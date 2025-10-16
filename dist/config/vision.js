@@ -46,22 +46,14 @@ const initializeVisionClient = () => {
       return new vision.ImageAnnotatorClient({ credentials });
     }
 
-    throw new Error('No se encontraron credenciales válidas de Google Cloud Vision');
+    console.warn('⚠️ No se encontraron credenciales de Google Cloud Vision');
+    console.warn('⚠️ Google Vision estará deshabilitado. Funcionalidades de OCR no estarán disponibles.');
+    return null;
 
   } catch (error) {
     console.error('❌ Error inicializando Google Vision:', error.message);
-    
-    // En producción, lanzar error; en desarrollo, retornar cliente mock
-    if (process.env.NODE_ENV === 'production') {
-      throw error;
-    }
-    
-    console.warn('⚠️ Usando cliente mock de Google Vision para desarrollo');
-    return {
-      textDetection: () => Promise.resolve([{ fullTextAnnotation: { text: 'Texto de prueba (Vision no disponible)' } }]),
-      documentTextDetection: () => Promise.resolve([{ fullTextAnnotation: { text: 'Texto de prueba (Vision no disponible)' } }]),
-      safeSearchDetection: () => Promise.resolve([{ safeSearchAnnotation: { adult: 'VERY_UNLIKELY', violence: 'VERY_UNLIKELY', racy: 'VERY_UNLIKELY' } }])
-    };
+    console.warn('⚠️ Google Vision estará deshabilitado. Funcionalidades de OCR no estarán disponibles.');
+    return null;
   }
 };
 

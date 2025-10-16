@@ -7,6 +7,12 @@ import visionClient from '../config/vision.js';
  */
 export async function analyzeImageBufferWithVision(imageBuffer) {
     try {
+        // Verificar si Google Vision está disponible
+        if (!visionClient) {
+            console.warn('⚠️ Google Vision no está disponible. Retornando texto vacío.');
+            return '';
+        }
+        
         console.log('🖼️ Iniciando análisis de imagen con Google Vision...');
         const [result] = await visionClient.textDetection(imageBuffer);
         const text = result.fullTextAnnotation
@@ -50,6 +56,10 @@ export async function analyzeImageBufferWithVision(imageBuffer) {
  */
 export async function analyzeImageUrlWithVision(imageUrl) {
     try {
+        if (!visionClient) {
+            console.warn('⚠️ Google Vision no está disponible. Retornando texto vacío.');
+            return '';
+        }
         const [result] = await visionClient.textDetection(imageUrl);
         const text = result.fullTextAnnotation
             ? result.fullTextAnnotation.text
@@ -68,6 +78,10 @@ export async function analyzeImageUrlWithVision(imageUrl) {
  */
 export async function isImageSafe(imageBuffer) {
     try {
+        if (!visionClient) {
+            console.warn('⚠️ Google Vision no está disponible. Asumiendo imagen segura.');
+            return true;
+        }
         const [result] = await visionClient.safeSearchDetection(imageBuffer);
         const detections = result.safeSearchAnnotation || {};
         return (detections.adult === 'VERY_UNLIKELY' &&
@@ -82,6 +96,11 @@ export async function isImageSafe(imageBuffer) {
 
 export async function analyzePdfBufferWithVision(buffer) {
     try {
+        if (!visionClient) {
+            console.warn('⚠️ Google Vision no está disponible. No se puede analizar PDF.');
+            return 'PDF no procesado: Google Vision no está configurado';
+        }
+        
         console.log('📄 Iniciando análisis de PDF con Google Vision...');
         console.log(`📄 Tamaño del PDF: ${(buffer.length / 1024 / 1024).toFixed(2)}MB`);
         
@@ -187,6 +206,24 @@ export async function analyzePdfBufferWithVision(buffer) {
  */
 export async function analyzeImageComplete(imageBuffer) {
     try {
+        if (!visionClient) {
+            console.warn('⚠️ Google Vision no está disponible. Retornando análisis vacío.');
+            return {
+                timestamp: new Date().toISOString(),
+                imageSize: imageBuffer.length,
+                text: '',
+                objects: [],
+                labels: [],
+                logos: [],
+                faces: [],
+                colors: [],
+                safety: {},
+                landmarks: [],
+                summary: 'Análisis no disponible: Google Vision no configurado',
+                confidence: 0
+            };
+        }
+        
         console.log('🔍 Iniciando análisis visual completo con Google Vision...');
         console.log(`📊 Tamaño de imagen: ${(imageBuffer.length / 1024).toFixed(2)}KB`);
         
