@@ -1,0 +1,37 @@
+name: Deploy to Render
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Permite ejecutar manualmente desde GitHub
+
+jobs:
+  deploy:
+    name: Deploy to Render
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 🚀 Trigger Render Deploy
+        run: |
+          echo "🔄 Triggering Render deployment..."
+          curl -X POST "https://api.render.com/deploy/srv-d3occ13e5dus73aki5m0?key=${{ secrets.RENDER_DEPLOY_HOOK }}"
+          echo "✅ Deploy triggered successfully!"
+          echo "📊 Monitor deployment at: https://dashboard.render.com/web/srv-d3occ13e5dus73aki5m0"
+      
+      - name: 📝 Deployment Info
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎯 Deployment Details:"
+          echo "   Service: speedleads-server"
+          echo "   Service ID: srv-d3occ13e5dus73aki5m0"
+          echo "   URL: https://speedleads-server.onrender.com"
+          echo "   Branch: main"
+          echo "   Commit: ${{ github.sha }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "⏳ Deployment will take approximately 5-10 minutes"
+          echo "📊 Monitor progress: https://dashboard.render.com/web/srv-d3occ13e5dus73aki5m0/logs"
+          echo ""
+          echo "✅ Once deployed, verify with:"
+          echo "   curl https://speedleads-server.onrender.com/api/health"
