@@ -176,6 +176,8 @@ const allowedOrigins = [
   'https://app.uniclick.io',  // 🎯 ÚNICO origen permitido para autenticación
   'https://uniclick.io',      // Dominio principal
   'https://www.uniclick.io',  // Dominio www
+  'https://www.speedleads.app', // Frontend principal en Vercel
+  'https://speedleads.app',   // Frontend sin www
   'https://web.whatsapp.com', // Para webhooks de WhatsApp (sin trailing slash)
   'http://localhost:3000',    // Solo para desarrollo (sin trailing slash)
   'http://uniclick.io:5001',  // Solo para desarrollo
