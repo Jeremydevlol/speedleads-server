@@ -63,10 +63,6 @@ RUN npm install
 # Copia todo tu código al contenedor
 COPY . .
 
-# Copia el archivo de credenciales de Google Vision a /app
-# Asegúrate de que el JSON exista en la raíz de tu repo
-COPY brave-cistern-441722-a9-8aa519ef966f.json /app/
-
 # Crea directorio temporal para archivos de audio y uploads
 RUN mkdir -p /app/temp && chmod 777 /app/temp
 RUN mkdir -p /app/uploads && chmod 777 /app/uploads
@@ -78,9 +74,8 @@ RUN mkdir -p /app/.next && chmod 777 /app/.next
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
-# Expón los puertos necesarios (5001 para AWS ECS)
+# Expón el puerto para Render (usa variable de entorno PORT)
 EXPOSE 5001
-EXPOSE 3000
 
 # Copia los scripts de inicio
 COPY docker-start.sh /app/
@@ -88,5 +83,5 @@ COPY docker-start-robust.sh /app/
 COPY docker-start-fast.sh /app/
 RUN chmod +x /app/docker-start.sh /app/docker-start-robust.sh /app/docker-start-fast.sh
 
-# Comando de inicio RÁPIDO para evitar circuit breaker
+# Comando de inicio para Render
 CMD ["./docker-start-fast.sh"]

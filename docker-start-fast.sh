@@ -1,15 +1,16 @@
 #!/bin/bash
 
 # docker-start-fast.sh
-# Script de inicio optimizado para arranque rápido y health check inmediato
+# Script de inicio optimizado para arranque rápido en Render
 
 set -e
 
-echo "⚡ INICIO RÁPIDO PARA ECS - Evitando Circuit Breaker"
+echo "⚡ INICIO RÁPIDO PARA RENDER"
 
 # Configurar variables críticas INMEDIATAMENTE
 export NODE_ENV=production
-export PORT=5001
+# Render proporciona PORT dinámicamente, usar 5001 como fallback
+export PORT=${PORT:-5001}
 export HOST=0.0.0.0
 
 echo "🚀 Configuración:"
