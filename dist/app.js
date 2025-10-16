@@ -624,9 +624,10 @@ server.listen(Number(ENV_CONFIG.PORT), '0.0.0.0', async () => {
     console.log('   ▸ Usuario:', info.rows[0].current_user);
     client.release();
   } catch (err) {
-    console.log('\x1b[31m%s\x1b[0m', '\n❌ Error de conexión a DB:');
+    console.log('\x1b[31m%s\x1b[0m', '\n⚠️ Error de conexión a DB (el servidor continuará):');
     console.error('   ▸', err.message);
-    process.exit(1);
+    console.log('   ▸ Verifica las variables de entorno: DATABASE_URL, SUPABASE_URL');
+    // NO hacer exit - permitir que el servidor arranque para debugging
   }
 
   console.log('\x1b[36m%s\x1b[0m', '\n🔍 Verificación de servicios:');
