@@ -54,11 +54,13 @@ const envPath = path.resolve(__dirname, '../.env');
 try {
   const envConfig = dotenv.config({ path: envPath });
   if (envConfig.error) {
-    throw new Error(`Error al cargar .env: ${envConfig.error.message}`);
+    console.warn(`⚠️ No se encontró archivo .env en: ${envPath}`);
+    console.warn('⚠️ Usando variables de entorno del sistema (Render Dashboard)');
+  } else {
+    console.log(`✅ Archivo .env cargado desde: ${envPath}`);
   }
-  console.log(`✅ Archivo .env cargado desde: ${envPath}`);
 } catch (error) {
-  process.exit(1);
+  console.warn('⚠️ Error al cargar .env, usando variables del sistema');
 }
 dotenv.config();
 // Variables obligatorias
@@ -96,13 +98,10 @@ const checkRequiredVars = () => {
   ];
   const missingVars = requiredVars.filter(varName => !ENV_CONFIG[varName]);
   if (missingVars.length > 0) {
-    console.error('\n❌ ERROR: Variables de entorno faltantes:');
-    console.error(missingVars.map(v => `  - ${v}`).join('\n'));
-    if (ENV_CONFIG.NODE_ENV === 'production') {
-      console.error('🚨 No se puede iniciar en producción sin estas variables');
-      process.exit(1);
-    }
-    console.warn('⚠️  Iniciando en modo desarrollo con funcionalidad limitada\n');
+    console.warn('\n⚠️ WARNING: Variables de entorno faltantes:');
+    console.warn(missingVars.map(v => `  - ${v}`).join('\n'));
+    console.warn('⚠️ El servidor continuará pero algunas funcionalidades pueden no estar disponibles');
+    console.warn('⚠️ Configura estas variables en Render Dashboard para habilitar todas las funcionalidades\n');
   } else {
     console.log('✅ Todas las variables requeridas están configuradas');
   }
