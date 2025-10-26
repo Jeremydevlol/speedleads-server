@@ -1,0 +1,25 @@
+# Dockerfile simple para evitar problemas de I/O
+FROM node:20-slim
+
+# Instalar dependencias del sistema mínimas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Crear directorio de trabajo
+WORKDIR /app
+
+# Copiar archivos de dependencias
+COPY package*.json ./
+
+# Instalar dependencias de producción
+RUN npm ci --only=production --silent
+
+# Copiar código compilado (ya está en dist/)
+COPY dist/ ./dist/
+
+# Exponer puerto
+EXPOSE 5001
+
+# Comando de inicio
+CMD ["node", "dist/app.js"]

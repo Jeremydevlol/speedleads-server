@@ -1,0 +1,62 @@
+# Dockerfile.minimal
+# Versión minimalista para debug de problemas en ECS
+
+FROM node:20-slim
+
+# Instalar solo lo esencial
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    lsof \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Crear directorio de trabajo
+WORKDIR /app
+
+# Copiar archivos de dependencias
+COPY package*.json ./
+
+# Instalar solo dependencias de producción
+RUN npm ci --production --silent
+
+# Copiar código compilado
+COPY dist/ ./dist/
+COPY brave-cistern-441722-a9-8aa519ef966f.json ./
+
+# Crear directorios necesarios
+RUN mkdir -p /app/temp /app/uploads /app/whatsapp-sessions
+RUN chmod 755 /app/temp /app/uploads /app/whatsapp-sessions
+
+# Variables de entorno
+ENV NODE_ENV=production
+ENV PORT=5001
+ENV HOST=0.0.0.0
+
+# Exponer puerto
+EXPOSE 5001
+
+# Health check integrado
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:5001/health || exit 1
+
+# Script de inicio simple y directo
+RUN echo '#!/bin/bash\n\
+set -e\n\
+echo "🚀 Iniciando servidor minimalista..."\n\
+echo "Puerto: $PORT"\n\
+echo "Directorio: $(pwd)"\n\
+echo "Archivos dist: $(ls -la dist/ | wc -l)"\n\
+\n\
+# Verificar archivo principal\n\
+if [ ! -f "dist/app.js" ]; then\n\
+    echo "❌ ERROR: dist/app.js no encontrado"\n\
+    exit 1\n\
+fi\n\
+\n\
+# Iniciar servidor\n\
+echo "🚀 Ejecutando: node dist/app.js"\n\
+exec node dist/app.js\n\
+' > /app/start-minimal.sh && chmod +x /app/start-minimal.sh
+
+# Comando de inicio
+CMD ["./start-minimal.sh"]

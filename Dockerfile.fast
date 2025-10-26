@@ -1,0 +1,43 @@
+# Dockerfile.fast
+# Optimizado para arranque ultra rápido y evitar circuit breaker
+
+FROM node:20-slim
+
+# Instalar solo lo mínimo esencial
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copiar dependencias y código pre-compilado
+COPY package*.json ./
+COPY dist/ ./dist/
+COPY brave-cistern-441722-a9-8aa519ef966f.json ./
+
+# Instalar solo dependencias de producción (sin dev dependencies)
+RUN npm ci --production --silent --no-audit --no-fund
+
+# Crear directorios con permisos mínimos
+RUN mkdir -p /app/temp /app/uploads /app/whatsapp-sessions && \
+    chmod 755 /app/temp /app/uploads /app/whatsapp-sessions
+
+# Variables de entorno para máximo rendimiento
+ENV NODE_ENV=production
+ENV PORT=5001
+ENV HOST=0.0.0.0
+ENV NODE_OPTIONS="--max-old-space-size=1024"
+
+# Exponer puerto
+EXPOSE 5001
+
+# Health check optimizado (respuesta rápida)
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=2 \
+    CMD curl -f http://localhost:5001/ping || exit 1
+
+# Script de inicio rápido
+COPY docker-start-fast.sh /app/
+RUN chmod +x /app/docker-start-fast.sh
+
+# Comando optimizado para arranque inmediato
+CMD ["./docker-start-fast.sh"]

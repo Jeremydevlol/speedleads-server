@@ -1,0 +1,36 @@
+node_modules/
+uploads/
+.wwebjs_auth*/
+.wwebjs_cache*/
+.env
+baileys_auth*/
+
+# Directorios temporales
+temp/
+tmp/
+
+# Archivos temporales de audio
+*.ogg
+*.wav
+*.mp3
+*.m4a
+*.txt
+
+# Archivos de transcripción
+*_transcription.txt
+*_transcript.txt
+
+# Credenciales y secretos
+dist/credentials/
+*.json
+.env*
+!package.json
+!package-lock.json
+!tsconfig.json
+
+# Documentación con secretos
+AUDITORIA_BILLING_PRODUCCION.md
+CONFIGURAR_CLAVES_PRODUCCION.md
+
+# Carpetas de deploy
+deploy-package/
