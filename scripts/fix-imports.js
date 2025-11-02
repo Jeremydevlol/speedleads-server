@@ -1,4 +1,4 @@
-const replace = require('replace-in-file');
+import { replaceInFileSync } from 'replace-in-file';
 
 const options = {
   files: 'dist/**/*.js',
@@ -7,7 +7,7 @@ const options = {
 };
 
 try {
-  const results = replace.sync(options);
+  const results = replaceInFileSync(options);
   console.log('Modified files:', results);
 } catch (error) {
   console.error('Error occurred:', error);

@@ -193,7 +193,7 @@ app.use(cors({
   origin: function (origin, callback) {
     // En desarrollo, permitir todo
     if (ENV_CONFIG.NODE_ENV === 'development') {
-      console.log(`✅ CORS allow in development: ${origin}`);
+      // No loggear nada en desarrollo para evitar spam de extensiones
       return callback(null, true);
     }
 
@@ -214,13 +214,11 @@ app.use(cors({
     });
 
     if (isSubdomainAllowed) {
-      console.log(`✅ CORS allow subdomain: ${origin}`);
       return callback(null, true);
     }
 
     // 🌐 ADICIONAL: Permitir cualquier subdominio de uniclick.io para websites
     if (origin && origin.match(/^https?:\/\/[a-zA-Z0-9-]+\.uniclick\.io(:\d+)?$/)) {
-      console.log(`✅ CORS allow website subdomain: ${origin}`);
       return callback(null, true);
     }
 
@@ -533,7 +531,7 @@ app.get('/api/instagram/search', async (req, res) => {
 // Endpoint para enviar mensaje directo a un usuario específico
 app.post('/api/instagram/send-message', async (req, res) => {
   console.log('📤 [SEND] Endpoint de envío de mensaje directo llamado');
-  const { username, message } = req.body;
+  const { username, message, userId, personalityId } = req.body;
   
   if (!username || !message) {
     return res.status(400).json({
@@ -544,21 +542,278 @@ app.post('/api/instagram/send-message', async (req, res) => {
   }
   
   try {
-    // Importar el servicio de Instagram
+    // Importar servicios necesarios
     const { igSendMessage } = await import('./services/instagramService.js');
     
-    console.log(`📤 [SEND] Enviando mensaje a ${username}: "${message}"`);
+    let finalMessage = message;
+    let messageGenerated = false;
+    let actualPersonalityId = personalityId;
+    let actualUserId = userId;
+    
+    console.log(`🔍 [SEND] DEBUG - userId recibido: ${userId}, personalityId recibido: ${personalityId}`);
+    
+    // Si no hay userId, intentar obtenerlo del token o req
+    if (!actualUserId) {
+      try {
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          // Intentar obtener userId del token
+          try {
+            const { validateJwt } = await import('./config/jwt.js');
+            const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+            if (decoded) {
+              actualUserId = decoded.userId || decoded.sub || decoded.user?.id;
+              console.log(`✅ [SEND] userId obtenido del token: ${actualUserId}`);
+            }
+          } catch (jwtError) {
+            console.log(`⚠️ [SEND] No se pudo obtener userId del token: ${jwtError.message}`);
+          }
+        }
+      } catch (error) {
+        console.log(`⚠️ [SEND] Error obteniendo userId: ${error.message}`);
+      }
+    }
+    
+    // Si no hay personalityId pero hay userId, intentar obtenerlo del bot activo
+    if (!actualPersonalityId && actualUserId) {
+      try {
+        const { default: instagramBotService } = await import('./services/instagramBotService.js');
+        
+        console.log(`🔍 [SEND] Buscando bot activo para userId: ${actualUserId}`);
+        const botData = instagramBotService.activeBots.get(actualUserId);
+        
+        if (botData && botData.isRunning && botData.personalityData) {
+          actualPersonalityId = botData.personalityData.id;
+          console.log(`✅ [SEND] personalityId obtenido del bot activo: "${botData.personalityData.nombre}" (ID: ${actualPersonalityId})`);
+        } else {
+          console.log(`⚠️ [SEND] No hay bot activo para userId ${actualUserId}`);
+          if (instagramBotService.activeBots.size > 0) {
+            console.log(`   Bots activos disponibles:`, Array.from(instagramBotService.activeBots.keys()));
+          } else {
+            console.log(`   No hay ningún bot activo. Activa el bot desde el frontend primero.`);
+          }
+        }
+      } catch (botError) {
+        console.log(`❌ [SEND] Error obteniendo personalityId del bot: ${botError.message}`);
+      }
+    }
+    
+    // Resumen final de lo que se encontró
+    if (!actualUserId) {
+      console.log(`❌ [SEND] No se puede generar mensaje con IA: falta userId`);
+      console.log(`   El mensaje se enviará tal cual sin personalización.`);
+      console.log(`   Solución: El frontend debe enviar userId en el body o incluir un token de autenticación válido.`);
+    } else if (!actualPersonalityId) {
+      console.log(`❌ [SEND] No se puede generar mensaje con IA: falta personalityId`);
+      console.log(`   userId encontrado: ${actualUserId}`);
+      console.log(`   El mensaje se enviará tal cual sin personalización.`);
+      console.log(`   Solución: El frontend debe enviar personalityId en el body o activar el bot primero.`);
+    }
+    
+    // Si hay personalidadId (del body o del bot activo) y userId, generar mensaje con IA
+    console.log(`🔍 [SEND] DEBUG FINAL - actualPersonalityId: ${actualPersonalityId}, actualUserId: ${actualUserId}`);
+    
+    if (actualPersonalityId && actualUserId) {
+      console.log(`✅ [SEND] Condiciones para IA cumplidas - Generando mensaje personalizado...`);
+      try {
+        console.log(`🧠 [SEND] Generando mensaje personalizado con IA (personalityId: ${actualPersonalityId})...`);
+        
+        const { generateBotResponse } = await import('./services/openaiService.js');
+        const { supabaseAdmin } = await import('./config/db.js');
+        
+        // PRIORIDAD 1: Intentar obtener personalidad del bot activo SOLO si coincide con la solicitada
+        let personalityData = null;
+        try {
+          const { default: instagramBotService } = await import('./services/instagramBotService.js');
+          const botData = instagramBotService.activeBots.get(actualUserId);
+          
+          if (botData && botData.isRunning && botData.personalityData) {
+            // SOLO usar la personalidad del bot si coincide con la que viene del frontend
+            if (botData.personalityData.id === actualPersonalityId) {
+              personalityData = botData.personalityData;
+              console.log(`✅ [SEND] Usando personalidad del bot activo (coincide): "${personalityData.nombre}" (ID: ${personalityData.id})`);
+            } else {
+              console.log(`ℹ️ [SEND] Personalidad del bot (${botData.personalityData.id}) != solicitada (${actualPersonalityId}), cargando desde DB`);
+            }
+          }
+        } catch (botError) {
+          console.log(`⚠️ [SEND] Error obteniendo personalidad del bot: ${botError.message}`);
+        }
+        
+        // PRIORIDAD 2: Si no se encontró en el bot o no coincide, cargar desde DB
+        if (!personalityData && actualPersonalityId) {
+          try {
+            console.log(`📥 [SEND] Cargando personalidad ${actualPersonalityId} desde DB...`);
+            const { data: personalityDataFromDB, error: personalityError } = await supabaseAdmin
+              .from('personalities')
+              .select('*')
+              .eq('id', actualPersonalityId)
+              .eq('users_id', actualUserId)
+              .single();
+            
+            if (personalityDataFromDB && !personalityError) {
+              personalityData = personalityDataFromDB;
+              console.log(`✅ [SEND] Personalidad cargada desde DB: "${personalityData.nombre}" (ID: ${personalityData.id})`);
+            } else {
+              console.log(`❌ [SEND] Personalidad ${actualPersonalityId} NO encontrada en DB: ${personalityError?.message || 'Sin datos'}`);
+            }
+          } catch (dbError) {
+            console.log(`❌ [SEND] Error cargando personalidad desde DB: ${dbError.message}`);
+          }
+        }
+        
+        if (personalityData) {
+          // Cargar instrucciones adicionales si es necesario (similar a loadPersonalityData)
+          let combinedInstructions = personalityData.instrucciones || '';
+          try {
+            const { data: additionalInstructions } = await supabaseAdmin
+              .from('personality_instructions')
+              .select('instruccion')
+              .eq('personality_id', actualPersonalityId)
+              .eq('users_id', actualUserId)
+              .order('created_at', { ascending: true });
+            
+            if (additionalInstructions && additionalInstructions.length > 0) {
+              const additionalText = additionalInstructions.map(instr => instr.instruccion).join('\n');
+              combinedInstructions = `${combinedInstructions}\n\n${additionalText}`;
+              console.log(`📚 [SEND] ${additionalInstructions.length} instrucciones adicionales agregadas a la personalidad`);
+            }
+          } catch (instrError) {
+            console.log(`⚠️ [SEND] Error cargando instrucciones adicionales: ${instrError.message}`);
+          }
+          
+          // Crear objeto de personalidad completo con instrucciones combinadas
+          const fullPersonalityData = {
+            ...personalityData,
+            instrucciones: combinedInstructions
+          };
+          
+          console.log(`🎭 [SEND] Usando personalidad completa: "${fullPersonalityData.nombre}" (ID: ${fullPersonalityData.id})`);
+          console.log(`📝 [SEND] Instrucciones totales: ${combinedInstructions.length} caracteres`);
+          
+          // Generar mensaje usando la personalidad
+          const greetingPrompt = `Eres un experto en comunicación. Necesitas crear un mensaje personalizado basado en el siguiente mensaje base para enviar a ${username}:
+
+MENSAJE BASE:
+${message}
+
+INSTRUCCIONES:
+1. Crea una variación personalizada del mensaje base
+2. NO copies el mensaje exacto
+3. Adapta el tono usando la personalidad "${fullPersonalityData.nombre}"
+4. Hazlo natural y conversacional
+5. Máximo 400 caracteres
+6. Mantén la esencia del mensaje original
+
+Genera SOLO el mensaje personalizado, sin explicaciones.`;
+
+          const aiResponse = await generateBotResponse({
+            personality: fullPersonalityData,
+            userMessage: greetingPrompt,
+            userId: actualUserId,
+            history: [],
+            mediaType: null,
+            mediaContent: null,
+            context: `Generando mensaje personalizado para ${username}`,
+            followerInfo: {
+              username: username,
+              full_name: '',
+              biography: '',
+              follower_count: 0,
+              is_business: false
+            }
+          });
+
+          if (aiResponse && aiResponse.trim() !== '') {
+            finalMessage = aiResponse.trim();
+            messageGenerated = true;
+            console.log(`✅ [SEND] Mensaje generado con IA: "${finalMessage.substring(0, 60)}..."`);
+          } else {
+            console.log(`⚠️ [SEND] IA no generó respuesta, usando mensaje original`);
+          }
+        } else {
+          console.log(`❌ [SEND] Personalidad ${actualPersonalityId} no encontrada en DB`);
+          console.log(`   Verifica que la personalidad exista y pertenezca al usuario ${actualUserId}`);
+          console.log(`   El mensaje se enviará tal cual sin personalización.`);
+        }
+      } catch (aiError) {
+        console.log(`❌ [SEND] Error generando mensaje con IA: ${aiError.message}`);
+        console.error(`   Stack:`, aiError.stack);
+        console.log(`   El mensaje se enviará tal cual sin personalización.`);
+      }
+    } else {
+      console.log(`⚠️ [SEND] No se generará mensaje con IA porque:`);
+      if (!actualUserId) console.log(`   - Falta userId (debe venir en el body o token)`);
+      if (!actualPersonalityId) console.log(`   - Falta personalityId (debe venir en el body o haber bot activo)`);
+      console.log(`   El mensaje se enviará tal cual: "${message}"`);
+    }
+    
+    console.log(`📤 [SEND] Enviando mensaje a ${username}: "${finalMessage.substring(0, 60)}${finalMessage.length > 60 ? '...' : ''}"`);
     
     // Enviar mensaje real a Instagram
-    const result = await igSendMessage(username, message);
+    const result = await igSendMessage(username, finalMessage);
     
     if (result.success) {
       console.log(`✅ [SEND] Mensaje enviado exitosamente a ${username}`);
+      
+      // Guardar en historial para continuidad de conversación si hay userId
+      if (actualUserId) {
+        try {
+          const { default: instagramBotService } = await import('./services/instagramBotService.js');
+          const botData = instagramBotService.activeBots.get(actualUserId);
+          
+          if (botData) {
+            if (!botData.conversationHistory) {
+              botData.conversationHistory = new Map();
+            }
+            
+            let history = botData.conversationHistory.get(username) || [];
+            history.push({
+              role: 'assistant',
+              content: finalMessage,
+              timestamp: Date.now(),
+              isInitialMessage: true
+            });
+            
+            botData.conversationHistory.set(username, history.slice(-50));
+            console.log(`💾 [SEND] Historial guardado para ${username} para continuidad de conversación`);
+          } else {
+            // Si no hay bot activo, crear historial básico en el servicio para que el bot lo encuentre después
+            const { getOrCreateIGSession } = await import('./services/instagramService.js');
+            try {
+              const session = await getOrCreateIGSession(actualUserId);
+              
+              if (!session.conversationHistory) {
+                session.conversationHistory = new Map();
+              }
+              
+              let history = session.conversationHistory.get(username) || [];
+              history.push({
+                role: 'assistant',
+                content: finalMessage,
+                timestamp: Date.now(),
+                isInitialMessage: true
+              });
+              
+              session.conversationHistory.set(username, history.slice(-50));
+              console.log(`💾 [SEND] Historial guardado en sesión para ${username}`);
+            } catch (sessionError) {
+              console.log(`⚠️ [SEND] Error guardando historial en sesión: ${sessionError.message}`);
+            }
+          }
+        } catch (histError) {
+          console.log(`⚠️ [SEND] Error guardando historial: ${histError.message}`);
+        }
+      }
+      
       res.json({
         success: true,
         message: 'Mensaje enviado exitosamente',
         recipient: username,
-        sent_message: message,
+        sent_message: finalMessage,
+        ai_generated: messageGenerated,
+        personality_used: actualPersonalityId || null,
+        personality_name: (messageGenerated && actualPersonalityId && personalityData) ? personalityData.nombre : null,
         timestamp: new Date().toISOString()
       });
     } else {
@@ -882,10 +1137,16 @@ app.get('/api/instagram/followers', async (req, res) => {
   }
 });
 
-// Endpoint para enviar mensajes masivos a seguidores (ANTES de middlewares de autenticación)
+// Endpoint para enviar mensajes masivos a seguidores CON IA (ANTES de middlewares de autenticación)
 app.post('/api/instagram/bulk-send-followers', async (req, res) => {
+  console.log('═══════════════════════════════════════════════════════════');
   console.log('📤👥 [BULK-FOLLOWERS] Endpoint de envío masivo a seguidores llamado');
-  const { target_username, message, limit = 50, delay = 2000 } = req.body;
+  console.log('📥 [BULK-FOLLOWERS] Body recibido:', JSON.stringify(req.body, null, 2));
+  console.log('📥 [BULK-FOLLOWERS] Headers:', {
+    'content-type': req.headers['content-type'],
+    'authorization': req.headers['authorization'] ? 'Bearer ***' : 'no presente'
+  });
+  const { target_username, message, limit = 50, delay = 2000, userId, personalityId } = req.body;
 
   if (!target_username || !message) {
     return res.status(400).json({
@@ -896,9 +1157,98 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
   }
 
   try {
+    // Obtener userId y personalityId del bot activo automáticamente
+    let actualUserId = userId;
+    let actualPersonalityId = personalityId;
+    
+    console.log(`🔍 [BULK-FOLLOWERS] userId del body: ${actualUserId || 'no proporcionado'}`);
+    console.log(`🔍 [BULK-FOLLOWERS] personalityId del body: ${actualPersonalityId || 'no proporcionado'}`);
+    
+    // Importar el servicio de bot ANTES de buscar
+    const { default: instagramBotService } = await import('./services/instagramBotService.js');
+    
+    // Si no hay userId, intentar obtenerlo del token JWT
+    if (!actualUserId) {
+      try {
+        const authHeader = req.headers.authorization;
+        console.log(`🔍 [BULK-FOLLOWERS] Buscando userId en token JWT...`);
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const { validateJwt } = await import('./config/jwt.js');
+          try {
+            const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+            if (decoded) {
+              actualUserId = decoded.userId || decoded.sub || decoded.user?.id;
+              console.log(`✅ [BULK-FOLLOWERS] userId obtenido del token: ${actualUserId}`);
+            }
+          } catch (jwtError) {
+            console.log(`⚠️ [BULK-FOLLOWERS] Error validando JWT: ${jwtError.message}`);
+          }
+        }
+      } catch (error) {
+        console.log(`❌ [BULK-FOLLOWERS] Error obteniendo userId del token: ${error.message}`);
+      }
+    }
+    
+    // Si tenemos userId, buscar su bot activo
+    if (actualUserId && !actualPersonalityId) {
+      try {
+        console.log(`🔍 [BULK-FOLLOWERS] Buscando bot activo para userId: ${actualUserId}`);
+        const botData = instagramBotService.activeBots.get(actualUserId);
+        
+        if (botData && botData.isRunning && botData.personalityData) {
+          actualPersonalityId = botData.personalityData.id;
+          console.log(`✅ [BULK-FOLLOWERS] Usando personalidad del bot activo: "${botData.personalityData.nombre}" (ID: ${actualPersonalityId})`);
+        } else {
+          console.log(`⚠️ [BULK-FOLLOWERS] Bot no activo o sin personalidad para userId: ${actualUserId}`);
+        }
+      } catch (botError) {
+        console.log(`❌ [BULK-FOLLOWERS] Error obteniendo bot: ${botError.message}`);
+      }
+    }
+    
+    // Si NO tenemos userId ni personalityId, buscar CUALQUIER bot activo
+    if (!actualUserId || !actualPersonalityId) {
+      try {
+        console.log(`🔍 [BULK-FOLLOWERS] Buscando cualquier bot activo (sin userId específico)...`);
+        console.log(`🔍 [BULK-FOLLOWERS] Total de bots activos: ${instagramBotService.activeBots.size}`);
+        
+        // Buscar el primer bot activo que tenga personalidad
+        for (const [botUserId, botData] of instagramBotService.activeBots.entries()) {
+          console.log(`🔍 [BULK-FOLLOWERS] Revisando bot de userId: ${botUserId}`);
+          console.log(`   - isRunning: ${botData.isRunning}`);
+          console.log(`   - tiene personalidad: ${!!botData.personalityData}`);
+          
+          if (botData && botData.isRunning && botData.personalityData) {
+            if (!actualUserId) {
+              actualUserId = botUserId;
+              console.log(`✅ [BULK-FOLLOWERS] userId encontrado de bot activo: ${actualUserId}`);
+            }
+            if (!actualPersonalityId) {
+              actualPersonalityId = botData.personalityData.id;
+              console.log(`✅ [BULK-FOLLOWERS] Personalidad encontrada de bot activo: "${botData.personalityData.nombre}" (ID: ${actualPersonalityId})`);
+            }
+            
+            if (actualUserId && actualPersonalityId) {
+              console.log(`✅ [BULK-FOLLOWERS] Bot activo encontrado! userId: ${actualUserId}, personalidad: "${botData.personalityData.nombre}"`);
+              break;
+            }
+          }
+        }
+      } catch (searchError) {
+        console.log(`❌ [BULK-FOLLOWERS] Error buscando bots activos: ${searchError.message}`);
+      }
+    }
+    
+    console.log(`👤 [BULK-FOLLOWERS] userId final: ${actualUserId || 'NINGUNO - Se enviará sin IA'}`);
+    console.log(`🎭 [BULK-FOLLOWERS] personalityId final: ${actualPersonalityId || 'NINGUNO - Se enviará sin IA'}`);
+
     const { igGetFollowers, igSendMessage } = await import('./services/instagramService.js');
+    const { generateBotResponse } = await import('./services/openaiService.js');
+    const { supabaseAdmin } = await import('./config/db.js');
 
     console.log(`👥 [BULK-FOLLOWERS] Obteniendo seguidores de ${target_username}...`);
+    console.log(`🎭 [BULK-FOLLOWERS] Personalidad a usar: ${actualPersonalityId || 'ninguna'}`);
+    console.log(`👤 [BULK-FOLLOWERS] Usuario: ${actualUserId || 'no especificado'}`);
 
     // Primero obtener los seguidores
     const followersResult = await igGetFollowers(target_username, parseInt(limit));
@@ -915,9 +1265,78 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
     }
 
     console.log(`📤 [BULK-FOLLOWERS] Enviando mensajes a ${followersResult.followers.length} seguidores...`);
+    console.log(`📝 [BULK-FOLLOWERS] MENSAJE BASE RECIBIDO: "${message}"`);
+    console.log(`📝 [BULK-FOLLOWERS] Este mensaje base se usará para generar variaciones personalizadas con IA`);
+
+    // Cargar personalidad si está disponible (de bot activo o desde DB)
+    let personalityData = null;
+    if (actualPersonalityId && actualUserId) {
+      try {
+        // PRIORIDAD 1: Intentar del bot activo (ya cargado)
+        const botData = instagramBotService.activeBots.get(actualUserId);
+        
+        if (botData && botData.personalityData && botData.personalityData.id === actualPersonalityId) {
+          personalityData = botData.personalityData;
+          console.log(`✅ [BULK-FOLLOWERS] Usando personalidad del bot activo: "${personalityData.nombre}"`);
+        } else {
+          // PRIORIDAD 2: Cargar desde DB
+          console.log(`🔍 [BULK-FOLLOWERS] Cargando personalidad ${actualPersonalityId} desde DB...`);
+          const { data: personalityDataFromDB } = await supabaseAdmin
+            .from('personalities')
+            .select('*')
+            .eq('id', actualPersonalityId)
+            .eq('users_id', actualUserId)
+            .single();
+          
+          if (personalityDataFromDB) {
+            personalityData = personalityDataFromDB;
+            
+            // Cargar instrucciones adicionales
+            const { data: additionalInstructions } = await supabaseAdmin
+              .from('personality_instructions')
+              .select('instruccion')
+              .eq('personality_id', actualPersonalityId)
+              .eq('users_id', actualUserId)
+              .order('created_at', { ascending: true });
+            
+            if (additionalInstructions && additionalInstructions.length > 0) {
+              const additionalText = additionalInstructions.map(instr => instr.instruccion).join('\n');
+              personalityData.instrucciones = `${personalityData.instrucciones || ''}\n\n${additionalText}`;
+              console.log(`✅ [BULK-FOLLOWERS] ${additionalInstructions.length} instrucciones adicionales agregadas`);
+            }
+            
+            console.log(`✅ [BULK-FOLLOWERS] Personalidad cargada desde DB: "${personalityData.nombre}"`);
+          } else {
+            console.log(`❌ [BULK-FOLLOWERS] Personalidad ${actualPersonalityId} no encontrada en DB`);
+          }
+        }
+      } catch (personalityError) {
+        console.log(`❌ [BULK-FOLLOWERS] Error cargando personalidad: ${personalityError.message}`);
+        console.error(personalityError);
+      }
+    }
+    
+    if (!personalityData && actualPersonalityId && actualUserId) {
+      console.log(`⚠️ [BULK-FOLLOWERS] ❌ No se pudo cargar la personalidad ${actualPersonalityId}`);
+      console.log(`   Se enviará el mensaje base SIN personalización con IA`);
+      console.log(`   Verifica que:`);
+      console.log(`   1. El bot esté activo con una personalidad`);
+      console.log(`   2. La personalidad ${actualPersonalityId} exista en la base de datos`);
+      console.log(`   3. El userId ${actualUserId} tenga acceso a esa personalidad`);
+    } else if (personalityData) {
+      console.log(`✅ [BULK-FOLLOWERS] Personalidad cargada correctamente: "${personalityData.nombre}"`);
+      console.log(`✅ [BULK-FOLLOWERS] Listo para generar mensajes con IA`);
+    } else {
+      console.log(`⚠️ [BULK-FOLLOWERS] ⚠️ NO SE GENERARÁN MENSAJES CON IA`);
+      console.log(`   Razones:`);
+      console.log(`   - Personalidad: ${personalityData ? 'Cargada' : 'NO disponible'}`);
+      console.log(`   - userId: ${actualUserId || 'NO disponible'}`);
+      console.log(`   → Los mensajes se enviarán tal cual sin personalización`);
+    }
 
     let sentCount = 0;
     let failedCount = 0;
+    let aiGeneratedCount = 0;
     const results = [];
 
     // Enviar mensajes a cada seguidor con delay
@@ -925,9 +1344,109 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
       const follower = followersResult.followers[i];
       
       try {
-        console.log(`📤 [BULK-FOLLOWERS] Enviando mensaje ${i + 1}/${followersResult.followers.length} a ${follower.username}...`);
+        console.log(`📤 [BULK-FOLLOWERS] Procesando ${i + 1}/${followersResult.followers.length}: ${follower.username}...`);
         
-        const sendResult = await igSendMessage(follower.username, message);
+        let finalMessage = message;
+        let aiGenerated = false;
+
+        // Generar mensaje con IA si hay personalidad y mensaje base
+        // IMPORTANTE: Verificar que tenemos TODO lo necesario
+        console.log(`🔍 [BULK-FOLLOWERS] Verificando condiciones para IA:`);
+        console.log(`   - personalidad: ${personalityData ? 'SÍ' : 'NO'}`);
+        console.log(`   - userId: ${actualUserId ? 'SÍ' : 'NO'}`);
+        console.log(`   - mensaje base: ${message && message.trim() ? 'SÍ' : 'NO'}`);
+        
+        if (personalityData && actualUserId && message && message.trim()) {
+          try {
+            console.log(`🧠 [BULK-FOLLOWERS] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+            console.log(`🧠 [BULK-FOLLOWERS] Generando mensaje con IA para: ${follower.username}`);
+            console.log(`🧠 [BULK-FOLLOWERS] Mensaje base a personalizar: "${message}"`);
+            console.log(`🧠 [BULK-FOLLOWERS] Personalidad a usar: "${personalityData.nombre}" (ID: ${personalityData.id})`);
+            
+            const greetingPrompt = `Eres un experto en comunicación y ventas. Tu tarea es crear un mensaje ÚNICO y DIFERENTE para este seguidor específico, basándote en el mensaje base pero variándolo completamente.
+
+MENSAJE BASE DEL CLIENTE (REFERENCIA):
+"${message}"
+
+IMPORTANTE: Este mensaje base es solo una REFERENCIA. Debes crear una VARIACIÓN COMPLETAMENTE DIFERENTE que comunique el mismo mensaje, pero con palabras distintas, estructura diferente y enfoque único.
+
+PERFIL DEL SEGUIDOR:
+- Usuario: @${follower.username}
+- Nombre: ${follower.full_name || 'No disponible'}
+- Biografía: ${follower.biography || 'No disponible'}
+- Tipo: ${follower.is_business ? 'Negocio' : 'Personal'}
+- Seguidores: ${follower.follower_count || 0}
+
+PERSONALIDAD A USAR:
+Debes hablar como "${personalityData.nombre}". ${personalityData.instrucciones ? `Instrucciones: ${personalityData.instrucciones.substring(0, 250)}...` : ''}
+
+REGLAS ESTRICTAS PARA LA VARIACIÓN:
+1. ✅ VARIACIÓN COMPLETA: Crea un mensaje DIFERENTE cada vez, aunque el mensaje base sea el mismo
+2. ✅ NO REPETIR: No uses las mismas palabras exactas del mensaje base
+3. ✅ MANTENER ESENCIA: Comunica el mismo mensaje/idea pero con palabras completamente diferentes
+4. ✅ PERSONALIZADO: Adapta el tono y enfoque específicamente para ${follower.username}
+5. ✅ NATURAL: Debe sonar como escrito por un humano, no robótico
+6. ✅ ÚNICO: Este mensaje debe ser diferente a cualquier otro que hayas generado antes
+7. ✅ LÍMITE: Máximo 400 caracteres
+8. ❌ NO incluyas explicaciones, solo el mensaje final
+
+EJEMPLOS:
+Mensaje base: "Tenemos ofertas especiales"
+Variación 1: "¡Hola! Te tenemos una sorpresa con promociones increíbles que no te puedes perder 😊"
+Variación 2: "Oye, ¿sabías que tenemos descuentos exclusivos ahora mismo? Déjame contarte más..."
+Variación 3: "¡Buenas noticias! Acabamos de lanzar una promoción especial que creo que te va a encantar"
+
+Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin comillas).`;
+
+            const aiResponse = await generateBotResponse({
+              personality: personalityData,
+              userMessage: greetingPrompt,
+              userId: actualUserId,
+              history: [],
+              mediaType: null,
+              mediaContent: null,
+              context: `Generando mensaje personalizado para seguidor ${follower.username}`,
+              followerInfo: {
+                username: follower.username,
+                full_name: follower.full_name || '',
+                biography: follower.biography || '',
+                follower_count: follower.follower_count || 0,
+                is_business: follower.is_business || false
+              }
+            });
+
+            if (aiResponse && aiResponse.trim() !== '') {
+              finalMessage = aiResponse.trim();
+              aiGenerated = true;
+              aiGeneratedCount++;
+              console.log(`✅ [BULK-FOLLOWERS] ✅ MENSAJE GENERADO CON IA:`);
+              console.log(`   Base: "${message.substring(0, 60)}${message.length > 60 ? '...' : ''}"`);
+              console.log(`   Generado: "${finalMessage}"`);
+              console.log(`   Para: @${follower.username}`);
+            } else {
+              console.log(`⚠️ [BULK-FOLLOWERS] IA no generó respuesta para ${follower.username}, usando mensaje base`);
+              console.log(`   Mensaje base: "${message}"`);
+            }
+          } catch (aiError) {
+            console.log(`❌ [BULK-FOLLOWERS] Error generando IA para ${follower.username}: ${aiError.message}`);
+            console.log(`   Usando mensaje base sin personalización`);
+          }
+        } else {
+          if (!personalityData) {
+            console.log(`⚠️ [BULK-FOLLOWERS] ⚠️ NO SE GENERARÁ CON IA - Razones:`);
+            console.log(`   - Personalidad disponible: ${personalityData ? 'SÍ' : 'NO'}`);
+            console.log(`   - userId disponible: ${actualUserId ? 'SÍ' : 'NO'}`);
+            console.log(`   - Mensaje base disponible: ${message && message.trim() ? 'SÍ' : 'NO'}`);
+            console.log(`   → Se enviará el mensaje base tal cual: "${message}"`);
+          } else if (!actualUserId) {
+            console.log(`⚠️ [BULK-FOLLOWERS] No hay userId, no se puede generar con IA`);
+            console.log(`   → Se enviará el mensaje base: "${message}"`);
+          } else if (!message || !message.trim()) {
+            console.log(`⚠️ [BULK-FOLLOWERS] No hay mensaje base, no se puede personalizar`);
+          }
+        }
+        
+        const sendResult = await igSendMessage(follower.username, finalMessage);
         
         if (sendResult.success) {
           sentCount++;
@@ -935,9 +1454,11 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
             username: follower.username,
             full_name: follower.full_name,
             status: 'sent',
+            ai_generated: aiGenerated,
+            message_preview: finalMessage.substring(0, 60) + '...',
             timestamp: new Date().toISOString()
           });
-          console.log(`✅ [BULK-FOLLOWERS] Mensaje enviado a ${follower.username}`);
+          console.log(`✅ [BULK-FOLLOWERS] Mensaje ${aiGenerated ? '(IA)' : '(base)'} enviado a ${follower.username}`);
         } else {
           failedCount++;
           results.push({
@@ -968,15 +1489,18 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
       }
     }
 
-    console.log(`✅ [BULK-FOLLOWERS] Envío masivo completado: ${sentCount} enviados, ${failedCount} fallidos`);
+    console.log(`✅ [BULK-FOLLOWERS] Envío masivo completado: ${sentCount} enviados (${aiGeneratedCount} con IA), ${failedCount} fallidos`);
 
     res.json({
       success: true,
-      message: `Envío masivo completado: ${sentCount} mensajes enviados, ${failedCount} fallidos`,
+      message: `Envío masivo completado: ${sentCount} mensajes enviados (${aiGeneratedCount} generados con IA), ${failedCount} fallidos`,
       target_username,
       sent_count: sentCount,
+      ai_generated_count: aiGeneratedCount,
       failed_count: failedCount,
       total_followers: followersResult.followers.length,
+      personality_used: actualPersonalityId || null,
+      personality_name: personalityData?.nombre || null,
       results,
       account_info: followersResult.account_info
     });
@@ -1008,36 +1532,93 @@ app.post('/api/instagram/login', async (req, res) => {
   }
   
   try {
+    // Obtener userId del token o del body
+    let userId = req.body.userId;
+    
+    // Si no viene en el body, intentar obtener del token JWT
+    if (!userId) {
+      try {
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const token = authHeader.substring(7);
+          // Intentar decodificar el token para obtener userId
+          const { validateJwt } = await import('./config/jwt.js');
+          try {
+            const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+            if (decoded && decoded.userId) {
+              userId = decoded.userId;
+            } else if (decoded && decoded.sub) {
+              userId = decoded.sub;
+            } else if (decoded && decoded.user?.id) {
+              userId = decoded.user.id;
+            }
+          } catch (jwtError) {
+            console.log('⚠️ [LOGIN] No se pudo validar JWT, usando userId del body si está disponible');
+          }
+        }
+      } catch (error) {
+        console.log('⚠️ [LOGIN] Error obteniendo userId del token:', error.message);
+      }
+    }
+    
+    // Si aún no hay userId, usar un fallback (no ideal pero necesario para compatibilidad)
+    if (!userId) {
+      // Intentar obtener de req.user si está disponible (después del middleware)
+      userId = req.user?.userId || req.user?.id || req.user?.sub;
+    }
+    
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: 'userId es requerido. Por favor proporciona el userId en el body o usa un token de autenticación válido.'
+      });
+    }
+    
+    console.log(`🔍 Validando credenciales para usuario: ${username} (userId: ${userId})`);
+    
     // Importar el servicio de Instagram
     const { getOrCreateIGSession } = await import('./services/instagramService.js');
     
     console.log('🔄 [LOGIN] Iniciando sesión real en Instagram...');
     
-    // Crear sesión de Instagram
-    const session = await getOrCreateIGSession('a123ccc0-7ee7-45da-92dc-52059c7e21c8');
+    // Crear sesión de Instagram con el userId del usuario
+    const session = await getOrCreateIGSession(userId);
     
     // Hacer login real en Instagram
     const loginResult = await session.login({ username, password });
     
     if (loginResult.success) {
-      console.log('✅ [LOGIN] Login real exitoso en Instagram para:', username);
+      console.log(`✅ [LOGIN] Login real exitoso en Instagram para: ${username} (userId: ${userId})`);
+      
+      // IMPORTANTE: NO auto-activar bot después de login
+      // El bot SOLO se activará cuando:
+      // 1. El usuario seleccione una personalidad desde el frontend
+      // 2. El usuario active la IA Global desde el frontend
+      // Esto asegura que el bot use la personalidad seleccionada por el usuario
+      console.log(`ℹ️ [LOGIN] Login exitoso. El bot NO se activa automáticamente.`);
+      console.log(`   📋 Para activar el bot:`);
+      console.log(`   1. Selecciona una personalidad desde el frontend`);
+      console.log(`   2. Activa la IA Global desde el frontend`);
+      console.log(`   3. El bot comenzará a funcionar con la personalidad seleccionada`);
+      
       res.json({ 
         success: true, 
         message: 'Login real exitoso en Instagram', 
-        restored: false, 
+        restored: loginResult.restored || false, 
         username: username, 
         connected: true,
-        sessionId: 'a123ccc0-7ee7-45da-92dc-52059c7e21c8'
+        userId: userId
       });
     } else {
-      console.log('❌ [LOGIN] Error en login real de Instagram:', loginResult.error);
+      console.log(`❌ Login fallido para usuario: ${username} - ${loginResult.error || 'Error desconocido'}`);
       res.status(401).json({ 
         success: false, 
         error: loginResult.error || 'Error en login de Instagram' 
       });
     }
   } catch (error) {
-    console.error('❌ [LOGIN] Error en login de Instagram:', error.message);
+    console.error(`❌ [LOGIN] Error en login de Instagram: ${error.message}`);
+    console.error('Stack:', error.stack);
     res.status(500).json({ 
       success: false, 
       error: 'Error interno en login de Instagram: ' + error.message 
@@ -1108,10 +1689,50 @@ app.post('/api/instagram/bot/activate', async (req, res) => {
 // Endpoint para activar/desactivar bot desde frontend
 app.post('/api/instagram/bot/toggle', async (req, res) => {
   console.log('🤖 [BOT] Endpoint de toggle del bot llamado');
+  console.log('📥 [BOT] Body recibido:', JSON.stringify(req.body, null, 2));
   const { enabled, personalityId, userId } = req.body;
   
-  // Usar userId del frontend o generar uno por defecto
-  const actualUserId = userId || 'a123ccc0-7ee7-45da-92dc-52059c7e21c8';
+  let actualUserId = userId;
+  
+  // Si no viene userId en el body, intentar obtenerlo del token
+  if (!actualUserId) {
+    try {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const { validateJwt } = await import('./config/jwt.js');
+        try {
+          const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+          if (decoded) {
+            actualUserId = decoded.userId || decoded.sub || decoded.user?.id;
+            console.log(`🔍 [BOT] userId obtenido del token: ${actualUserId}`);
+          }
+        } catch (jwtError) {
+          console.log(`⚠️ [BOT] No se pudo validar JWT`);
+        }
+      }
+    } catch (error) {
+      console.log(`⚠️ [BOT] Error obteniendo userId del token: ${error.message}`);
+    }
+  }
+  
+  if (!actualUserId) {
+    return res.status(400).json({
+      success: false,
+      error: 'userId es requerido. Por favor proporciona el userId en el body o usa un token de autenticación válido.',
+      userId: null
+    });
+  }
+  
+  if (!personalityId && enabled) {
+    return res.status(400).json({
+      success: false,
+      error: 'personalityId es requerido para activar el bot. Por favor selecciona una personalidad.',
+      userId: actualUserId
+    });
+  }
+  
+  console.log(`🔍 [BOT] userId final: ${actualUserId}`);
+  console.log(`🎭 [BOT] personalityId: ${personalityId || 'no especificada'}`);
   
   try {
     const { activateBotForUser, deactivateBotForUser, startGlobalMonitoring, stopGlobalMonitoring } = await import('./services/instagramBotService.js');
@@ -1139,19 +1760,46 @@ app.post('/api/instagram/bot/toggle', async (req, res) => {
       }
       
       // Activar bot con personalidad
+      // Intentar obtener credenciales desde variables de entorno o usar las del login
+      const botPassword = process.env.IG_PASSWORD || 'Dios2025';
+      
       const botResult = await activateBotForUser(actualUserId, {
         username: session.username,
-        password: 'Dios2025' // Usar la contraseña real
-      }, personalityId || 872);
+        password: botPassword
+      }, personalityId);
+      
+      // Dar tiempo para que el bot se inicialice completamente
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
       if (botResult) {
+        // Asegurar que el monitoreo global esté iniciado
+        try {
+          await startGlobalMonitoring();
+          console.log('✅ [BOT] Monitoreo global iniciado/verificado');
+        } catch (monitorError) {
+          console.log(`⚠️ [BOT] Error iniciando monitoreo global: ${monitorError.message}`);
+        }
+        
         console.log('✅ [BOT] Bot activado desde frontend para usuario:', actualUserId);
+        console.log(`🎭 [BOT] Personalidad ID: ${personalityId}`);
+        
+        // Verificar que el bot está realmente activo
+        const { default: instagramBotService } = await import('./services/instagramBotService.js');
+        const status = instagramBotService.getBotStatusForUser(actualUserId);
+        console.log(`📊 [BOT] Estado del bot:`, {
+          isActive: status.isActive,
+          hasService: status.hasService,
+          hasPersonality: status.hasPersonality,
+          personalityName: status.personalityData?.nombre
+        });
+        
         res.json({
           success: true,
           message: 'Bot activado exitosamente',
           active: true,
           personalityId: personalityId || 872,
-          userId: actualUserId
+          userId: actualUserId,
+          status: status
         });
       } else {
         res.status(500).json({
@@ -1255,6 +1903,7 @@ app.get('/api/instagram/personalities', async (req, res) => {
 // Endpoint para activar/desactivar IA Global desde frontend (ANTES de middlewares)
 app.post('/api/instagram/global-ai/toggle', async (req, res) => {
   console.log('🤖 [GLOBAL-AI] Endpoint de toggle de IA Global llamado');
+  console.log('📥 [GLOBAL-AI] Body recibido:', JSON.stringify(req.body, null, 2));
   const { enabled, personalityId, userId } = req.body;
   
   try {
@@ -1263,46 +1912,224 @@ app.post('/api/instagram/global-ai/toggle', async (req, res) => {
     if (enabled) {
       console.log('🚀 [GLOBAL-AI] Activando IA Global...');
       
-      // Usar userId del frontend o generar uno por defecto
-      const actualUserId = userId || 'a123ccc0-7ee7-45da-92dc-52059c7e21c8';
+      // Obtener userId del body, token, o default
+      let actualUserId = userId;
+      
+      // Si no viene en el body, intentar obtener del token
+      if (!actualUserId) {
+        try {
+          const authHeader = req.headers.authorization;
+          if (authHeader && authHeader.startsWith('Bearer ')) {
+            const { validateJwt } = await import('./config/jwt.js');
+            try {
+              const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+              if (decoded) {
+                actualUserId = decoded.userId || decoded.sub || decoded.user?.id;
+                console.log(`🔍 [GLOBAL-AI] userId obtenido del token: ${actualUserId}`);
+              }
+            } catch (jwtError) {
+              console.log(`⚠️ [GLOBAL-AI] No se pudo obtener userId del token`);
+            }
+          }
+        } catch (error) {
+          console.log(`⚠️ [GLOBAL-AI] Error obteniendo userId: ${error.message}`);
+        }
+      }
+      
+      // NO usar userId por defecto - requerir que venga del frontend o token
+      if (!actualUserId) {
+        return res.status(400).json({
+          success: false,
+          error: 'userId es requerido. Por favor proporciona el userId en el body o usa un token de autenticación válido.',
+          userId: null
+        });
+      }
+      
+      console.log(`🔍 [GLOBAL-AI] userId final a usar: ${actualUserId}`);
+      
+      if (!personalityId) {
+        return res.status(400).json({
+          success: false,
+          error: 'personalityId es requerido para activar la IA Global. Por favor selecciona una personalidad.',
+          userId: actualUserId
+        });
+      }
+      
+      console.log(`🎭 [GLOBAL-AI] personalityId: ${personalityId}`);
       
       // Verificar si hay sesión de Instagram
       const { getOrCreateIGSession } = await import('./services/instagramService.js');
       const session = await getOrCreateIGSession(actualUserId);
       
+      console.log(`\n🎯 [GLOBAL-AI] ============================================`);
+      console.log(`🎯 [GLOBAL-AI] PROCESO DE ACTIVACIÓN DE IA GLOBAL`);
+      console.log(`🎯 [GLOBAL-AI] ============================================`);
+      console.log(`   Usuario ID: ${actualUserId}`);
+      console.log(`   Personalidad ID: ${personalityId}`);
+      console.log(`   La personalidad debe estar seleccionada desde el frontend`);
+      console.log(`🎯 [GLOBAL-AI] ============================================\n`);
+      
+      console.log(`📋 [GLOBAL-AI] Verificando sesión de Instagram...`);
+      console.log(`   - logged: ${session.logged}`);
+      console.log(`   - username: ${session.username || 'N/A'}`);
+      console.log(`   - igUserId: ${session.igUserId || 'N/A'}\n`);
+      
       if (!session.logged) {
+        console.log(`❌ [GLOBAL-AI] ERROR: No hay sesión activa de Instagram`);
+        console.log(`   Pasos requeridos:`);
+        console.log(`   1. Haz login en Instagram primero`);
+        console.log(`   2. Selecciona una personalidad desde el frontend`);
+        console.log(`   3. Activa la IA Global desde el frontend\n`);
         return res.status(400).json({
           success: false,
-          error: 'No hay sesión activa de Instagram. Debe hacer login primero.'
+          error: 'No hay sesión activa de Instagram. Debe hacer login primero.',
+          userId: actualUserId,
+          steps: [
+            '1. Haz login en Instagram',
+            '2. Selecciona una personalidad desde el frontend',
+            '3. Activa la IA Global desde el frontend'
+          ]
         });
       }
       
-      // Activar bot con personalidad
+      console.log(`✅ [GLOBAL-AI] Sesión de Instagram válida`);
+      console.log(`   Username: ${session.username}`);
+      console.log(`   IG User ID: ${session.igUserId}\n`);
+      
+      console.log(`🔧 [GLOBAL-AI] Iniciando activación del bot...`);
+      console.log(`🎭 [GLOBAL-AI] Personalidad seleccionada: ${personalityId}`);
+      console.log(`   El bot usará esta personalidad para todas las respuestas\n`);
+      
+      console.log(`🔧 [GLOBAL-AI] Llamando activateBotForUser con:`);
+      console.log(`   - userId: ${actualUserId}`);
+      console.log(`   - username: ${session.username}`);
+      console.log(`   - personalityId: ${personalityId}`);
+      
       const botResult = await activateBotForUser(actualUserId, {
         username: session.username,
-        password: 'Dios2025'
-      }, personalityId || 872); // Usar personalidad por defecto del usuario actual
+        password: process.env.IG_PASSWORD || 'Dios2025'
+      }, personalityId);
+      
+      console.log(`🔍 [GLOBAL-AI] Resultado de activación: ${botResult}`);
+      console.log(`   Tipo de resultado: ${typeof botResult}`);
+      
+      // Dar tiempo para que el bot se inicialice completamente
+      console.log(`⏳ [GLOBAL-AI] Esperando 2 segundos para inicialización...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
       if (botResult) {
-        console.log('✅ [GLOBAL-AI] IA Global activada');
+        // Verificar estado del bot ANTES de iniciar monitoreo
+        const { default: instagramBotService } = await import('./services/instagramBotService.js');
+        const botStatusBefore = instagramBotService.getBotStatusForUser(actualUserId);
+        console.log(`📊 [GLOBAL-AI] Estado del bot ANTES de monitoreo:`, {
+          isActive: botStatusBefore.isActive,
+          hasService: botStatusBefore.hasService,
+          hasPersonality: botStatusBefore.hasPersonality,
+          personalityName: botStatusBefore.personalityData?.nombre
+        });
+        
+        // Asegurar que el monitoreo global esté iniciado
+        try {
+          await startGlobalMonitoring();
+          console.log('✅ [GLOBAL-AI] Monitoreo global iniciado/verificado');
+          
+          // Verificar estado global
+          const globalStatus = instagramBotService.getGlobalStatus();
+          console.log(`📊 [GLOBAL-AI] Estado global:`, globalStatus);
+        } catch (monitorError) {
+          console.error(`❌ [GLOBAL-AI] Error iniciando monitoreo global: ${monitorError.message}`);
+          console.error(monitorError);
+        }
+        
+        // Verificar estado final del bot
+        const status = instagramBotService.getBotStatusForUser(actualUserId);
+        console.log(`📊 [GLOBAL-AI] Estado final del bot:`, {
+          isActive: status.isActive,
+          hasService: status.hasService,
+          hasPersonality: status.hasPersonality,
+          personalityName: status.personalityData?.nombre,
+          personalityId: status.personalityData?.id
+        });
+        
+        console.log('✅ [GLOBAL-AI] IA Global activada exitosamente');
+        
+        // Verificar que el bot realmente esté en el Map de bots activos
+        const botDataInMap = instagramBotService.activeBots.get(actualUserId);
+        if (botDataInMap) {
+          console.log(`✅ [GLOBAL-AI] Bot confirmado en activeBots Map para ${actualUserId}`);
+          console.log(`   Bot está corriendo: ${botDataInMap.isRunning}`);
+          console.log(`   Personalidad: "${botDataInMap.personalityData?.nombre}" (ID: ${botDataInMap.personalityData?.id})`);
+        } else {
+          console.log(`⚠️ [GLOBAL-AI] Bot NO encontrado en activeBots Map para ${actualUserId}`);
+          console.log(`   Bots activos en el Map:`, Array.from(instagramBotService.activeBots.keys()));
+        }
+        
+        console.log('✅ [GLOBAL-AI] IA Global activada exitosamente');
+        
         res.json({
           success: true,
           message: 'IA Global activada exitosamente',
           active: true,
-          personalityId: personalityId || 872,
-          userId: actualUserId
+          personalityId: personalityId,
+          userId: actualUserId,
+          status: status,
+          globalStatus: instagramBotService.getGlobalStatus()
         });
       } else {
+        console.log(`❌ [GLOBAL-AI] Error: botResult es ${botResult} (esperado: true)`);
+        console.log(`   Tipo: ${typeof botResult}`);
+        
+        // Intentar obtener más información del error
+        const { default: instagramBotService } = await import('./services/instagramBotService.js');
+        const errorStatus = instagramBotService.getBotStatusForUser(actualUserId);
+        console.log(`📊 [GLOBAL-AI] Estado del bot después del error:`, errorStatus);
+        
         res.status(500).json({
           success: false,
-          error: 'Error activando IA Global'
+          error: 'Error activando IA Global. El bot no se pudo inicializar correctamente.',
+          userId: actualUserId,
+          botResult: botResult,
+          debug: {
+            hasActiveBots: instagramBotService.activeBots.size > 0,
+            activeBots: Array.from(instagramBotService.activeBots.keys()),
+            sessionLogged: session.logged,
+            sessionUsername: session.username
+          }
         });
       }
     } else {
       console.log('🛑 [GLOBAL-AI] Desactivando IA Global...');
       
-      const actualUserId = userId || 'a123ccc0-7ee7-45da-92dc-52059c7e21c8';
-      await deactivateBotForUser(actualUserId);
+      // Obtener userId dinámicamente
+      let actualUserId = userId;
+          if (!actualUserId) {
+            try {
+              const authHeader = req.headers.authorization;
+              if (authHeader && authHeader.startsWith('Bearer ')) {
+                const { validateJwt } = await import('./config/jwt.js');
+                try {
+                  const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+                  if (decoded) {
+                    actualUserId = decoded.userId || decoded.sub || decoded.user?.id;
+                  }
+                } catch (jwtError) {
+                  console.log(`⚠️ [GLOBAL-AI] No se pudo validar JWT`);
+                }
+              }
+            } catch (error) {
+              console.log(`⚠️ [GLOBAL-AI] Error obteniendo userId: ${error.message}`);
+            }
+          }
+          
+          if (!actualUserId) {
+            return res.status(400).json({
+              success: false,
+              error: 'userId es requerido para desactivar la IA Global.',
+              userId: null
+            });
+          }
+          
+          await deactivateBotForUser(actualUserId);
       
       console.log('✅ [GLOBAL-AI] IA Global desactivada');
       res.json({
@@ -1441,7 +2268,7 @@ app.use((req, res, next) => {
   const country = req.get('cf-ipcountry') || req.get('x-forwarded-for') || 'unknown';
   const userAgent = req.get('user-agent') || '';
   
-  console.log(`🌍 Request from ${country}: ${req.method} ${req.path} | UA: ${userAgent.substring(0, 50)}...`);
+  // Log eliminado para evitar spam
   
   // Si es app.uniclick.io y NO es una ruta de API, es una ruta de frontend
   if (req.get('host') === 'app.uniclick.io' && !req.path.startsWith('/api/')) {
@@ -1838,6 +2665,36 @@ server.listen(Number(ENV_CONFIG.PORT), '0.0.0.0', async () => {
 
   console.log('\x1b[36m%s\x1b[0m', `\n🚀 Servidor listo en ${ENV_CONFIG.BACKEND_URL}`);
   console.log('\x1b[90m%s\x1b[0m', '   Presiona CTRL+C para detener\n');
+  
+  // AUTO-ACTIVAR BOT SI HAY SESIÓN ACTIVA
+  try {
+    console.log('\x1b[36m%s\x1b[0m', '🤖 Verificando sesiones activas de Instagram para auto-activar bot...');
+    
+    const { getOrCreateIGSession } = await import('./services/instagramService.js');
+    
+    // Importar el módulo completo
+    const instagramBotServiceModule = await import('./services/instagramBotService.js');
+    const instagramBotService = instagramBotServiceModule.default;
+    
+    // Verificar que el módulo se cargó correctamente
+    if (!instagramBotService || !instagramBotService.activateBotForUser) {
+      console.log(`\x1b[33m%s\x1b[0m`, `⚠️ Error: instagramBotService no está disponible correctamente`);
+      console.log(`   Tipo: ${typeof instagramBotService}`);
+      console.log(`   Tiene activateBotForUser: ${!!instagramBotService?.activateBotForUser}`);
+    } else {
+      // NO auto-activar bot al iniciar - el usuario debe activarlo desde el frontend
+      // con su cuenta y personalidad seleccionada
+      console.log(`\x1b[33m%s\x1b[0m`, `ℹ️ El bot NO se auto-activa al iniciar el servidor.`);
+      console.log(`\x1b[36m%s\x1b[0m`, `   💡 Para activar el bot:`);
+      console.log(`   1. Haz login en Instagram desde el frontend (se usará tu cuenta)`);
+      console.log(`   2. Selecciona la personalidad que deseas usar`);
+      console.log(`   3. Activa la IA desde el frontend`);
+      console.log(`   El bot usará la cuenta con la que hiciste login y la personalidad que selecciones.\n`);
+    }
+  } catch (autoActivateError) {
+    console.log(`\x1b[33m%s\x1b[0m`, `⚠️ Error en auto-activación del bot: ${autoActivateError.message}`);
+    console.log(`   El bot se puede activar manualmente desde el frontend.`);
+  }
 });
 
 // Manejo de errores no capturados

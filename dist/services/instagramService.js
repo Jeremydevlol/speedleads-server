@@ -61,6 +61,38 @@ class InstagramService {
   stateFile() {
     return path.join(STATE_DIR, `${this.userId}.json`);
   }
+  
+  /**
+   * Guardar sesión en archivo (incluyendo processedMessages y processedComments)
+   */
+  async saveSession() {
+    try {
+      const file = this.stateFile();
+      
+      if (!this.logged || !this.username) {
+        return; // No guardar si no hay sesión activa
+      }
+      
+      const cookieJar = await this.ig.state.serializeCookieJar();
+      
+      // Convertir Sets a Arrays para poder guardarlos en JSON
+      const processedMessagesArray = this.processedMessages ? Array.from(this.processedMessages) : [];
+      const processedCommentsArray = this.processedComments ? Array.from(this.processedComments) : [];
+      
+      fs.writeFileSync(file, JSON.stringify({ 
+        cookieJar,
+        username: this.username,
+        igUserId: this.igUserId,
+        savedAt: new Date().toISOString(),
+        processedMessages: processedMessagesArray,
+        processedComments: processedCommentsArray
+      }), 'utf8');
+      
+      P.info(`💾 Sesión guardada (${processedMessagesArray.length} mensajes, ${processedCommentsArray.length} comentarios procesados)`);
+    } catch (error) {
+      P.warn(`⚠️ Error guardando sesión: ${error.message}`);
+    }
+  }
 
   /**
    * Login a Instagram con usuario/contraseña
@@ -91,6 +123,21 @@ class InstagramService {
           this.igUserId = user.pk;
           this.logged = true;
           
+          // Restaurar processedMessages y processedComments desde archivo
+          if (saved.processedMessages && Array.isArray(saved.processedMessages)) {
+            this.processedMessages = new Set(saved.processedMessages);
+            P.info(`✅ Restaurados ${this.processedMessages.size} mensajes procesados desde archivo`);
+          } else {
+            this.processedMessages = new Set();
+          }
+          
+          if (saved.processedComments && Array.isArray(saved.processedComments)) {
+            this.processedComments = new Set(saved.processedComments);
+            P.info(`✅ Restaurados ${this.processedComments.size} comentarios procesados desde archivo`);
+          } else {
+            this.processedComments = new Set();
+          }
+          
           P.info(`✅ Sesión de Instagram restaurada desde disco para ${username}`);
           emitToUserIG(this.userId, 'instagram:status', { 
             connected: true, 
@@ -112,14 +159,25 @@ class InstagramService {
         this.igUserId = loginResult.pk;
         this.logged = true;
 
-        // Guardar cookies
+        // Guardar cookies - asegurarse de que se guarden correctamente
+        // Pequeño delay para asegurar que las cookies se establezcan
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
         const cookieJar = await this.ig.state.serializeCookieJar();
-        fs.writeFileSync(file, JSON.stringify({ 
-          cookieJar,
-          username,
-          igUserId: this.igUserId,
-          savedAt: new Date().toISOString()
-        }), 'utf8');
+        P.info(`💾 Guardando cookies después del login`);
+        
+            // Convertir Sets a Arrays para poder guardarlos en JSON
+            const processedMessagesArray = this.processedMessages ? Array.from(this.processedMessages) : [];
+            const processedCommentsArray = this.processedComments ? Array.from(this.processedComments) : [];
+            
+            fs.writeFileSync(file, JSON.stringify({ 
+              cookieJar,
+              username,
+              igUserId: this.igUserId,
+              savedAt: new Date().toISOString(),
+              processedMessages: processedMessagesArray,
+              processedComments: processedCommentsArray
+            }), 'utf8');
 
         P.info(`✅ Login exitoso y cookies guardadas para ${username}`);
         emitToUserIG(this.userId, 'instagram:status', { 
@@ -164,13 +222,24 @@ class InstagramService {
             this.igUserId = retryResult.pk;
             this.logged = true;
             
-            // Guardar cookies
+            // Guardar cookies - asegurarse de que se guarden correctamente
+            // Pequeño delay para asegurar que las cookies se establezcan
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
             const cookieJar = await this.ig.state.serializeCookieJar();
+            P.info(`💾 Guardando cookies después de verificación`);
+            
+            // Convertir Sets a Arrays para poder guardarlos en JSON
+            const processedMessagesArray = this.processedMessages ? Array.from(this.processedMessages) : [];
+            const processedCommentsArray = this.processedComments ? Array.from(this.processedComments) : [];
+            
             fs.writeFileSync(file, JSON.stringify({ 
               cookieJar,
               username,
               igUserId: this.igUserId,
-              savedAt: new Date().toISOString()
+              savedAt: new Date().toISOString(),
+              processedMessages: processedMessagesArray,
+              processedComments: processedCommentsArray
             }), 'utf8');
             
             P.info(`✅ Login exitoso después de verificación para ${username}`);
@@ -261,6 +330,62 @@ class InstagramService {
         return { success: true, threadId, text };
       } catch (error) {
         P.error(`❌ Error respondiendo en thread ${threadId}: ${error.message}`);
+        throw error;
+      }
+    });
+  }
+
+  // Responder a un comentario en un post
+  async replyToComment(mediaId, commentId, text) {
+    return this.limiter.schedule(async () => {
+      try {
+        if (!this.logged) {
+          throw new Error('No hay sesión activa de Instagram');
+        }
+
+        P.info(`💬 Respondiendo a comentario ${commentId} en media ${mediaId}`);
+        P.info(`📝 Texto: "${text.substring(0, 100)}..."`);
+        
+        // Convertir IDs a formato correcto si es necesario
+        const mediaIdStr = String(mediaId);
+        const commentIdStr = String(commentId);
+        
+        P.info(`🔄 Media ID: ${mediaIdStr}, Comment ID: ${commentIdStr}`);
+        
+        try {
+          // Método 1: Intentar con repliedToCommentId
+          const result = await this.ig.media.comment({
+            mediaId: mediaIdStr,
+            text: text,
+            module: 'comments_v2',
+            repliedToCommentId: commentIdStr
+          });
+          
+          P.info(`✅ Respuesta enviada al comentario ${commentIdStr}`);
+          P.info(`📊 Resultado:`, JSON.stringify(result, null, 2));
+          
+          return { success: true, mediaId: mediaIdStr, commentId: commentIdStr, text, result };
+        } catch (method1Error) {
+          P.warn(`⚠️ Método 1 falló: ${method1Error.message}`);
+          
+          // Método 2: Intentar sin repliedToCommentId (como comentario normal mencionando al usuario)
+          try {
+            P.info(`🔄 Intentando método alternativo...`);
+            const result2 = await this.ig.media.comment({
+              mediaId: mediaIdStr,
+              text: text
+            });
+            
+            P.info(`✅ Respuesta enviada como comentario nuevo`);
+            return { success: true, mediaId: mediaIdStr, commentId: commentIdStr, text, result: result2, method: 'alternative' };
+          } catch (method2Error) {
+            P.error(`❌ Método alternativo también falló: ${method2Error.message}`);
+            throw method2Error;
+          }
+        }
+      } catch (error) {
+        P.error(`❌ Error respondiendo a comentario: ${error.message}`);
+        P.error(`📋 Stack:`, error.stack);
         throw error;
       }
     });
@@ -455,8 +580,468 @@ class InstagramService {
   }
 
   /**
-   * Obtener comentarios recientes de los posts del usuario
+   * Obtener comentarios de una publicación específica por URL
    */
+  async getCommentsFromPost(postUrl, limit = 50) {
+    return this.limiter.schedule(async () => {
+      try {
+        // Verificar que haya sesión activa con cookies
+        if (!this.logged) {
+          P.warn(`⚠️ Sesión no está logueada, intentando restaurar desde archivo...`);
+          try {
+            const file = this.stateFile();
+            if (fs.existsSync(file)) {
+              const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+              if (data.cookieJar && data.username) {
+                await this.ig.state.deserializeCookieJar(JSON.stringify(data.cookieJar));
+                this.logged = true;
+                this.username = data.username;
+                this.igUserId = data.igUserId;
+                P.info(`✅ Sesión restaurada desde archivo para obtener comentarios`);
+              } else {
+                throw new Error('No hay cookies guardadas. Debe hacer login primero.');
+              }
+            } else {
+              throw new Error('No hay sesión guardada. Debe hacer login primero.');
+            }
+          } catch (restoreError) {
+            P.error(`❌ Error restaurando sesión: ${restoreError.message}`);
+            throw new Error('No hay sesión activa de Instagram. Debe hacer login primero.');
+          }
+        }
+        
+        P.info(`💬 Obteniendo comentarios de publicación: ${postUrl}`);
+
+        // Extraer el código de la publicación de la URL
+        let shortcode;
+        try {
+          // Patrones comunes de URLs de Instagram
+          const urlPatterns = [
+            /instagram\.com\/p\/([A-Za-z0-9_-]+)/,
+            /instagram\.com\/reel\/([A-Za-z0-9_-]+)/,
+            /instagram\.com\/tv\/([A-Za-z0-9_-]+)/,
+            /instagram\.com\/.*\/([A-Za-z0-9_-]+)\//
+          ];
+          
+          // También manejar URLs con query parameters como ?igsh=
+          const cleanUrl = postUrl.split('?')[0];
+
+          let match = null;
+          for (const pattern of urlPatterns) {
+            match = cleanUrl.match(pattern);
+            if (match) break;
+          }
+
+          if (!match) {
+            throw new Error('URL de Instagram no válida. Debe ser un post, reel o video.');
+          }
+
+          shortcode = match[1];
+          P.info(`📝 Código de publicación extraído: ${shortcode}`);
+
+        } catch (urlError) {
+          P.error(`❌ Error procesando URL: ${urlError.message}`);
+          throw new Error(`URL de Instagram no válida: ${urlError.message}`);
+        }
+
+        // Obtener información real del media usando el shortcode
+        let postInfo;
+        let mediaId = null;
+        
+        try {
+          // Método 1: Intentar convertir shortcode a media ID manualmente
+          try {
+            const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+            let id = 0;
+            
+            for (let i = 0; i < shortcode.length; i++) {
+              const char = shortcode[i];
+              const index = alphabet.indexOf(char);
+              if (index === -1) {
+                throw new Error(`Carácter inválido en shortcode: ${char}`);
+              }
+              id = id * 64 + index;
+            }
+            
+            mediaId = id.toString();
+            P.info(`🔄 Media ID convertido: ${mediaId} (desde shortcode: ${shortcode})`);
+            
+            // Intentar obtener información real del media
+            try {
+              const mediaInfo = await this.ig.media.info(mediaId);
+              
+              if (mediaInfo && mediaInfo.items && mediaInfo.items.length > 0) {
+                const item = mediaInfo.items[0];
+                // Usar el pk del item como mediaId real
+                const realMediaId = item.pk.toString();
+                mediaId = realMediaId; // Actualizar mediaId con el pk real
+                
+                postInfo = {
+                  id: realMediaId,
+                  shortcode: item.code || shortcode,
+                  caption: item.caption?.text || '',
+                  media_type: item.media_type || 1,
+                  like_count: item.like_count || 0,
+                  comment_count: item.comment_count || 0,
+                  taken_at: item.taken_at || Math.floor(Date.now() / 1000),
+                  owner: {
+                    username: item.user?.username || 'unknown',
+                    full_name: item.user?.full_name || 'Usuario desconocido',
+                    profile_pic_url: item.user?.profile_pic_url || null
+                  }
+                };
+                
+                P.info(`✅ Información del media obtenida: @${postInfo.owner.username} - ${postInfo.comment_count} comentarios`);
+                P.info(`✅ Media ID real (pk): ${realMediaId}`);
+              }
+            } catch (infoError) {
+              P.info(`⚠️ No se pudo obtener info del media con ID ${mediaId}, usando información básica`);
+              postInfo = {
+                id: mediaId,
+                shortcode: shortcode,
+                caption: 'Información obtenida por shortcode',
+                media_type: 1,
+                like_count: 0,
+                comment_count: 0,
+                taken_at: Math.floor(Date.now() / 1000),
+                owner: {
+                  username: 'unknown',
+                  full_name: 'Usuario desconocido',
+                  profile_pic_url: null
+                }
+              };
+            }
+          } catch (conversionError) {
+            P.warn(`⚠️ Error convirtiendo shortcode: ${conversionError.message}`);
+            postInfo = {
+              id: shortcode,
+              shortcode: shortcode,
+              caption: 'Información obtenida por shortcode',
+              media_type: 1,
+              like_count: 0,
+              comment_count: 0,
+              taken_at: Math.floor(Date.now() / 1000),
+              owner: {
+                username: 'unknown',
+                full_name: 'Usuario desconocido',
+                profile_pic_url: null
+              }
+            };
+          }
+          
+          P.info(`📸 Usando media ID: ${mediaId || shortcode}`);
+        } catch (infoError) {
+          P.error(`❌ Error procesando información: ${infoError.message}`);
+          throw new Error(`No se pudo procesar información: ${infoError.message}`);
+        }
+
+        // Obtener comentarios de la publicación usando múltiples métodos
+        const comments = [];
+        try {
+          P.info(`💬 Obteniendo comentarios de la publicación...`);
+          
+          // Método 0: Intentar obtener ID usando shortcodeToMediaId si está disponible
+          let finalMediaId = mediaId;
+          try {
+            // Primero intentar obtener información del media usando shortcode directamente
+            try {
+              P.info(`🔄 Método 0a: Obteniendo info del media con shortcode: ${shortcode}`);
+              const mediaInfo = await this.ig.media.info(shortcode);
+              
+              if (mediaInfo && mediaInfo.items && mediaInfo.items.length > 0) {
+                const item = mediaInfo.items[0];
+                const realMediaId = item.pk.toString();
+                finalMediaId = realMediaId;
+                
+                postInfo = {
+                  id: realMediaId,
+                  shortcode: item.code || shortcode,
+                  caption: item.caption?.text || '',
+                  media_type: item.media_type || 1,
+                  like_count: item.like_count || 0,
+                  comment_count: item.comment_count || 0,
+                  taken_at: item.taken_at || Math.floor(Date.now() / 1000),
+                  owner: {
+                    username: item.user?.username || 'unknown',
+                    full_name: item.user?.full_name || 'Usuario desconocido',
+                    profile_pic_url: item.user?.profile_pic_url || null
+                  }
+                };
+                
+                P.info(`✅ Post info obtenida directamente: @${postInfo.owner.username} - ${postInfo.comment_count} comentarios`);
+                P.info(`✅ Media ID real (pk): ${realMediaId}`);
+              }
+            } catch (directError) {
+              P.info(`⚠️ No se pudo obtener info directa con shortcode: ${directError.message}`);
+              
+              // Intentar con shortcodeToMediaId si está disponible
+              if (this.ig.util && typeof this.ig.util.shortcodeToMediaId === 'function') {
+                P.info(`🔄 Método 0b: Usando shortcodeToMediaId nativo...`);
+                const utilMediaId = await this.ig.util.shortcodeToMediaId(shortcode);
+                if (utilMediaId) {
+                  finalMediaId = utilMediaId.toString();
+                  P.info(`✅ Media ID obtenido con shortcodeToMediaId: ${finalMediaId}`);
+                  
+                  // Actualizar postInfo si tenemos nueva información
+                  try {
+                    const mediaInfo = await this.ig.media.info(finalMediaId);
+                    if (mediaInfo && mediaInfo.items && mediaInfo.items.length > 0) {
+                      const item = mediaInfo.items[0];
+                      postInfo.id = item.pk.toString();
+                      postInfo.comment_count = item.comment_count || 0;
+                      P.info(`✅ Post info actualizada: ${item.comment_count} comentarios`);
+                    }
+                  } catch (infoError) {
+                    P.warn(`⚠️ No se pudo actualizar post info: ${infoError.message}`);
+                  }
+                }
+              }
+            }
+          } catch (utilError) {
+            P.info(`⚠️ Método shortcodeToMediaId no disponible: ${utilError.message}`);
+          }
+          
+          // Método 1: Intentar con media ID (finalMediaId o mediaId original)
+          const testMediaId = finalMediaId || mediaId || shortcode;
+          if (testMediaId) {
+            try {
+              P.info(`🔄 Método 1: Intentando con media ID: ${testMediaId}`);
+              const commentsFeed = this.ig.feed.mediaComments(testMediaId);
+              let hasMore = true;
+              let count = 0;
+
+            while (hasMore && count < limit) {
+              try {
+                const items = await commentsFeed.items();
+                
+                if (!items || items.length === 0) {
+                  P.info(`⚠️ No hay más comentarios disponibles`);
+                  break;
+                }
+
+                for (const comment of items) {
+                  if (count >= limit) break;
+
+                  comments.push({
+                    id: comment.pk.toString(),
+                    post_id: shortcode,
+                    author_name: comment.user.full_name || comment.user.username,
+                    username: comment.user.username,
+                    author_avatar: comment.user.profile_pic_url,
+                    comment_text: comment.text,
+                    timestamp: comment.created_at.toString(),
+                    like_count: comment.comment_like_count || 0,
+                    is_verified: comment.user.is_verified || false,
+                    is_business: comment.user.is_business || false
+                  });
+
+                  count++;
+                }
+                
+                if (count % 10 === 0) {
+                  P.info(`📈 Progreso: ${count}/${limit} comentarios extraídos...`);
+                }
+
+                hasMore = commentsFeed.isMoreAvailable();
+                
+                if (hasMore && count < limit) {
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+
+              } catch (pageError) {
+                P.error(`❌ Error obteniendo página de comentarios: ${pageError.message}`);
+                break;
+              }
+            }
+
+            if (comments.length > 0) {
+              P.info(`✅ ${comments.length} comentarios extraídos usando media ID: ${testMediaId}`);
+              return {
+                success: true,
+                comments,
+                post_info: postInfo,
+                extracted_count: comments.length,
+                limit_requested: limit,
+                total_comments: postInfo.comment_count
+              };
+            }
+
+          } catch (mediaIdError) {
+            P.info(`⚠️ Método con media ID ${testMediaId} falló: ${mediaIdError.message}`);
+            // Log detallado del error
+            if (mediaIdError.response) {
+              P.warn(`   Status: ${mediaIdError.response.status}`);
+              P.warn(`   Body: ${JSON.stringify(mediaIdError.response.body || {}).substring(0, 200)}`);
+            }
+          }
+        }
+
+          // Método 2: Intentar con shortcode directamente (respaldo)
+          try {
+            P.info(`🔄 Método 2: Intentando con shortcode directamente: ${shortcode}`);
+            const commentsFeed2 = this.ig.feed.mediaComments(shortcode);
+            let hasMore = true;
+            let count = 0;
+            const comments2 = [];
+
+            while (hasMore && count < limit) {
+              try {
+                const items = await commentsFeed2.items();
+                
+                if (!items || items.length === 0) {
+                  P.info(`⚠️ No hay más comentarios disponibles`);
+                  break;
+                }
+
+                for (const comment of items) {
+                  if (count >= limit) break;
+
+                  comments2.push({
+                    id: comment.pk.toString(),
+                    post_id: shortcode,
+                    author_name: comment.user.full_name || comment.user.username,
+                    username: comment.user.username,
+                    author_avatar: comment.user.profile_pic_url,
+                    comment_text: comment.text,
+                    timestamp: comment.created_at.toString(),
+                    like_count: comment.comment_like_count || 0,
+                    is_verified: comment.user.is_verified || false,
+                    is_business: comment.user.is_business || false
+                  });
+
+                  count++;
+                }
+                
+                if (count % 10 === 0) {
+                  P.info(`📈 Progreso: ${count}/${limit} comentarios extraídos...`);
+                }
+
+                hasMore = commentsFeed2.isMoreAvailable();
+                
+                if (hasMore && count < limit) {
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+
+              } catch (pageError) {
+                P.error(`❌ Error obteniendo página de comentarios: ${pageError.message}`);
+                break;
+              }
+            }
+
+            if (comments2.length > 0) {
+              P.info(`✅ ${comments2.length} comentarios extraídos usando shortcode directamente`);
+              return {
+                success: true,
+                comments: comments2,
+                post_info: postInfo,
+                extracted_count: comments2.length,
+                limit_requested: limit,
+                total_comments: postInfo.comment_count
+              };
+            }
+
+          } catch (shortcodeError) {
+            P.info(`⚠️ Método con shortcode falló: ${shortcodeError.message}`);
+          }
+          
+          // Método 3: Intentar con pk del postInfo si está disponible
+          if (postInfo && postInfo.id && postInfo.id !== shortcode && postInfo.id !== mediaId) {
+            try {
+              P.info(`🔄 Método 3: Intentando con pk del postInfo: ${postInfo.id}`);
+              const commentsFeed3 = this.ig.feed.mediaComments(postInfo.id);
+              let hasMore = true;
+              let count = 0;
+              const comments3 = [];
+
+              while (hasMore && count < limit) {
+                try {
+                  const items = await commentsFeed3.items();
+                  
+                  if (!items || items.length === 0) {
+                    P.info(`⚠️ No hay más comentarios disponibles`);
+                    break;
+                  }
+
+                  for (const comment of items) {
+                    if (count >= limit) break;
+
+                    comments3.push({
+                      id: comment.pk.toString(),
+                      post_id: postInfo.id,
+                      author_name: comment.user.full_name || comment.user.username,
+                      username: comment.user.username,
+                      author_avatar: comment.user.profile_pic_url,
+                      comment_text: comment.text,
+                      timestamp: comment.created_at.toString(),
+                      like_count: comment.comment_like_count || 0,
+                      is_verified: comment.user.is_verified || false,
+                      is_business: comment.user.is_business || false
+                    });
+
+                    count++;
+                  }
+                  
+                  if (count % 10 === 0) {
+                    P.info(`📈 Progreso: ${count}/${limit} comentarios extraídos...`);
+                  }
+
+                  hasMore = commentsFeed3.isMoreAvailable();
+                  
+                  if (hasMore && count < limit) {
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                  }
+
+                } catch (pageError) {
+                  P.error(`❌ Error obteniendo página de comentarios: ${pageError.message}`);
+                  break;
+                }
+              }
+
+              if (comments3.length > 0) {
+                P.info(`✅ ${comments3.length} comentarios extraídos usando pk del postInfo`);
+                return {
+                  success: true,
+                  comments: comments3,
+                  post_info: postInfo,
+                  extracted_count: comments3.length,
+                  limit_requested: limit,
+                  total_comments: postInfo.comment_count
+                };
+              }
+
+            } catch (pkError) {
+              P.info(`⚠️ Método con pk del postInfo falló: ${pkError.message}`);
+            }
+          }
+
+          P.info(`✅ ${comments.length} comentarios extraídos de la publicación`);
+          
+          return {
+            success: true,
+            comments,
+            post_info: postInfo,
+            extracted_count: comments.length,
+            limit_requested: limit,
+            total_comments: postInfo.comment_count
+          };
+
+        } catch (feedError) {
+          P.error(`❌ Error obteniendo comentarios: ${feedError.message}`);
+          
+          return {
+            success: false,
+            error: `No se pudieron obtener comentarios: ${feedError.message}`,
+            comments: [],
+            post_info: postInfo
+          };
+        }
+
+      } catch (error) {
+        P.error(`❌ Error obteniendo comentarios de publicación: ${error.message}`);
+        throw error;
+      }
+    });
+  }
   async getRecentComments(limit = 10) {
     try {
       if (!this.logged) {
@@ -728,13 +1313,39 @@ class InstagramService {
   async sendMessage(username, message) {
     return this.limiter.schedule(async () => {
       try {
+        // Verificar que haya sesión activa con cookies
+        if (!this.logged) {
+          P.warn(`⚠️ Sesión no está logueada, intentando restaurar desde archivo...`);
+          try {
+            const file = this.stateFile();
+            if (fs.existsSync(file)) {
+              const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+              if (data.cookieJar && data.username) {
+                await this.ig.state.deserializeCookieJar(JSON.stringify(data.cookieJar));
+                this.logged = true;
+                this.username = data.username;
+                this.igUserId = data.igUserId;
+                P.info(`✅ Sesión restaurada desde archivo para enviar mensaje`);
+              } else {
+                throw new Error('No hay cookies guardadas. Debe hacer login primero.');
+              }
+            } else {
+              throw new Error('No hay sesión guardada. Debe hacer login primero.');
+            }
+          } catch (restoreError) {
+            P.error(`❌ Error restaurando sesión: ${restoreError.message}`);
+            throw new Error('No hay sesión activa de Instagram. Debe hacer login primero.');
+          }
+        }
+        
         P.info(`📤 Enviando mensaje a ${username}: "${message}"`);
 
         let user = null;
         let userId = null;
 
-        // Intentar búsqueda exacta primero
+        // Método 1: Intentar búsqueda exacta primero
         try {
+          P.info(`🔍 Intentando búsqueda exacta para ${username}...`);
           const exactUser = await this.ig.user.searchExact(username);
           if (exactUser && exactUser.pk) {
             user = exactUser;
@@ -771,6 +1382,7 @@ class InstagramService {
         // Si aún no tenemos un usuario válido, intentar obtener por username directamente
         if (!user || !userId) {
           try {
+            P.info(`🔄 Intentando obtener info por username: ${username}...`);
             const userInfo = await this.ig.user.infoByUsername(username);
             if (userInfo && userInfo.pk) {
               user = userInfo;
@@ -782,30 +1394,74 @@ class InstagramService {
           }
         }
 
-        // Verificar que tenemos un usuario válido
-        if (!user || !userId) {
-          throw new Error(`No se pudo obtener información válida del usuario ${username}`);
+        // Método final: Intentar getIdByUsername directamente (más directo)
+        if (!userId) {
+          try {
+            P.info(`🔄 Método final: Obteniendo ID directamente con getIdByUsername...`);
+            userId = await this.ig.user.getIdByUsername(username);
+            P.info(`✅ ID obtenido directamente: ${userId}`);
+          } catch (getIdError) {
+            P.error(`❌ Error obteniendo ID: ${getIdError.message}`);
+            // No lanzar error aquí, continuar para intentar con el error descriptivo
+          }
         }
 
-        P.info(`📤 Preparando envío de mensaje a ${username} (ID: ${userId})`);
+        // Verificar que tenemos un userId válido
+        if (!userId) {
+          const errorMsg = `No se pudo obtener información válida del usuario ${username}. ` +
+            `Verifica que el username sea correcto y que tengas sesión activa.`;
+          P.error(`❌ ${errorMsg}`);
+          throw new Error(errorMsg);
+        }
 
-        // Simular envío de mensaje (la API de Instagram ha cambiado)
-        // En un entorno real, esto se conectaría con la API actualizada
-        P.info(`📤 Simulando envío de mensaje a ${username}: "${message}"`);
-        
-        // Simular delay de envío
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        P.info(`✅ Mensaje simulado enviado exitosamente a ${username}`);
+        P.info(`📤 Preparando envío REAL de mensaje a ${username} (ID: ${userId})`);
+
+        // Enviar mensaje REAL usando la API de Instagram
+        try {
+          // Usar el método correcto de la API de Instagram
+          const thread = this.ig.entity.directThread([String(userId)]);
+          await thread.broadcastText(message);
+
+          P.info(`✅ Mensaje REAL enviado exitosamente a ${username}`);
         return {
           success: true,
           recipient: username,
           message: message,
           timestamp: new Date().toISOString(),
           user_id: userId,
-          status: 'simulated',
-          note: 'Mensaje simulado - La API de Instagram ha cambiado y requiere actualización'
-        };
+            status: 'sent',
+            note: 'Mensaje enviado exitosamente a Instagram'
+          };
+        } catch (apiError) {
+          P.error(`❌ Error enviando mensaje real a ${username}: ${apiError.message}`);
+          
+          // Fallback: intentar método alternativo usando sendText
+          try {
+            P.info(`🔄 Intentando método alternativo para ${username}...`);
+            
+            const sendResult = await this.sendText({
+              username: username,
+              text: message
+            });
+
+            if (sendResult && sendResult.success) {
+              P.info(`✅ Mensaje REAL enviado exitosamente (método alternativo) a ${username}`);
+        return {
+          success: true,
+          recipient: username,
+          message: message,
+          timestamp: new Date().toISOString(),
+          user_id: userId,
+                status: 'sent',
+                method: 'alternative',
+                note: 'Mensaje enviado usando método alternativo'
+              };
+            }
+          } catch (altError) {
+            P.error(`❌ Error en método alternativo para ${username}: ${altError.message}`);
+            throw new Error(`No se pudo enviar mensaje a ${username}: ${apiError.message}`);
+          }
+        }
       } catch (error) {
         P.error(`❌ Error enviando mensaje a ${username}: ${error.message}`);
         throw error;
@@ -991,7 +1647,44 @@ class InstagramService {
  */
 export async function getOrCreateIGSession(userId) {
   if (igSessions.has(userId)) {
-    return igSessions.get(userId);
+    const existing = igSessions.get(userId);
+    // Verificar si la sesión tiene cookies cargadas
+    if (existing.logged) {
+      return existing;
+    }
+    // Si no está logueada pero existe, intentar cargar desde archivo
+    try {
+      const file = path.join(STATE_DIR, `${userId}.json`);
+      if (fs.existsSync(file)) {
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (data.cookieJar && data.username) {
+          await existing.ig.state.deserializeCookieJar(JSON.stringify(data.cookieJar));
+          existing.logged = true;
+          existing.username = data.username;
+          existing.igUserId = data.igUserId;
+          
+          // Restaurar processedMessages y processedComments
+          if (data.processedMessages && Array.isArray(data.processedMessages)) {
+            existing.processedMessages = new Set(data.processedMessages);
+            P.info(`✅ Restaurados ${existing.processedMessages.size} mensajes procesados`);
+          } else {
+            existing.processedMessages = new Set();
+          }
+          
+          if (data.processedComments && Array.isArray(data.processedComments)) {
+            existing.processedComments = new Set(data.processedComments);
+            P.info(`✅ Restaurados ${existing.processedComments.size} comentarios procesados`);
+          } else {
+            existing.processedComments = new Set();
+          }
+          
+          P.info(`✅ Sesión restaurada desde archivo para usuario ${userId}`);
+          return existing;
+        }
+      }
+    } catch (restoreError) {
+      P.warn(`⚠️ No se pudo restaurar sesión desde archivo: ${restoreError.message}`);
+    }
   }
 
   if (initializing.has(userId)) {
@@ -1000,6 +1693,40 @@ export async function getOrCreateIGSession(userId) {
 
   const sessionPromise = (async () => {
     const service = new InstagramService(userId);
+    
+    // Intentar cargar sesión guardada si existe
+    try {
+      const file = path.join(STATE_DIR, `${userId}.json`);
+      if (fs.existsSync(file)) {
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (data.cookieJar && data.username) {
+          await service.ig.state.deserializeCookieJar(JSON.stringify(data.cookieJar));
+          service.logged = true;
+          service.username = data.username;
+          service.igUserId = data.igUserId;
+          
+          // Restaurar processedMessages y processedComments
+          if (data.processedMessages && Array.isArray(data.processedMessages)) {
+            service.processedMessages = new Set(data.processedMessages);
+            P.info(`✅ Restaurados ${service.processedMessages.size} mensajes procesados`);
+          } else {
+            service.processedMessages = new Set();
+          }
+          
+          if (data.processedComments && Array.isArray(data.processedComments)) {
+            service.processedComments = new Set(data.processedComments);
+            P.info(`✅ Restaurados ${service.processedComments.size} comentarios procesados`);
+          } else {
+            service.processedComments = new Set();
+          }
+          
+          P.info(`✅ Sesión cargada desde archivo para usuario ${userId}`);
+        }
+      }
+    } catch (loadError) {
+      P.info(`ℹ️ No hay sesión guardada para usuario ${userId}, se creará una nueva al hacer login`);
+    }
+    
     igSessions.set(userId, service);
     return service;
   })();
@@ -1055,6 +1782,54 @@ export async function igSyncInbox() {
       success: false,
       error: error.message,
       data: []
+    };
+  }
+}
+
+// Función wrapper para extraer comentarios de una publicación específica
+export async function igGetCommentsFromPost(postUrl, limit = 50) {
+  try {
+    // Usar la primera sesión disponible o crear una nueva
+    let session = null;
+    for (const [userId, userSession] of igSessions) {
+      if (userSession.logged) {
+        session = userSession;
+        break;
+      }
+    }
+    
+    if (!session) {
+      return {
+        success: false,
+        error: 'No hay sesión activa de Instagram. Debe hacer login primero.',
+        comments: [],
+        post_info: null
+      };
+    }
+    
+    console.log(`💬 [IG] Extrayendo comentarios de publicación: ${postUrl}`);
+    const result = await session.getCommentsFromPost(postUrl, limit);
+    
+    return {
+      success: result.success,
+      comments: result.comments || [],
+      post_info: result.post_info,
+      extracted_count: result.extracted_count || 0,
+      limit_requested: limit,
+      total_comments: result.total_comments,
+      error: result.error,
+      message: result.success ? 
+        `${result.extracted_count} comentarios extraídos de la publicación` : 
+        `Error extrayendo comentarios: ${result.error}`
+    };
+  } catch (error) {
+    console.error('❌ [IG] Error obteniendo comentarios de publicación:', error.message);
+    return {
+      success: false,
+      comments: [],
+      post_info: null,
+      error: error.message,
+      message: 'Error interno obteniendo comentarios de publicación'
     };
   }
 }

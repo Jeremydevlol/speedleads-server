@@ -65,6 +65,7 @@ export const authMiddleware = async (req, res, next) => {
     '/api/instagram/import-leads',  // <-- Importación de leads sin autenticación
     '/api/instagram/bulk-send-list',  // <-- Envío masivo desde lista sin autenticación
     '/api/instagram/bot/update-personality',  // <-- Actualización de personalidad sin autenticación
+    '/api/instagram/comments-send-ai',  // <-- Envío automático a comentaristas sin autenticación
   ]);
 
   // Rutas públicas con patrones (regex)
@@ -200,8 +201,7 @@ export const contentTypeMiddleware = (req, res, next) => {
   const acceptLanguage = req.get('accept-language') || '';
   const country = req.get('cf-ipcountry') || req.get('x-forwarded-for') || '';
   
-  // Log específico para debugging geográfico
-  console.log(`🌍 Request desde: ${country} | User-Agent: ${userAgent.substring(0, 50)}...`);
+  // Log eliminado para evitar spam
   
   // Asegurar headers correctos para archivos estáticos
   if (req.path.endsWith('.js')) {

@@ -5,7 +5,7 @@ import express from 'express';
 import Stripe from 'stripe';
 const router = express.Router();
 // --- Stripe y Supabase ---
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2025-03-31.basil' });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 // ---------- Helpers ----------
 async function linkUserToStripeCustomer(userId, stripeCustomerId, email) {
@@ -186,8 +186,10 @@ const webhookHandler = async (req, res) => {
 router.post('/portal', express.json(), async (req, res) => {
     try {
         const { userId, returnUrl } = req.body;
-        if (!userId)
-            return res.status(400).json({ error: 'userId requerido' });
+        if (!userId) {
+            res.status(400).json({ error: 'userId requerido' });
+            return;
+        }
         const { data: existing } = await supabase
             .from('billing.billing_customers')
             .select('stripe_customer_id, email')
@@ -216,15 +218,19 @@ router.post('/portal', express.json(), async (req, res) => {
 // ---------- Opcional: estado de mi suscripción ----------
 router.get('/me', async (req, res) => {
     const userId = req.query.userId;
-    if (!userId)
-        return res.status(400).json({ error: 'userId requerido' });
+    if (!userId) {
+        res.status(400).json({ error: 'userId requerido' });
+        return;
+    }
     const { data, error } = await supabase
         .from('billing.my_subscription')
         .select('*')
         .eq('user_id', userId)
         .maybeSingle();
-    if (error)
-        return res.status(500).json({ error: error.message });
+    if (error) {
+        res.status(500).json({ error: error.message });
+        return;
+    }
     res.json({ subscription: data });
 });
 // ---------- Exportaciones ----------

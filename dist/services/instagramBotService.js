@@ -1,13 +1,62 @@
 import axios from 'axios';
-import { fetchPersonalityInstructions } from '../controllers/personalityController.js';
 import { analyzeImageUrlWithVision } from './googleVisionService.js';
 import { getOrCreateIGSession } from './instagramService.js';
 import { generateBotResponse, transcribeAudioBuffer } from './openaiService.js';
+
+// Función auxiliar para cargar personalidad directamente desde DB (evita dependencia circular)
+async function loadPersonalityData(personalityId, userId) {
+  try {
+    const { supabaseAdmin } = await import('../config/db.js');
+    
+    const { data: personalityData, error: personalityError } = await supabaseAdmin
+      .from('personalities')
+      .select('*')
+      .eq('id', personalityId)
+      .eq('users_id', userId)
+      .single();
+    
+    if (personalityError || !personalityData) {
+      throw new Error(`Personalidad no encontrada: ${personalityError?.message || 'No data'}`);
+    }
+    
+    // Obtener instrucciones adicionales
+    const { data: additionalInstructions } = await supabaseAdmin
+      .from('personality_instructions')
+      .select('instruccion')
+      .eq('personality_id', personalityId)
+      .eq('users_id', userId)
+      .order('created_at', { ascending: true });
+    
+    // Combinar instrucciones
+    let combinedInstructions = personalityData.instrucciones || '';
+    if (additionalInstructions && additionalInstructions.length > 0) {
+      const additionalText = additionalInstructions.map(instr => instr.instruccion).join('\n');
+      combinedInstructions = `${combinedInstructions}\n\n${additionalText}`;
+    }
+    
+    return {
+      id: personalityData.id,
+      nombre: personalityData.nombre,
+      empresa: personalityData.empresa,
+      sitio_web: personalityData.sitio_web,
+      posicion: personalityData.posicion,
+      category: personalityData.category,
+      instrucciones: combinedInstructions,
+      saludo: personalityData.saludo,
+      time_response: personalityData.time_response,
+      avatar_url: personalityData.avatar_url
+    };
+  } catch (error) {
+    console.error(`❌ Error cargando personalidad: ${error.message}`);
+    throw error;
+  }
+}
 
 class InstagramBotService {
   constructor() {
     this.activeBots = new Map(); // Mapa de bots activos por usuario
     this.globalCheckInterval = null;
+    this.commentsCheckInterval = null;
     this.isGlobalRunning = false;
     
     // Configuración global del bot con medidas anti-detección mejoradas
@@ -209,16 +258,38 @@ class InstagramBotService {
   }
 
   // Función para generar respuesta con IA (con soporte de medios como WhatsApp)
-  async generateAIResponse(userId, userMessage, history = [], mediaType = null, mediaContent = null) {
+  // SIEMPRE usa la personalidad del bot activo
+  async generateAIResponse(userId, userMessage, history = [], mediaType = null, mediaContent = null, additionalContext = null) {
     try {
       const botData = this.activeBots.get(userId);
-      if (!botData) return 'Gracias por tu mensaje. ¿En qué puedo ayudarte?';
+      if (!botData || !botData.isRunning) {
+        console.error(`❌ [Instagram Bot] No hay bot activo para ${userId}`);
+        return 'Gracias por tu mensaje. ¿En qué puedo ayudarte?';
+      }
+      
+      if (!botData.personalityData) {
+        console.error(`❌ [Instagram Bot] No hay personalidad configurada para el bot de ${userId}`);
+        return 'Gracias por tu mensaje. ¿En qué puedo ayudarte?';
+      }
       
       console.log(`🧠 [Instagram Bot] Generando respuesta con IA para usuario ${userId}...`);
+      console.log(`🎭 [Instagram Bot] PERSONALIDAD ACTIVA: "${botData.personalityData.nombre}" (ID: ${botData.personalityData.id})`);
       
       // Detectar si hay contenido multimedia
       if (mediaType) {
         console.log(`📎 [Instagram Bot] Mensaje con medio detectado: ${mediaType}`);
+      }
+      
+      // Si hay contexto adicional (ej: información del post), agregarlo al historial
+      let enhancedHistory = [...history];
+      if (additionalContext && additionalContext.postContext) {
+        const postCtx = additionalContext.postContext;
+        // Agregar un mensaje de sistema con el contexto del post
+        enhancedHistory.unshift({
+          role: 'system',
+          content: `Contexto de la publicación: ${postCtx.caption || 'Sin caption'}. Likes: ${postCtx.likeCount}, Comentarios: ${postCtx.commentCount}`,
+          timestamp: Date.now()
+        });
       }
       
       // Usar el sistema de IA existente con soporte de medios
@@ -227,7 +298,7 @@ class InstagramBotService {
           personality: botData.personalityData,
           userMessage: userMessage,
           userId: userId,
-          history: history,
+          history: enhancedHistory,
           mediaType: mediaType,      // Tipo de medio: 'image', 'audio', 'video', etc.
           mediaContent: mediaContent  // Contenido del medio (URL, buffer, transcripción, etc.)
         });
@@ -276,31 +347,59 @@ class InstagramBotService {
 
       const igService = await getOrCreateIGSession(userId);
       
-      const status = await igService.checkStatus();
+          // Verificar estado de la sesión
+          let status = null;
+          try {
+            console.log(`🔍 [Instagram Bot] Verificando estado de sesión para ${userId}...`);
+            status = await igService.checkStatus();
+            console.log(`🔍 [Instagram Bot] Resultado de checkStatus:`, {
+              connected: status?.connected,
+              username: status?.username,
+              igUserId: status?.igUserId
+            });
+          } catch (checkError) {
+            console.log(`⚠️ [Instagram Bot] Error verificando estado: ${checkError.message}`);
+            console.error(`   Stack:`, checkError.stack);
+            status = { connected: false, username: null };
+          }
+          
+          // Si checkStatus falla o no está conectado, verificar directamente con logged
+          if ((!status || !status.connected) && !igService.logged) {
+            console.log(`⏳ [Instagram Bot] No hay sesión activa válida para ${userId}`);
+            console.log(`   Estado de igService:`, {
+              logged: igService.logged,
+              username: igService.username,
+              igUserId: igService.igUserId
+            });
+            console.log(`   La sesión puede estar expirada. Necesitas hacer login desde el frontend primero.`);
+            console.log(`   Para activar el bot automáticamente, primero haz login exitoso desde el frontend.`);
+            return false;
+          } else {
+            // Si igService.logged es true, usar esa información
+            if (igService.logged) {
+              console.log(`✅ [Instagram Bot] Sesión activa detectada (logged: true) para ${userId}`);
+              console.log(`   Username: ${igService.username || status?.username || 'N/A'}`);
+              if (status && status.username && !igService.username) {
+                igService.username = status.username;
+              }
+            } else {
+              console.log(`✅ [Instagram Bot] Sesión activa y válida para ${userId}`);
+              console.log(`   Username: ${status.username}`);
+              // Actualizar el username en el servicio si no está establecido
+              if (!igService.username && status.username) {
+                igService.username = status.username;
+              }
+              if (!igService.logged) {
+                igService.logged = true;
+              }
+            }
+          }
       
-      if (!status.connected) {
-        console.log(`⏳ [Instagram Bot] No hay sesión activa para ${userId}, iniciando login...`);
-        const loginResult = await igService.login({
-          username: credentials.username,
-          password: credentials.password
-        });
-        
-        if (!loginResult.success) {
-          console.log(`❌ [Instagram Bot] Error en login para ${userId}:`, loginResult.message);
-          return false;
-        }
-        
-        console.log(`✅ [Instagram Bot] Login exitoso para ${userId}`);
-      } else {
-        console.log(`✅ [Instagram Bot] Sesión ya activa para ${userId}`);
-        console.log(`   Username: ${status.username}`);
-      }
-      
-      // Cargar datos de personalidad
+      // Cargar datos de personalidad directamente desde DB (evita dependencia circular)
       let personalityData;
       try {
         console.log(`🧠 [Instagram Bot] Cargando personalidad para ${userId}...`);
-        personalityData = await fetchPersonalityInstructions(personalityId, userId);
+        personalityData = await loadPersonalityData(personalityId, userId);
         console.log(`✅ [Instagram Bot] Personalidad cargada para ${userId}: ${personalityData.nombre}`);
       } catch (personalityError) {
         console.error(`❌ [Instagram Bot] Error cargando personalidad para ${userId}:`, personalityError.message);
@@ -321,10 +420,34 @@ class InstagramBotService {
         igService: igService,
         personalityData: personalityData,
         processedMessages: new Set(),
+        processedComments: new Set(),
         lastResponseTime: 0,
         isRunning: true,
-        credentials: credentials
+        credentials: credentials,
+        conversationHistory: new Map(), // Inicializar historial de conversación
+        commentHistory: new Map() // Inicializar historial de comentarios
       };
+      
+      // Intentar cargar historial desde la sesión si existe
+      if (igService.conversationHistory && igService.conversationHistory.size > 0) {
+        console.log(`📚 [Instagram Bot] Cargando ${igService.conversationHistory.size} conversaciones desde sesión`);
+        botData.conversationHistory = igService.conversationHistory;
+      }
+      
+      // Cargar mensajes procesados desde la sesión si existe (para evitar duplicados)
+      if (igService.processedMessages && igService.processedMessages.size > 0) {
+        console.log(`✅ [Instagram Bot] Cargando ${igService.processedMessages.size} mensajes procesados desde sesión`);
+        botData.processedMessages = new Set([...botData.processedMessages, ...igService.processedMessages]);
+      }
+      
+      // Cargar comentarios procesados desde la sesión si existe
+      if (igService.processedComments && igService.processedComments.size > 0) {
+        console.log(`✅ [Instagram Bot] Cargando ${igService.processedComments.size} comentarios procesados desde sesión`);
+        if (!botData.processedComments) {
+          botData.processedComments = new Set();
+        }
+        botData.processedComments = new Set([...botData.processedComments, ...igService.processedComments]);
+      }
       
       this.activeBots.set(userId, botData);
       
@@ -348,8 +471,24 @@ class InstagramBotService {
       console.log(`🔍 [Instagram Bot] Verificando nuevos mensajes para ${userId}...`);
       console.log(`   Personalidad activa: ${botData.personalityData?.nombre} (ID: ${botData.personalityData?.id})`);
       
+      // Verificar que el servicio de Instagram esté logueado
+      if (!botData.igService.logged) {
+        console.error(`❌ [Instagram Bot] El servicio de Instagram no está logueado para ${userId}`);
+        return;
+      }
+      
+      console.log(`✅ [Instagram Bot] Servicio de Instagram está logueado como: ${botData.igService.username}`);
+      
       // Obtener inbox de DMs
-      const threads = await botData.igService.fetchInbox();
+      let threads = [];
+      try {
+        threads = await botData.igService.fetchInbox();
+        console.log(`📥 [Instagram Bot] fetchInbox() completado, ${threads.length} threads obtenidos`);
+      } catch (inboxError) {
+        console.error(`❌ [Instagram Bot] Error obteniendo inbox: ${inboxError.message}`);
+        console.error(inboxError);
+        return;
+      }
       
       if (threads.length === 0) {
         console.log(`📭 [Instagram Bot] No hay conversaciones en inbox para ${userId}`);
@@ -362,10 +501,29 @@ class InstagramBotService {
             const sender = thread.users?.find(u => u.pk === thread.last_message.user_id);
             const senderUsername = sender?.username || 'Usuario';
             
-            const messageId = `${thread.thread_id}_${thread.last_message.id}_${thread.last_message.user_id}`;
+            // Crear ID único más robusto para evitar duplicados
+            // Usar thread_id, message_id, user_id y timestamp para máxima unicidad
+            const messageTimestamp = thread.last_message.timestamp || thread.last_message.timestamp_us || Date.now() * 1000;
+            const messageId = `${thread.thread_id}_${thread.last_message.id}_${thread.last_message.user_id}_${messageTimestamp}`;
+            
+            // También crear un ID alternativo usando el texto del mensaje (para detectar mensajes idénticos)
+            const messageTextForId = (thread.last_message.text || '').substring(0, 50).trim().replace(/\s+/g, ' '); // Primeros 50 caracteres normalizados
+            const alternativeMessageId = `${thread.thread_id}_${senderUsername}_${messageTextForId}_${thread.last_message.user_id}`;
+            
+            // Verificar si ya procesamos este mensaje (por ID o por contenido)
+            const alreadyProcessed = botData.processedMessages.has(messageId) || 
+                                   botData.processedMessages.has(alternativeMessageId);
+            
+            if (alreadyProcessed) {
+              // Log solo cuando es necesario para debugging
+              if (thread.last_message.id) {
+                console.log(`⏭️  [Instagram Bot] Mensaje ya procesado, omitiendo: ${messageId.substring(0, 80)}...`);
+              }
+              continue; // Omitir este mensaje, ya fue procesado
+            }
             
             // Verificar si debemos responder (anti-detección)
-            if (!botData.processedMessages.has(messageId) && this.isSafeToRespond(userId) && this.shouldRespond(userId)) {
+            if (this.isSafeToRespond(userId) && this.shouldRespond(userId)) {
               console.log(`\n💬 [Instagram Bot] Nuevo mensaje para ${userId}:`);
               console.log(`   De: @${senderUsername}`);
               
@@ -456,18 +614,66 @@ class InstagramBotService {
               await this.simulateReading(processedMessage.length);
               
               // Obtener historial de la conversación para contexto
-              const history = botData.conversationHistory?.get(thread.thread_id) || [];
+              // Intentar primero por thread_id, luego por username
+              let history = botData.conversationHistory?.get(thread.thread_id) || [];
+              
+              // Si no hay historial por thread_id, buscar por username del remitente
+              if (history.length === 0 && senderUsername) {
+                // Buscar en el bot data
+                const historyByUsername = botData.conversationHistory?.get(senderUsername);
+                if (historyByUsername && historyByUsername.length > 0) {
+                  history = historyByUsername;
+                  console.log(`📚 [Instagram Bot] Historial encontrado por username (${senderUsername}) con ${history.length} mensajes previos`);
+                  // Migrar el historial al thread_id para futuras referencias
+                  botData.conversationHistory.set(thread.thread_id, history);
+                } else {
+                  // También buscar en la sesión de Instagram
+                  try {
+                    if (botData.igService && botData.igService.conversationHistory) {
+                      const sessionHistory = botData.igService.conversationHistory.get(senderUsername);
+                      if (sessionHistory && sessionHistory.length > 0) {
+                        history = sessionHistory;
+                        console.log(`📚 [Instagram Bot] Historial encontrado en sesión por username (${senderUsername}) con ${history.length} mensajes previos`);
+                        // Migrar al bot
+                        botData.conversationHistory.set(thread.thread_id, history);
+                      }
+                    }
+                  } catch (sessionError) {
+                    console.log(`⚠️ [Instagram Bot] Error buscando historial en sesión: ${sessionError.message}`);
+                  }
+                }
+              }
+              
+              // Si hay historial, mostrar información
+              if (history.length > 0) {
+                const initialMsg = history.find(m => m.isInitialMessage);
+                if (initialMsg) {
+                  console.log(`📖 [Instagram Bot] Continuando conversación iniciada con mensaje: "${initialMsg.content.substring(0, 50)}..."`);
+                }
+                console.log(`📚 [Instagram Bot] Contexto disponible: ${history.length} mensajes previos en la conversación`);
+              }
               
               // Agregar mensaje del usuario al historial (con contenido procesado)
               history.push({
                 role: 'user',
                 content: processedMessage,
                 timestamp: Date.now(),
-                mediaType: mediaType
+                mediaType: mediaType,
+                username: senderUsername
               });
               
-              // Generar respuesta con IA (con soporte de medios)
-              const aiResponse = await this.generateAIResponse(userId, processedMessage, history, mediaType, mediaContent);
+              // Obtener información del thread para contexto adicional
+              const threadContext = {
+                threadId: thread.thread_id,
+                isGroup: thread.thread_type === 'group',
+                users: thread.users?.map(u => ({ username: u.username, fullName: u.full_name })) || []
+              };
+              
+              // Generar respuesta con IA usando la personalidad del bot activo
+              // La personalidad ya está cargada en botData.personalityData
+              console.log(`🧠 [Instagram Bot] Generando respuesta con personalidad "${botData.personalityData?.nombre || 'desconocida'}" (ID: ${botData.personalityData?.id || 'N/A'})`);
+              
+              const aiResponse = await this.generateAIResponse(userId, processedMessage, history, mediaType, mediaContent, { threadContext });
               
               console.log(`   Respuesta IA: "${aiResponse.substring(0, 100)}..."`);
               
@@ -491,15 +697,41 @@ class InstagramBotService {
                   timestamp: Date.now()
                 });
                 
-                // Guardar historial actualizado
+                // Guardar historial actualizado tanto por thread_id como por username (para continuidad)
                 if (!botData.conversationHistory) {
                   botData.conversationHistory = new Map();
                 }
-                botData.conversationHistory.set(thread.thread_id, history.slice(-50)); // Mantener últimos 50 mensajes
+                const savedHistory = history.slice(-50); // Mantener últimos 50 mensajes
+                botData.conversationHistory.set(thread.thread_id, savedHistory);
+                if (senderUsername) {
+                  botData.conversationHistory.set(senderUsername, savedHistory);
+                }
+                console.log(`💾 [Instagram Bot] Historial actualizado: ${savedHistory.length} mensajes guardados`);
                 
-                // Marcar mensaje como procesado y registrar envío
+                // Marcar mensaje como procesado (ambos IDs para máxima protección)
                 botData.processedMessages.add(messageId);
+                if (alternativeMessageId) {
+                  botData.processedMessages.add(alternativeMessageId);
+                }
+                
+                // También guardar en la sesión de Instagram para persistencia
+                if (botData.igService && !botData.igService.processedMessages) {
+                  botData.igService.processedMessages = new Set();
+                }
+                if (botData.igService && botData.igService.processedMessages) {
+                  botData.igService.processedMessages.add(messageId);
+                  if (alternativeMessageId) {
+                    botData.igService.processedMessages.add(alternativeMessageId);
+                  }
+                }
+                
+                // Guardar inmediatamente en archivo para persistencia
+                if (botData.igService && typeof botData.igService.saveSession === 'function') {
+                  await botData.igService.saveSession();
+                }
+                
                 this.recordMessageSent(userId);
+                console.log(`✅ [Instagram Bot] Mensaje marcado como procesado: ${messageId.substring(0, 80)}...`);
                 
               } catch (replyError) {
                 console.log(`❌ [Instagram Bot] Error enviando respuesta para ${userId}: ${replyError.message}`);
@@ -521,6 +753,220 @@ class InstagramBotService {
     }
   }
 
+  // Verificar nuevos comentarios en posts del usuario
+  async checkForNewComments(userId) {
+    try {
+      const botData = this.activeBots.get(userId);
+      if (!botData || !botData.isRunning) {
+        return;
+      }
+
+      console.log(`🔍 [Instagram Bot] Verificando nuevos comentarios para ${userId}...`);
+      console.log(`   Personalidad activa: ${botData.personalityData?.nombre} (ID: ${botData.personalityData?.id})`);
+      
+      try {
+        // Obtener posts recientes del usuario
+        const user = await botData.igService.ig.account.currentUser();
+        const userId_ig = user.pk;
+        const userFeed = botData.igService.ig.feed.user(userId_ig);
+        const posts = await userFeed.items();
+
+        console.log(`📸 [Instagram Bot] ${posts.length} posts encontrados para verificar comentarios`);
+
+        // Procesar los primeros 5 posts más recientes
+        for (const post of posts.slice(0, 5)) {
+          try {
+            const commentsFeed = botData.igService.ig.feed.mediaComments(post.id);
+            const comments = await commentsFeed.items();
+
+            console.log(`💬 [Instagram Bot] Post ${post.id}: ${comments.length} comentarios encontrados`);
+            
+            // Log de comentarios ya procesados para debugging
+            if (botData.processedComments && botData.processedComments.size > 0) {
+              const processedForThisPost = Array.from(botData.processedComments).filter(id => id.startsWith(post.id));
+              if (processedForThisPost.length > 0) {
+                console.log(`   📋 ${processedForThisPost.length} comentarios ya procesados anteriormente para este post`);
+              }
+            }
+
+            // Procesar cada comentario
+            for (const comment of comments) {
+              // Verificar que no sea nuestro propio comentario
+              if (comment.user.pk === userId_ig) {
+                continue;
+              }
+
+              // Asegurar que processedComments existe
+              if (!botData.processedComments) {
+                botData.processedComments = new Set();
+              }
+              
+              // También verificar en la sesión de Instagram
+              if (botData.igService && !botData.igService.processedComments) {
+                botData.igService.processedComments = new Set();
+              }
+
+              // Crear ID único más robusto para el comentario
+              // Usar post_id, comment_pk, user_pk y timestamp si está disponible
+              const commentTimestamp = comment.created_at || comment.created_at_utc || comment.timestamp || Date.now();
+              const commentId = `${post.id}_${comment.pk}_${comment.user.pk}_${commentTimestamp}`;
+              
+              // También crear un ID alternativo usando el texto del comentario (para detectar comentarios idénticos)
+              const commentTextForId = (comment.text || '').substring(0, 50).trim().replace(/\s+/g, ' ');
+              const alternativeCommentId = `${post.id}_${comment.user.username}_${commentTextForId}_${comment.user.pk}`;
+              
+              // Verificar si ya procesamos este comentario (por ID o por contenido)
+              const alreadyProcessed = botData.processedComments.has(commentId) || 
+                                     botData.processedComments.has(alternativeCommentId) ||
+                                     (botData.igService?.processedComments?.has(commentId)) ||
+                                     (botData.igService?.processedComments?.has(alternativeCommentId));
+
+              if (alreadyProcessed) {
+                // Log para debugging
+                console.log(`⏭️  [Instagram Bot] Comentario ya procesado, omitiendo: ${comment.user.username} en post ${post.id.substring(0, 30)}...`);
+                continue; // Omitir este comentario, ya fue procesado
+              }
+
+              // Verificar si debemos responder (anti-detección)
+              if (this.isSafeToRespond(userId) && this.shouldRespond(userId)) {
+                console.log(`\n💬 [Instagram Bot] Nuevo comentario en post ${post.id}:`);
+                console.log(`   De: @${comment.user.username}`);
+                console.log(`   Texto: "${comment.text}"`);
+
+                // Simular lectura del comentario
+                console.log('👀 [Instagram Bot] Simulando lectura del comentario...');
+                await this.simulateReading(comment.text.length);
+
+                // Obtener historial de comentarios para contexto
+                const commentHistory = botData.commentHistory?.get(post.id) || [];
+
+                // Obtener información del post para contexto
+                const postCaption = post.caption?.text || '';
+                const postContext = {
+                  postId: post.id,
+                  caption: postCaption,
+                  likeCount: post.like_count || 0,
+                  commentCount: post.comment_count || 0,
+                  mediaType: post.media_type || 1, // 1=photo, 2=video, 8=carousel
+                  takenAt: post.taken_at || Date.now() / 1000
+                };
+
+                // Construir mensaje con contexto completo
+                const userMessageWithContext = `Comentario en mi publicación:
+
+PUBLICACIÓN:
+${postCaption ? `📝 Caption: "${postCaption}"` : '📸 Publicación sin texto'}
+📊 Likes: ${postContext.likeCount} | Comentarios: ${postContext.commentCount}
+
+COMENTARIO:
+@${comment.user.username}: "${comment.text}"
+
+Responde de manera apropiada considerando el contexto de la publicación y mi personalidad.`;
+
+                // Agregar comentario al historial con contexto
+                commentHistory.push({
+                  role: 'user',
+                  content: comment.text,
+                  username: comment.user.username,
+                  timestamp: Date.now(),
+                  postContext: postContext
+                });
+
+                // Generar respuesta con IA incluyendo contexto del post
+                const aiResponse = await this.generateAIResponse(
+                  userId,
+                  userMessageWithContext,
+                  commentHistory,
+                  null,
+                  null,
+                  { postContext: postContext } // Pasar contexto adicional del post
+                );
+
+                console.log(`   Respuesta IA: "${aiResponse.substring(0, 100)}..."`);
+
+                // Simular escritura
+                console.log('⌨️  [Instagram Bot] Simulando escritura...');
+                await this.simulateTyping(aiResponse.length);
+
+                console.log('📤 [Instagram Bot] Enviando DM a quien comentó...');
+                try {
+                  // Enviar DM a la persona que comentó
+                  const sendResult = await botData.igService.sendMessage(comment.user.username, aiResponse);
+
+                  if (sendResult.success) {
+                    console.log(`✅ [Instagram Bot] DM enviado a @${comment.user.username} por su comentario en post ${post.id}`);
+
+                    // Agregar respuesta al historial
+                    commentHistory.push({
+                      role: 'assistant',
+                      content: aiResponse,
+                      timestamp: Date.now()
+                    });
+
+                    // Guardar historial
+                    if (!botData.commentHistory) {
+                      botData.commentHistory = new Map();
+                    }
+                    botData.commentHistory.set(post.id, commentHistory.slice(-20)); // Mantener últimos 20 comentarios
+
+                    // Marcar comentario como procesado (ambos IDs para máxima protección)
+                    botData.processedComments.add(commentId);
+                    if (alternativeCommentId) {
+                      botData.processedComments.add(alternativeCommentId);
+                    }
+                    
+                    // También guardar en la sesión de Instagram para persistencia
+                    if (!botData.igService.processedComments) {
+                      botData.igService.processedComments = new Set();
+                    }
+                    botData.igService.processedComments.add(commentId);
+                    if (alternativeCommentId) {
+                      botData.igService.processedComments.add(alternativeCommentId);
+                    }
+                    
+                    // Guardar inmediatamente en archivo para persistencia
+                    if (botData.igService && typeof botData.igService.saveSession === 'function') {
+                      await botData.igService.saveSession();
+                    }
+                    
+                    this.recordMessageSent(userId);
+                    console.log(`✅ [Instagram Bot] Comentario marcado como procesado: ${commentId}`);
+                    console.log(`   Usuario: @${comment.user.username} | Post: ${post.id.substring(0, 30)}...`);
+                  } else {
+                    console.log(`❌ [Instagram Bot] Error enviando DM: ${sendResult.error}`);
+                  }
+
+                } catch (replyError) {
+                  console.log(`❌ [Instagram Bot] Error enviando DM a @${comment.user.username}: ${replyError.message}`);
+                  console.log(`   Stack: ${replyError.stack}`);
+                }
+
+                console.log('   ' + '─'.repeat(50));
+
+                // Delay humano entre respuestas
+                const delay = this.getHumanDelay();
+                console.log(`⏳ [Instagram Bot] Esperando ${delay/1000}s (comportamiento humano)...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+              }
+            }
+
+            // Delay entre posts
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+          } catch (postError) {
+            console.log(`⚠️ [Instagram Bot] Error procesando post ${post.id}: ${postError.message}`);
+          }
+        }
+
+      } catch (error) {
+        console.log(`❌ [Instagram Bot] Error obteniendo comentarios: ${error.message}`);
+      }
+
+    } catch (error) {
+      console.log(`❌ [Instagram Bot] Error verificando comentarios para ${userId}:`, error.message);
+    }
+  }
+
   // Activar bot para un usuario
   async activateBotForUser(userId, credentials, personalityId = 872) {
     try {
@@ -532,12 +978,27 @@ class InstagramBotService {
         return false;
       }
       
-      // Iniciar verificación global si no está corriendo
-      if (!this.isGlobalRunning) {
-        await this.startGlobalMonitoring();
+      // Obtener el botData recién inicializado
+      const botData = this.activeBots.get(userId);
+      
+      // SIEMPRE iniciar monitoreo global si hay bots activos
+      if (this.activeBots.size > 0) {
+        if (!this.isGlobalRunning) {
+          console.log(`🚀 [Instagram Bot] Iniciando monitoreo global para ${this.activeBots.size} bot(s) activo(s)...`);
+          await this.startGlobalMonitoring();
+        } else {
+          console.log(`ℹ️ [Instagram Bot] Monitoreo global ya está corriendo (${this.activeBots.size} bot(s) activo(s))`);
+        }
       }
       
       console.log(`✅ [Instagram Bot] Bot activado para ${userId}`);
+      console.log(`📊 [Instagram Bot] Total de bots activos: ${this.activeBots.size}`);
+      if (botData && botData.personalityData) {
+        console.log(`🎭 [Instagram Bot] Personalidad: "${botData.personalityData.nombre}" (ID: ${botData.personalityData.id})`);
+      } else {
+        console.log(`⚠️ [Instagram Bot] Bot activado pero sin personalidad configurada`);
+      }
+      
       return true;
       
     } catch (error) {
@@ -587,7 +1048,7 @@ class InstagramBotService {
       let personalityData;
       try {
         console.log(`🧠 [Instagram Bot] Cargando nueva personalidad ${personalityId}...`);
-        personalityData = await fetchPersonalityInstructions(personalityId, userId);
+        personalityData = await loadPersonalityData(personalityId, userId);
         console.log(`✅ [Instagram Bot] Nueva personalidad cargada: ${personalityData.nombre}`);
       } catch (personalityError) {
         console.error(`❌ [Instagram Bot] Error cargando personalidad:`, personalityError.message);
@@ -609,20 +1070,30 @@ class InstagramBotService {
   // Iniciar monitoreo global
   async startGlobalMonitoring() {
     if (this.isGlobalRunning) {
+      console.log('ℹ️ [Instagram Bot] Monitoreo global ya está corriendo');
+      return;
+    }
+    
+    if (this.activeBots.size === 0) {
+      console.log('⚠️ [Instagram Bot] No hay bots activos, no se puede iniciar monitoreo global');
       return;
     }
     
     console.log('🚀 [Instagram Bot] Iniciando monitoreo global...');
+    console.log(`   🤖 Bots activos: ${this.activeBots.size}`);
+    console.log('   📥 Verificando DMs automáticamente cada 45 segundos');
+    console.log('   💬 Verificando comentarios automáticamente cada 2 minutos');
     this.isGlobalRunning = true;
     
     // Verificación inicial
     for (const [userId, botData] of this.activeBots) {
       if (botData.isRunning) {
         await this.checkForNewMessages(userId);
+        await this.checkForNewComments(userId);
       }
     }
     
-    // Configurar verificación periódica
+    // Configurar verificación periódica de DMs
     this.globalCheckInterval = setInterval(async () => {
       if (this.isGlobalRunning) {
         for (const [userId, botData] of this.activeBots) {
@@ -631,7 +1102,18 @@ class InstagramBotService {
           }
         }
       }
-    }, 45000); // 45 segundos
+    }, 45000); // 45 segundos para DMs
+    
+    // Configurar verificación periódica de comentarios (más lento, cada 2 minutos)
+    this.commentsCheckInterval = setInterval(async () => {
+      if (this.isGlobalRunning) {
+        for (const [userId, botData] of this.activeBots) {
+          if (botData.isRunning) {
+            await this.checkForNewComments(userId);
+          }
+        }
+      }
+    }, 120000); // 2 minutos para comentarios
     
     console.log('✅ [Instagram Bot] Monitoreo global iniciado');
   }
@@ -643,6 +1125,12 @@ class InstagramBotService {
     
     if (this.globalCheckInterval) {
       clearInterval(this.globalCheckInterval);
+      this.globalCheckInterval = null;
+    }
+    
+    if (this.commentsCheckInterval) {
+      clearInterval(this.commentsCheckInterval);
+      this.commentsCheckInterval = null;
     }
     
     console.log('✅ [Instagram Bot] Monitoreo global detenido');

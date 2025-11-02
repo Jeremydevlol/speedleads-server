@@ -7,7 +7,7 @@ import Stripe from 'stripe';
 const router = express.Router();
 
 // --- Stripe y Supabase ---
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-06-20' });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2025-03-31.basil' });
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
 // ---------- Helpers ----------
@@ -64,8 +64,8 @@ async function upsertSubscriptionFromStripe(sub: Stripe.Subscription, userId: st
     plan_id: planId,
     stripe_subscription_id: sub.id,
     status: sub.status as any,
-    current_period_start: sub.current_period_start ? new Date(sub.current_period_start * 1000).toISOString() : null,
-    current_period_end:   sub.current_period_end   ? new Date(sub.current_period_end   * 1000).toISOString() : null,
+    current_period_start: (sub as any).current_period_start ? new Date((sub as any).current_period_start * 1000).toISOString() : null,
+    current_period_end:   (sub as any).current_period_end   ? new Date((sub as any).current_period_end   * 1000).toISOString() : null,
     cancel_at_period_end: !!sub.cancel_at_period_end,
     canceled_at: sub.canceled_at ? new Date(sub.canceled_at * 1000).toISOString() : null,
     trial_end:   sub.trial_end   ? new Date(sub.trial_end   * 1000).toISOString() : null,
@@ -86,7 +86,7 @@ async function recordInvoiceFromStripe(inv: Stripe.Invoice) {
     .maybeSingle();
   if (!c) return;
 
-  const subId = typeof inv.subscription === 'string' ? inv.subscription : inv.subscription?.id;
+  const subId = typeof (inv as any).subscription === 'string' ? (inv as any).subscription : (inv as any).subscription?.id;
   let internalSubId: string | null = null;
   if (subId) {
     const { data: s } = await supabase
@@ -213,10 +213,13 @@ const webhookHandler = async (req: Request, res: Response) => {
 };
 
 // ---------- Portal del Cliente ----------
-router.post('/portal', express.json(), async (req: Request, res: Response) => {
+router.post('/portal', express.json(), async (req: Request, res: Response): Promise<void> => {
   try {
     const { userId, returnUrl } = req.body;
-    if (!userId) return res.status(400).json({ error: 'userId requerido' });
+    if (!userId) {
+      res.status(400).json({ error: 'userId requerido' });
+      return;
+    }
 
     const { data: existing } = await supabase
       .from('billing.billing_customers')
@@ -247,9 +250,12 @@ router.post('/portal', express.json(), async (req: Request, res: Response) => {
 });
 
 // ---------- Opcional: estado de mi suscripción ----------
-router.get('/me', async (req: Request, res: Response) => {
+router.get('/me', async (req: Request, res: Response): Promise<void> => {
   const userId = req.query.userId as string;
-  if (!userId) return res.status(400).json({ error: 'userId requerido' });
+  if (!userId) {
+    res.status(400).json({ error: 'userId requerido' });
+    return;
+  }
 
   const { data, error } = await supabase
     .from('billing.my_subscription')
@@ -257,7 +263,10 @@ router.get('/me', async (req: Request, res: Response) => {
     .eq('user_id', userId)
     .maybeSingle();
 
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
   res.json({ subscription: data });
 });
 
