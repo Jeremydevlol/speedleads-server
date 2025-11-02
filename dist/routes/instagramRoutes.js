@@ -392,4 +392,55 @@ router.get('/comments', async (req, res) => {
   }
 });
 
+/**
+ * @route   GET /api/instagram/thread/:threadId/messages
+ * @desc    Obtener historial completo de mensajes de un thread
+ * @access  Private
+ */
+router.get('/thread/:threadId/messages', async (req, res) => {
+  try {
+    const userId = req.user?.userId || req.user?.id || req.user?.sub;
+    if (!userId) {
+      console.log('❌ [API] No hay userId en la request');
+      return res.status(401).json({ 
+        success: false, 
+        error: 'No autenticado'
+      });
+    }
+
+    const { threadId } = req.params;
+    const { limit = 50 } = req.query;
+
+    console.log(`📖 [API] Obteniendo historial del thread ${threadId} para usuario ${userId}`);
+    
+    // Obtener servicio de Instagram del usuario
+    const { igGetThreadHistory } = await import('../services/instagramService.js');
+    const result = await igGetThreadHistory(threadId, parseInt(limit), userId);
+
+    if (result.success) {
+      console.log(`✅ [API] ${result.count} mensajes obtenidos del thread ${threadId}`);
+      res.json({
+        success: true,
+        data: result.messages,
+        count: result.count,
+        thread_id: result.thread_id
+      });
+    } else {
+      console.log(`❌ [API] Error obteniendo historial: ${result.error}`);
+      res.status(400).json({
+        success: false,
+        error: result.error
+      });
+    }
+
+  } catch (error) {
+    console.error(`❌ [API] Error obteniendo historial del thread: ${error.message}`);
+    console.error('Stack trace:', error.stack);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 export default router;

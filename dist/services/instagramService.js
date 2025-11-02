@@ -335,6 +335,137 @@ class InstagramService {
     });
   }
 
+  /**
+   * Obtener historial completo de un thread
+   */
+  async getThreadHistory(threadId, limit = 50) {
+    return this.limiter.schedule(async () => {
+      try {
+        if (!this.logged) {
+          throw new Error('No hay sesión activa de Instagram');
+        }
+
+        P.info(`📖 Obteniendo historial del thread ${threadId} (límite: ${limit})`);
+        
+        const thread = this.ig.entity.directThread(threadId);
+        
+        // Intentar obtener mensajes del thread
+        const messages = [];
+        let hasMore = true;
+        let count = 0;
+
+        try {
+          // Usar request() para obtener mensajes del thread
+          const threadData = await thread.request();
+          
+          if (threadData.thread && threadData.thread.items) {
+            for (const item of threadData.thread.items) {
+              if (count >= limit) break;
+
+              // Procesar el mensaje según su tipo
+              let messageText = '';
+              let mediaType = null;
+              let mediaUrl = null;
+
+              if (item.item_type === 'text') {
+                messageText = item.text || '';
+              } else if (item.item_type === 'media_share') {
+                messageText = item.media_share?.caption || '';
+                mediaType = 'media';
+              } else if (item.item_type === 'media') {
+                if (item.media.image_versions2) {
+                  mediaType = 'image';
+                  mediaUrl = item.media.image_versions2?.candidates?.[0]?.url;
+                } else if (item.media.video_versions) {
+                  mediaType = 'video';
+                  mediaUrl = item.media.video_versions?.[0]?.url;
+                }
+              } else if (item.item_type === 'voice_media') {
+                messageText = '[Audio]';
+                mediaType = 'audio';
+                mediaUrl = item.voice_media?.media?.audio?.audio_src;
+              } else if (item.item_type === 'like') {
+                messageText = '❤️ Me gusta';
+              } else if (item.item_type === 'story_share') {
+                messageText = item.story_share?.media?.caption || '[Compartió tu historia]';
+                mediaType = 'story';
+              } else {
+                messageText = '[Otro tipo de mensaje]';
+              }
+
+              // Obtener información del usuario que envió el mensaje
+              const sender = threadData.thread.users?.find(u => u.pk === item.user_id);
+              
+              messages.push({
+                id: item.item_id,
+                text: messageText,
+                sender: {
+                  pk: item.user_id,
+                  username: sender?.username || 'Usuario',
+                  full_name: sender?.full_name || sender?.username || 'Usuario',
+                  is_private: sender?.is_private || false,
+                  is_verified: sender?.is_verified || false
+                },
+                timestamp: item.timestamp || Date.now(),
+                is_own: item.user_id === this.igUserId,
+                media_type: mediaType,
+                media_url: mediaUrl,
+                item_type: item.item_type
+              });
+
+              count++;
+            }
+          }
+        } catch (requestError) {
+          P.warn(`⚠️ Error obteniendo mensajes con request(): ${requestError.message}`);
+          
+          // Intentar método alternativo: usar threadFeed
+          try {
+            const feed = this.ig.feed.directInbox();
+            const inbox = await feed.request();
+            const thread = inbox.inbox?.threads?.find(t => t.thread_id === threadId);
+            
+            if (thread && thread.items) {
+              for (const item of thread.items.slice(0, limit)) {
+                messages.push({
+                  id: item.item_id || item.id,
+                  text: item.text || '',
+                  sender: {
+                    pk: item.user_id,
+                    username: thread.users?.[0]?.username || 'Usuario',
+                    full_name: thread.users?.[0]?.full_name || 'Usuario'
+                  },
+                  timestamp: item.timestamp || Date.now(),
+                  is_own: item.user_id === this.igUserId,
+                  item_type: item.item_type || 'text'
+                });
+                count++;
+                if (count >= limit) break;
+              }
+            }
+          } catch (feedError) {
+            P.error(`❌ Error con método alternativo: ${feedError.message}`);
+            throw requestError; // Re-lanzar el error original
+          }
+        }
+
+        // Ordenar mensajes por timestamp (más antiguos primero)
+        messages.sort((a, b) => a.timestamp - b.timestamp);
+
+        P.info(`✅ ${messages.length} mensajes obtenidos del thread ${threadId}`);
+        return {
+          success: true,
+          thread_id: threadId,
+          messages: messages,
+          count: messages.length
+        };
+      } catch (error) {
+        P.error(`❌ Error obteniendo historial del thread ${threadId}: ${error.message}`);
+        throw error;
+      }
+    });
+  }
+
   // Responder a un comentario en un post
   async replyToComment(mediaId, commentId, text) {
     return this.limiter.schedule(async () => {
@@ -1518,10 +1649,31 @@ class InstagramService {
         // Verificar si la cuenta es privada
         if (userInfo.is_private) {
           P.warn(`⚠️ La cuenta ${username} es privada. No se pueden obtener seguidores.`);
+          
+          // Emitir alerta via Socket.IO
+          emitToUserIG(this.userId, 'instagram:alert', {
+            type: 'private_account_target',
+            severity: 'error',
+            message: `La cuenta @${username} es privada`,
+            description: 'No se pueden obtener seguidores de cuentas privadas. La cuenta objetivo debe ser pública para extraer sus seguidores.',
+            username: username,
+            account_info: userInfo
+          });
+          
           return {
             success: false,
             error: 'La cuenta es privada',
             followers: [],
+            public_followers: [],
+            private_followers: [],
+            alerts: [{
+              type: 'private_account_target',
+              severity: 'error',
+              message: `La cuenta @${username} es privada`,
+              description: 'No se pueden obtener seguidores de cuentas privadas. La cuenta objetivo debe ser pública para extraer sus seguidores.',
+              username: username,
+              account_info: userInfo
+            }],
             account_info: userInfo
           };
         }
@@ -1590,13 +1742,55 @@ class InstagramService {
 
           P.info(`✅ ${followers.length} seguidores extraídos de ${username} (de ${userInfo.follower_count} totales)`);
           
+          // Separar seguidores públicos de privados
+          const publicFollowers = followers.filter(f => !f.is_private);
+          const privateFollowers = followers.filter(f => f.is_private);
+          
+          // Generar alertas si es necesario
+          const alerts = [];
+          
+          // Alerta: Contar cuentas privadas entre los seguidores
+          if (privateFollowers.length > 0) {
+            alerts.push({
+              type: 'private_followers_detected',
+              severity: 'info',
+              message: `${privateFollowers.length} de ${followers.length} seguidores extraídos son cuentas privadas`,
+              description: `Estas cuentas pueden no aceptar mensajes directos de cuentas que no siguen.`,
+              count: privateFollowers.length,
+              total: followers.length
+            });
+            P.info(`⚠️ ALERTA: ${privateFollowers.length} cuentas privadas detectadas entre ${followers.length} seguidores`);
+          }
+          
+          // Alerta: Detecta si parece que no se pudieron extraer todos los seguidores
+          if (followers.length < userInfo.follower_count) {
+            const difference = userInfo.follower_count - followers.length;
+            if (difference > 100) { // Solo alertar si la diferencia es significativa
+              alerts.push({
+                type: 'partial_extraction',
+                severity: 'warning',
+                message: `Solo se pudieron extraer ${followers.length} de ${userInfo.follower_count} seguidores`,
+                description: `La diferencia de ${difference} seguidores podría deberse a límites de la API o configuración de privacidad de la cuenta.`,
+                extracted: followers.length,
+                total: userInfo.follower_count,
+                difference: difference
+              });
+              P.warn(`⚠️ ALERTA: Solo se extrajeron ${followers.length} de ${userInfo.follower_count} seguidores`);
+            }
+          }
+          
           return {
             success: true,
             followers,
+            public_followers: publicFollowers,
+            private_followers: privateFollowers,
             account_info: userInfo,
             extracted_count: followers.length,
+            public_count: publicFollowers.length,
+            private_count: privateFollowers.length,
             limit_requested: limit,
-            total_followers: userInfo.follower_count
+            total_followers: userInfo.follower_count,
+            alerts: alerts.length > 0 ? alerts : undefined
           };
 
         } catch (feedError) {
@@ -1911,18 +2105,31 @@ export async function igSearchUsers(query, limit = 10) {
 }
 
 // Función wrapper para enviar mensaje directo
-export async function igSendMessage(username, message) {
+export async function igSendMessage(username, message, userId = null) {
   try {
-    // Usar la primera sesión disponible o crear una nueva
+    // Si se proporciona userId, usar esa sesión específica
     let session = null;
-    for (const [userId, userSession] of igSessions) {
-      if (userSession.logged) {
-        session = userSession;
-        break;
+    if (userId) {
+      session = await getOrCreateIGSession(userId);
+      if (!session.logged) {
+        return {
+          success: false,
+          error: `No hay sesión activa de Instagram para el usuario ${userId}. Debe hacer login primero.`,
+          data: null
+        };
+      }
+    } else {
+      // Si no se proporciona userId, usar la primera sesión disponible (comportamiento antiguo para compatibilidad)
+      for (const [uid, userSession] of igSessions) {
+        if (userSession.logged) {
+          session = userSession;
+          console.log(`⚠️ [IG] No se proporcionó userId, usando sesión de usuario ${uid}`);
+          break;
+        }
       }
     }
     
-    if (!session) {
+    if (!session || !session.logged) {
       return {
         success: false,
         error: 'No hay sesión activa de Instagram. Debe hacer login primero.',
@@ -1930,7 +2137,7 @@ export async function igSendMessage(username, message) {
       };
     }
     
-    console.log(`📤 [IG] Enviando mensaje a ${username}: "${message}"`);
+    console.log(`📤 [IG] Enviando mensaje a ${username} desde usuario ${session.userId || 'desconocido'}: "${message}"`);
     const result = await session.sendMessage(username, message);
     
     return {
@@ -1949,18 +2156,32 @@ export async function igSendMessage(username, message) {
 }
 
 // Función wrapper para obtener seguidores de una cuenta
-export async function igGetFollowers(username, limit = 100) {
+export async function igGetFollowers(username, limit = 100, userId = null) {
   try {
-    // Usar la primera sesión disponible o crear una nueva
+    // Si se proporciona userId, usar esa sesión específica
     let session = null;
-    for (const [userId, userSession] of igSessions) {
-      if (userSession.logged) {
-        session = userSession;
-        break;
+    if (userId) {
+      session = await getOrCreateIGSession(userId);
+      if (!session.logged) {
+        return {
+          success: false,
+          error: `No hay sesión activa de Instagram para el usuario ${userId}. Debe hacer login primero.`,
+          followers: [],
+          account_info: null
+        };
+      }
+    } else {
+      // Si no se proporciona userId, usar la primera sesión disponible (comportamiento antiguo para compatibilidad)
+      for (const [uid, userSession] of igSessions) {
+        if (userSession.logged) {
+          session = userSession;
+          console.log(`⚠️ [IG] No se proporcionó userId para obtener seguidores, usando sesión de usuario ${uid}`);
+          break;
+        }
       }
     }
     
-    if (!session) {
+    if (!session || !session.logged) {
       return {
         success: false,
         error: 'No hay sesión activa de Instagram. Debe hacer login primero.',
@@ -1969,7 +2190,7 @@ export async function igGetFollowers(username, limit = 100) {
       };
     }
     
-    console.log(`👥 [IG] Obteniendo seguidores de ${username} (límite: ${limit})`);
+    console.log(`👥 [IG] Obteniendo seguidores de ${username} (límite: ${limit}) desde usuario ${session.userId || 'desconocido'}`);
     const result = await session.getFollowers(username, limit);
     
     return {
@@ -1991,6 +2212,47 @@ export async function igGetFollowers(username, limit = 100) {
       account_info: null,
       error: error.message,
       message: 'Error interno obteniendo seguidores'
+    };
+  }
+}
+
+// Función wrapper para obtener historial de un thread
+export async function igGetThreadHistory(threadId, limit = 50, userId = null) {
+  try {
+    // Si se proporciona userId, usar esa sesión específica
+    let session = null;
+    if (userId) {
+      session = await getOrCreateIGSession(userId);
+    } else {
+      // Usar la primera sesión disponible
+      for (const [uid, userSession] of igSessions) {
+        if (userSession.logged) {
+          session = userSession;
+          break;
+        }
+      }
+    }
+    
+    if (!session) {
+      return {
+        success: false,
+        error: 'No hay sesión activa de Instagram. Debe hacer login primero.',
+        messages: [],
+        count: 0
+      };
+    }
+    
+    console.log(`📖 [IG] Obteniendo historial del thread ${threadId}...`);
+    const result = await session.getThreadHistory(threadId, limit);
+    
+    return result;
+  } catch (error) {
+    console.error(`❌ [IG] Error obteniendo historial del thread: ${error.message}`);
+    return {
+      success: false,
+      error: error.message,
+      messages: [],
+      count: 0
     };
   }
 }

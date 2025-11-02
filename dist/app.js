@@ -750,8 +750,8 @@ Genera SOLO el mensaje personalizado, sin explicaciones.`;
     
     console.log(`📤 [SEND] Enviando mensaje a ${username}: "${finalMessage.substring(0, 60)}${finalMessage.length > 60 ? '...' : ''}"`);
     
-    // Enviar mensaje real a Instagram
-    const result = await igSendMessage(username, finalMessage);
+    // Enviar mensaje real a Instagram (con userId para usar la sesión correcta)
+    const result = await igSendMessage(username, finalMessage, actualUserId);
     
     if (result.success) {
       console.log(`✅ [SEND] Mensaje enviado exitosamente a ${username}`);
@@ -860,8 +860,9 @@ app.post('/api/instagram/find-and-send', async (req, res) => {
       const user = searchResult.data[0];
       console.log(`✅ [FIND-SEND] Usuario encontrado: ${user.username}`);
       
-      // Enviar mensaje al usuario encontrado
-      const sendResult = await igSendMessage(user.username, message);
+      // Enviar mensaje al usuario encontrado (con userId para usar la sesión correcta)
+      const userId = req.user?.userId || req.user?.id || req.user?.sub;
+      const sendResult = await igSendMessage(user.username, message, userId);
       
       if (sendResult.success) {
         console.log(`✅ [FIND-SEND] Mensaje enviado exitosamente a ${user.username}`);
@@ -1003,7 +1004,9 @@ app.post('/api/instagram/bulk-send-list', async (req, res) => {
       try {
         console.log(`📤 [BULK-LIST] Enviando mensaje ${i + 1}/${usernames.length} a ${username}...`);
         
-        const sendResult = await igSendMessage(username, message);
+        // Obtener userId del request
+        const userId = req.user?.userId || req.user?.id || req.user?.sub;
+        const sendResult = await igSendMessage(username, message, userId);
         
         if (sendResult.success) {
           sentCount++;
@@ -1250,8 +1253,8 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
     console.log(`🎭 [BULK-FOLLOWERS] Personalidad a usar: ${actualPersonalityId || 'ninguna'}`);
     console.log(`👤 [BULK-FOLLOWERS] Usuario: ${actualUserId || 'no especificado'}`);
 
-    // Primero obtener los seguidores
-    const followersResult = await igGetFollowers(target_username, parseInt(limit));
+    // Primero obtener los seguidores (usando la sesión del usuario correcto)
+    const followersResult = await igGetFollowers(target_username, parseInt(limit), actualUserId);
 
     if (!followersResult.success || !followersResult.followers || followersResult.followers.length === 0) {
       return res.json({
@@ -1446,7 +1449,8 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
           }
         }
         
-        const sendResult = await igSendMessage(follower.username, finalMessage);
+        // Enviar mensaje usando la sesión del usuario correcto
+        const sendResult = await igSendMessage(follower.username, finalMessage, actualUserId);
         
         if (sendResult.success) {
           sentCount++;
@@ -1459,6 +1463,52 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
             timestamp: new Date().toISOString()
           });
           console.log(`✅ [BULK-FOLLOWERS] Mensaje ${aiGenerated ? '(IA)' : '(base)'} enviado a ${follower.username}`);
+          
+          // IMPORTANTE: Marcar que ya se envió mensaje inicial a este usuario
+          // Esto previene que el bot auto-responda este mensaje que acabamos de enviar
+          try {
+            const { default: instagramBotService } = await import('./services/instagramBotService.js');
+            const { getOrCreateIGSession } = await import('./services/instagramService.js');
+            
+            if (actualUserId) {
+              const botData = instagramBotService.activeBots.get(actualUserId);
+              const igService = await getOrCreateIGSession(actualUserId);
+              
+              if (botData) {
+                // Guardar historial de conversación con el mensaje inicial
+                if (!botData.conversationHistory) {
+                  botData.conversationHistory = new Map();
+                }
+                let history = botData.conversationHistory.get(follower.username) || [];
+                history.push({
+                  role: 'assistant',
+                  content: finalMessage,
+                  timestamp: Date.now(),
+                  isInitialMessage: true
+                });
+                botData.conversationHistory.set(follower.username, history.slice(-50));
+                console.log(`💾 [BULK-FOLLOWERS] Historial guardado para ${follower.username}`);
+              }
+              
+              if (igService) {
+                // Guardar también en la sesión de Instagram
+                if (!igService.conversationHistory) {
+                  igService.conversationHistory = new Map();
+                }
+                let history = igService.conversationHistory.get(follower.username) || [];
+                history.push({
+                  role: 'assistant',
+                  content: finalMessage,
+                  timestamp: Date.now(),
+                  isInitialMessage: true
+                });
+                igService.conversationHistory.set(follower.username, history.slice(-50));
+                console.log(`💾 [BULK-FOLLOWERS] Historial guardado en sesión para ${follower.username}`);
+              }
+            }
+          } catch (histError) {
+            console.log(`⚠️ [BULK-FOLLOWERS] Error guardando historial para ${follower.username}: ${histError.message}`);
+          }
         } else {
           failedCount++;
           results.push({
@@ -1469,6 +1519,13 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
             timestamp: new Date().toISOString()
           });
           console.log(`❌ [BULK-FOLLOWERS] Error enviando a ${follower.username}: ${sendResult.error}`);
+          
+          // Si el error indica que no hay sesión activa, detener el proceso
+          if (sendResult.error && sendResult.error.includes('No hay sesión activa')) {
+            console.error(`🚨 [BULK-FOLLOWERS] SESIÓN EXPIRADA DURANTE ENVÍO MASIVO. Deteniendo proceso...`);
+            console.log(`📊 [BULK-FOLLOWERS] Resumen hasta ahora: ${sentCount} enviados, ${failedCount} fallidos`);
+            break; // Salir del loop
+          }
         }
       } catch (error) {
         failedCount++;
@@ -1480,6 +1537,13 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
           timestamp: new Date().toISOString()
         });
         console.log(`❌ [BULK-FOLLOWERS] Error enviando a ${follower.username}: ${error.message}`);
+        
+        // Si el error indica que no hay sesión activa, detener el proceso
+        if (error.message && error.message.includes('No hay sesión activa')) {
+          console.error(`🚨 [BULK-FOLLOWERS] SESIÓN EXPIRADA DURANTE ENVÍO MASIVO. Deteniendo proceso...`);
+          console.log(`📊 [BULK-FOLLOWERS] Resumen hasta ahora: ${sentCount} enviados, ${failedCount} fallidos`);
+          break; // Salir del loop
+        }
       }
 
       // Delay entre mensajes para evitar rate limiting

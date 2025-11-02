@@ -487,6 +487,76 @@ class InstagramBotService {
       } catch (inboxError) {
         console.error(`❌ [Instagram Bot] Error obteniendo inbox: ${inboxError.message}`);
         console.error(inboxError);
+        
+        // Detectar si la sesión expiró o hay problemas con Instagram
+        const errorMsg = inboxError.message || '';
+        const errorStatus = inboxError.response?.status || inboxError.status || 0;
+        
+        // Detectar errores específicos de Instagram
+        const isSessionExpired = errorStatus === 403 || 
+                                  errorStatus === 401 || 
+                                  errorMsg.includes('login_required') ||
+                                  errorMsg.includes('Forbidden');
+        
+        const isRateLimit = errorStatus === 429 || 
+                            errorMsg.includes('rate') || 
+                            errorMsg.includes('spam') ||
+                            errorMsg.includes('too many');
+        
+        const isServerError = errorStatus === 500 || errorStatus === 502 || errorStatus === 503;
+        
+        // Emitir alerta específica según el tipo de error
+        try {
+          const { emitToUserIG } = await import('./instagramService.js');
+          
+          if (isSessionExpired) {
+            console.error(`🚨 [Instagram Bot] SESIÓN EXPIRADA para usuario ${userId}`);
+            emitToUserIG(userId, 'instagram:alert', {
+              type: 'session_expired',
+              severity: 'error',
+              message: 'Sesión de Instagram expirada',
+              description: 'Tu sesión de Instagram ha expirado o fue cerrada. Por favor, haz login nuevamente desde el panel de Instagram.',
+              action_required: true,
+              timestamp: Date.now()
+            });
+            
+            // Marcar sesión como desconectada
+            botData.igService.logged = false;
+          } else if (isRateLimit) {
+            console.error(`🚨 [Instagram Bot] RATE LIMIT alcanzado para usuario ${userId}`);
+            emitToUserIG(userId, 'instagram:alert', {
+              type: 'rate_limit',
+              severity: 'warning',
+              message: 'Rate limit de Instagram alcanzado',
+              description: 'Instagram está limitando tus acciones. Espera 1-2 horas antes de continuar.',
+              action_required: true,
+              wait_time: '1-2 horas',
+              timestamp: Date.now()
+            });
+          } else if (isServerError) {
+            console.error(`🚨 [Instagram Bot] Error de servidor de Instagram (${errorStatus})`);
+            emitToUserIG(userId, 'instagram:alert', {
+              type: 'instagram_server_error',
+              severity: 'warning',
+              message: 'Instagram temporalmente no disponible',
+              description: `Instagram está devolviendo error ${errorStatus}. Esto puede ser temporal. El bot intentará de nuevo automáticamente.`,
+              error_status: errorStatus,
+              timestamp: Date.now()
+            });
+          } else {
+            // Error genérico
+            emitToUserIG(userId, 'instagram:alert', {
+              type: 'unknown_error',
+              severity: 'error',
+              message: 'Error obteniendo mensajes',
+              description: `Error: ${errorMsg}`,
+              timestamp: Date.now()
+            });
+          }
+        } catch (alertError) {
+          console.error(`⚠️ [Instagram Bot] Error emitiendo alerta: ${alertError.message}`);
+        }
+        
         return;
       }
       
@@ -500,6 +570,8 @@ class InstagramBotService {
           if (thread.last_message && thread.last_message.user_id !== botData.igService.igUserId) {
             const sender = thread.users?.find(u => u.pk === thread.last_message.user_id);
             const senderUsername = sender?.username || 'Usuario';
+            const senderPk = sender?.pk;
+            const isSenderPrivate = sender?.is_private || false;
             
             // Crear ID único más robusto para evitar duplicados
             // Usar thread_id, message_id, user_id y timestamp para máxima unicidad
@@ -522,10 +594,31 @@ class InstagramBotService {
               continue; // Omitir este mensaje, ya fue procesado
             }
             
+            // Alerta: Detectar si el remitente tiene cuenta privada
+            if (isSenderPrivate) {
+              console.log(`🔒 [Instagram Bot] Alerta: Cuenta privada detectada: @${senderUsername}`);
+              // Importar la función de emisión de alertas
+              try {
+                const { emitToUserIG } = await import('./instagramService.js');
+                emitToUserIG(userId, 'instagram:alert', {
+                  type: 'private_account_message',
+                  severity: 'info',
+                  message: `Mensaje recibido de cuenta privada: @${senderUsername}`,
+                  description: 'Has recibido un mensaje de una cuenta privada. Puede que sea un mensaje importante de un usuario que te sigue.',
+                  username: senderUsername,
+                  pk: senderPk,
+                  is_private: true,
+                  timestamp: Date.now()
+                });
+              } catch (alertError) {
+                console.log(`⚠️ [Instagram Bot] Error emitiendo alerta: ${alertError.message}`);
+              }
+            }
+            
             // Verificar si debemos responder (anti-detección)
             if (this.isSafeToRespond(userId) && this.shouldRespond(userId)) {
               console.log(`\n💬 [Instagram Bot] Nuevo mensaje para ${userId}:`);
-              console.log(`   De: @${senderUsername}`);
+              console.log(`   De: @${senderUsername}${isSenderPrivate ? ' (🔒 Cuenta privada)' : ''}`);
               
               let messageText = thread.last_message.text || '';
               console.log(`   Texto: "${messageText}"`);
@@ -960,6 +1053,54 @@ Responde de manera apropiada considerando el contexto de la publicación y mi pe
 
       } catch (error) {
         console.log(`❌ [Instagram Bot] Error obteniendo comentarios: ${error.message}`);
+        
+        // Detectar si la sesión expiró también para comentarios
+        const errorMsg = error.message || '';
+        const errorStatus = error.response?.status || error.status || 0;
+        
+        const isSessionExpired = errorStatus === 403 || 
+                                  errorStatus === 401 || 
+                                  errorMsg.includes('login_required') ||
+                                  errorMsg.includes('Forbidden');
+        
+        const isRateLimit = errorStatus === 429 || 
+                            errorMsg.includes('rate') || 
+                            errorMsg.includes('spam') ||
+                            errorMsg.includes('too many');
+        
+        if (isSessionExpired) {
+          console.error(`🚨 [Instagram Bot] SESIÓN EXPIRADA (comentarios) para usuario ${userId}`);
+          try {
+            const { emitToUserIG } = await import('./instagramService.js');
+            emitToUserIG(userId, 'instagram:alert', {
+              type: 'session_expired',
+              severity: 'error',
+              message: 'Sesión de Instagram expirada',
+              description: 'Tu sesión de Instagram ha expirado o fue cerrada. Por favor, haz login nuevamente.',
+              action_required: true,
+              timestamp: Date.now()
+            });
+            botData.igService.logged = false;
+          } catch (alertError) {
+            console.error(`⚠️ [Instagram Bot] Error emitiendo alerta: ${alertError.message}`);
+          }
+        } else if (isRateLimit) {
+          console.error(`🚨 [Instagram Bot] RATE LIMIT alcanzado (comentarios) para usuario ${userId}`);
+          try {
+            const { emitToUserIG } = await import('./instagramService.js');
+            emitToUserIG(userId, 'instagram:alert', {
+              type: 'rate_limit',
+              severity: 'warning',
+              message: 'Rate limit de Instagram alcanzado',
+              description: 'Instagram está limitando tus acciones. Espera 1-2 horas antes de continuar.',
+              action_required: true,
+              wait_time: '1-2 horas',
+              timestamp: Date.now()
+            });
+          } catch (alertError) {
+            console.error(`⚠️ [Instagram Bot] Error emitiendo alerta: ${alertError.message}`);
+          }
+        }
       }
 
     } catch (error) {
