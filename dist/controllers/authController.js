@@ -228,22 +228,17 @@ async function login(req, res) {
       return res.status(400).json({ message: 'Faltan email o password.' });
     }
 
-    const { rows: foundUsers } = await pool.query(
-      `SELECT id, email, username, role, password_hash, avatar_url, full_name
-         FROM users
-        WHERE email = $1
-        LIMIT 1`,
-      [email]
-    );
-    if (foundUsers.length === 0) {
+    // Autenticar con Supabase Auth
+    const { data: authData, error: authError } = await supabaseAdmin.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (authError || !authData.user) {
       return res.status(401).json({ message: 'Credenciales inválidas.' });
     }
 
-    const user = foundUsers[0];
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) {
-      return res.status(401).json({ message: 'Credenciales inválidas.' });
-    }
+    const user = authData.user;
 
     // Buscar subdominio del usuario en websites (solo si wildcards están habilitados)
     let userSubdomain = null;
@@ -251,11 +246,14 @@ async function login(req, res) {
     
     if (enableWildcards) {
       try {
-        const { rows: websites } = await pool.query(
-          `SELECT slug FROM websites WHERE user_id = $1 AND is_published = true LIMIT 1`,
-          [user.id]
-        );
-        if (websites.length > 0) {
+        const { data: websites } = await supabaseAdmin
+          .from('websites')
+          .select('slug')
+          .eq('user_id', user.id)
+          .eq('is_published', true)
+          .limit(1);
+        
+        if (websites && websites.length > 0) {
           userSubdomain = websites[0].slug;
         }
       } catch (subdomainError) {
@@ -327,10 +325,10 @@ async function login(req, res) {
       user: {
         id: user.id,
         email: user.email,
-        username: user.username,
-        role: user.role,
-        avatar_url: user.avatar_url || '',
-        full_name: user.full_name || '',
+        username: user.user_metadata?.username || user.email?.split('@')[0] || '',
+        role: user.app_metadata?.role || user.role || 'user',
+        avatar_url: user.user_metadata?.avatar_url || '',
+        full_name: user.user_metadata?.full_name || user.user_metadata?.name || '',
         subdomain: userSubdomain, // <- NUEVO: información del subdominio
       },
       redirect: redirectUrl // <- NUEVO: URL de redirección si aplica
@@ -546,37 +544,43 @@ async function googleAuth(req, res) {
       return res.status(400).json({ message: 'Email es requerido para autenticación con Google.' });
     }
 
-    // Buscar usuario existente
-    let { rows: foundUsers } = await pool.query(
-      `SELECT id, email, username, role, avatar_url, full_name
-         FROM users
-        WHERE email = $1
-        LIMIT 1`,
-      [email]
-    );
-
+    // Buscar o crear usuario en Supabase Auth
+    const { data: existingUser } = await supabaseAdmin.auth.admin.getUserByEmail(email);
+    
     let user;
-    if (foundUsers.length === 0) {
-      // Crear nuevo usuario
+    if (!existingUser || !existingUser.user) {
+      // Crear nuevo usuario en Supabase Auth
       const username = email.split('@')[0];
-      const { rows: newUser } = await pool.query(
-        `INSERT INTO users
-           (full_name, username, email, password_hash, role, avatar_url, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-         RETURNING id, email, username, role, full_name, avatar_url`,
-        [name, username, email, '', 'user', picture]
-      );
-      user = newUser[0];
+      const { data: newUserData, error: createError } = await supabaseAdmin.auth.admin.createUser({
+        email,
+        email_confirm: true,
+        user_metadata: {
+          full_name: name,
+          username: username,
+          avatar_url: picture
+        },
+        app_metadata: {
+          role: 'user'
+        }
+      });
+      
+      if (createError) {
+        throw createError;
+      }
+      
+      user = newUserData.user;
       console.log('✅ Nuevo usuario creado con Google OAuth:', email);
     } else {
-      user = foundUsers[0];
+      user = existingUser.user;
+      
       // Actualizar avatar si cambió
-      if (picture && picture !== user.avatar_url) {
-        await pool.query(
-          `UPDATE users SET avatar_url = $1, updated_at = NOW() WHERE id = $2`,
-          [picture, user.id]
-        );
-        user.avatar_url = picture;
+      if (picture && picture !== user.user_metadata?.avatar_url) {
+        await supabaseAdmin.auth.admin.updateUserById(user.id, {
+          user_metadata: {
+            ...user.user_metadata,
+            avatar_url: picture
+          }
+        });
       }
       console.log('✅ Usuario existente autenticado con Google OAuth:', email);
     }
@@ -610,8 +614,8 @@ async function googleAuth(req, res) {
         .from('profilesusers')
         .upsert({
           user_id: user.id,
-          username: user.username,
-          avatar_url: user.avatar_url
+          username: user.user_metadata?.username || email.split('@')[0],
+          avatar_url: user.user_metadata?.avatar_url || picture
         }, {
           onConflict: 'user_id'
         });
@@ -627,10 +631,10 @@ async function googleAuth(req, res) {
       user: {
         id: user.id,
         email: user.email,
-        username: user.username,
-        role: user.role,
-        avatar_url: user.avatar_url || '',
-        full_name: user.full_name || '',
+        username: user.user_metadata?.username || user.email?.split('@')[0] || '',
+        role: user.app_metadata?.role || user.role || 'user',
+        avatar_url: user.user_metadata?.avatar_url || '',
+        full_name: user.user_metadata?.full_name || user.user_metadata?.name || '',
       },
       // 🔒 CENTRALIZACIÓN: SIEMPRE redirigir a app.uniclick.io
       redirect: 'https://app.uniclick.io/dashboard'

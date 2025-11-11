@@ -88,3 +88,5 @@ Cada seguidor recibirá:
 2. ✅ Bot de Instagram activo con personalidad seleccionada
 3. ✅ Variable de entorno `NEXT_PUBLIC_BACKEND_URL` configurada (o usa el default `http://localhost:5001`)
 
+
+

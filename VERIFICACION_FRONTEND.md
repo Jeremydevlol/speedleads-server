@@ -227,3 +227,5 @@ El backend está completamente funcional y listo para recibir las peticiones del
 
 Si el frontend sigue el formato mostrado en este documento, todo debería funcionar sin problemas.
 
+
+

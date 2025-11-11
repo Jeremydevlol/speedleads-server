@@ -175,7 +175,7 @@ router.post('/send_message', validateJwt, async (req, res) => {
       return res.status(401).json({ success: false, message: 'No autenticado' })
     }
 
-    const { conversationId, textContent, attachments = [], senderType = 'you' } = req.body
+    const { conversationId, textContent, attachments = [], senderType = 'you', send_as_audio = false } = req.body
 
     if (!conversationId || !textContent) {
       return res.status(400).json({
@@ -189,7 +189,8 @@ router.post('/send_message', validateJwt, async (req, res) => {
       conversationId, 
       textContent, 
       attachments, 
-      senderType
+      senderType,
+      send_as_audio
     )
 
     return res.json({
@@ -218,7 +219,7 @@ router.post('/send_message_to_number', validateJwt, async (req, res) => {
       return res.status(401).json({ success: false, message: 'No autenticado' })
     }
 
-    const { phoneNumber, textContent, attachments = [], senderType = 'you', defaultCountry = '34' } = req.body
+    const { phoneNumber, textContent, attachments = [], senderType = 'you', defaultCountry = '34', send_as_audio = false } = req.body
 
     if (!phoneNumber || !textContent) {
       return res.status(400).json({
@@ -227,7 +228,7 @@ router.post('/send_message_to_number', validateJwt, async (req, res) => {
       })
     }
 
-    console.log(`📱 Solicitud de envío a número: ${phoneNumber}`);
+    console.log(`📱 Solicitud de envío a número: ${phoneNumber}${send_as_audio ? ' (como audio)' : ''}`);
 
     const result = await whatsappController.sendMessageToNumber(
       userId, 
@@ -235,7 +236,8 @@ router.post('/send_message_to_number', validateJwt, async (req, res) => {
       textContent, 
       attachments, 
       senderType,
-      defaultCountry
+      defaultCountry,
+      send_as_audio
     )
 
     return res.json({

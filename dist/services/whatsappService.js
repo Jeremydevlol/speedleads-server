@@ -132,25 +132,40 @@ export async function startSession(userId) {
       shouldSyncHistoryMessage: () => false,
       options: {
         phoneNumber: '',
-        qrTimeout: 60000, // Aumentar timeout del QR
+        qrTimeout: 120000, // Aumentar timeout del QR a 2 minutos
       },
-      connectTimeoutMs: 60000, // Aumentar timeout de conexión
-      keepAliveIntervalMs: 30000, // Mantener conexión viva
+      connectTimeoutMs: 120000, // Aumentar timeout de conexión a 2 minutos
+      keepAliveIntervalMs: 30000, // Mantener conexión viva cada 30 segundos
+      retryRequestDelayMs: 250, // Delay entre reintentos de requests fallidos
+      maxMsgRetryCount: 3, // Máximo de reintentos para mensajes
     });
+    
+    // IMPORTANTE: Guardar el socket en sessions INMEDIATAMENTE para que getLastQrForUser pueda encontrarlo
+    // aunque aún no esté conectado. Esto permite que el QR esté disponible desde el principio.
+    if (!sessions.has(userId)) {
+      sessions.set(userId, sock);
+      console.log(`📌 Socket guardado en sessions para usuario ${userId} (antes de generar QR)`);
+    }
+    
     let contactsSynced = false;  // Bandera para saber si los contactos han sido sincronizados
     sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-      console.log(`Connection update for user ${userId}: ${connection}`);  // Debugging
-      console.log(`QR available: ${!!qr}`);  // Debugging
-      console.log(`Last disconnect: ${lastDisconnect ? JSON.stringify(lastDisconnect) : 'none'}`);  // Debugging
+      console.log(`🔔 Connection update for user ${userId}: ${connection}`);  // Debugging
+      console.log(`📱 QR available: ${!!qr}`);  // Debugging
+      console.log(`🔌 Last disconnect: ${lastDisconnect ? JSON.stringify(lastDisconnect) : 'none'}`);  // Debugging
       
       if (qr) {
-        console.log(`📱 QR generado para usuario ${userId}`);
+        console.log(`✅ QR generado para usuario ${userId}`);
+        // Guardar QR en múltiples lugares para asegurar disponibilidad
         qrCache.set(userId, qr);
+        // Guardar también en el objeto sock para que getLastQrForUser lo encuentre
+        sock.qr = qr;
+        console.log(`💾 QR guardado en cache y sock.qr para usuario ${userId}`);
         emitToUser(userId, 'qr-code', qr);
       }
       
       if (connection === 'open') {
         console.log(`✅ Conexión abierta para usuario ${userId}`);
+        // Asegurar que el socket esté guardado en sessions
         if (!sessions.has(userId)) {
           console.log(`Guardando la sesión para el usuario ${userId}`);  // Debugging
           sessions.set(userId, sock);  // Guardamos la sesión en sessions
@@ -192,23 +207,52 @@ export async function startSession(userId) {
 
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
+        const errorTag = lastDisconnect?.error?.data?.tag;
         console.log(`Connection closed: ${code === DisconnectReason.loggedOut ? 'Logged out' : 'Other reason'}`);
+        console.log(`Error code: ${code}, Error tag: ${errorTag}`);
+        
         const loggedOut = code === DisconnectReason.loggedOut;
+        const isStreamError = code === 515 || errorTag === 'stream:error';
+        
         console.log(`Connection closed for user ${userId}: ${loggedOut ? 'Logged out' : 'Other error'}`);
         initializing.delete(userId);
 
         if (loggedOut) {
-          console.log(`User ${userId} logged out, removing auth files`);  // Debugging
+          console.log(`User ${userId} logged out, removing auth files`);
           sessions.delete(userId);
-          fs.rmSync(`${AUTH_DIR}/${userId}`, { recursive: true, force: true });
+          try {
+            fs.rmSync(`${AUTH_DIR}/${userId}`, { recursive: true, force: true });
+          } catch (rmError) {
+            console.error(`Error removiendo archivos de auth: ${rmError.message}`);
+          }
           emitToUser(userId, 'session-closed', { reason: 'logged_out' });
+        } else if (isStreamError) {
+          // Error de stream (515) - limpiar sesión y reconectar
+          console.log(`🔄 [${userId}] Stream error detectado, limpiando sesión y reconectando...`);
+          sessions.delete(userId);
+          
+          // Limpiar archivos de auth temporalmente si es necesario (comentado por seguridad)
+          // Solo si el error es recurrente se podría considerar esto
+          
+          emitToUser(userId, 'session-closed', { reason: 'stream_error' });
+          
+          // Esperar un poco más antes de reconectar en caso de stream error
+          setTimeout(() => {
+            console.log(`🔄 [${userId}] Intentando reconectar después de stream error...`);
+            startSession(userId).catch((e) => {
+              console.error(`❌ [${userId}] Error reconectando después de stream error:`, e.message);
+              emitToUser(userId, 'connection-error', { message: 'Error reconectando. Intenta escanear el QR de nuevo.' });
+            });
+          }, 3000);  // Esperar 3 segundos antes de reconectar
+        } else {
+          // Otro tipo de desconexión - intentar reconectar normalmente
+          console.log(`🔄 [${userId}] Desconexión temporal, intentando reconectar...`);
+          setTimeout(() => {
+            startSession(userId).catch((e) => {
+              console.error(`❌ [${userId}] Error intentando reconectar el socket:`, e.message);
+            });
+          }, 1000);  // Espera 1 segundo antes de intentar reconectar
         }
-
-        // Si se cierra la conexión por cualquier motivo, intentamos reconectar
-        setTimeout(() => startSession(userId).catch((e) => {
-          console.error(`Error intentando reconectar el socket para el usuario ${userId}:`, e);
-          // Aquí podrías agregar un delay de reintentos si lo necesitas
-        }), 1000);  // Espera 1 segundo antes de intentar reconectar
       }
     });
     sock.ev.on('creds.update', saveCreds);

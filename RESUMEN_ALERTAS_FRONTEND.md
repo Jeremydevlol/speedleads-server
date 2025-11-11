@@ -133,6 +133,10 @@ const MyComponent = () => {
 | `session_expired` ⭐ | 🔴 error | Sesión de Instagram expirada |
 | `rate_limit` ⭐ | 🟡 warning | Rate limit alcanzado |
 | `instagram_server_error` ⭐ | 🟡 warning | Error 500/502/503 de Instagram |
+| `facebook_linked_account` ⭐ | 🔴 error | Cuenta vinculada a Facebook |
+| `login_blocked` ⭐ | 🔴 error | Login bloqueado (cuenta nueva/IP) |
+| `challenge_required` ⭐ | 🟡 warning | Verificación requerida (challenge) |
+| `challenge_verification_pending` ⭐ | 🟡 warning | Verificación pendiente (401 después de verificar) |
 | `private_account_target` | 🔴 error | Cuenta objetivo es privada |
 | `private_followers_detected` | 🔵 info | Hay cuentas privadas en seguidores |
 | `partial_extraction` | 🟡 warning | No se extrajeron todos los seguidores |

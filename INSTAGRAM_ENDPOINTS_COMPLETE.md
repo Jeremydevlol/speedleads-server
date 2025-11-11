@@ -389,3 +389,5 @@ Basado en pruebas con token Bearer:
 5. **Historial de conversación**: Se guarda automáticamente para continuidad
 
 
+
+

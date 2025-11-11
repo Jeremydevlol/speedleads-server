@@ -31,22 +31,95 @@ export async function igLogin(req, res) {
     const igService = await getOrCreateIGSession(userId);
     const result = await igService.login({ username, password, proxy });
 
-    // Guardar credenciales en base de datos (encriptadas en producción)
-    await pool.query(`
-      INSERT INTO instagram_accounts (user_id, ig_username, created_at)
-      VALUES ($1, $2, NOW())
-      ON CONFLICT (user_id) 
-      DO UPDATE SET ig_username = $2, updated_at = NOW()
-    `, [userId, username]);
+    // Si el resultado indica que el login fue bloqueado como sospechoso
+    if (result.suspicious_login_blocked === true) {
+      P.info(`⚠️ Login bloqueado como sospechoso para ${username}`);
+      return res.status(200).json({
+        success: false,
+        challenge: false,
+        suspicious_login_blocked: true,
+        recovery_required: result.recovery_required || false,
+        message: result.message || 'Instagram bloqueó el login como sospechoso',
+        error: result.error || 'Login bloqueado como sospechoso',
+        username: username
+      });
+    }
 
-    res.json({ 
-      success: true, 
-      message: 'Login exitoso',
-      restored: result.restored,
-      username: username
-    });
+    // Si el resultado indica que se requiere recuperación de cuenta
+    if (result.recovery_required === true) {
+      P.info(`⚠️ Recuperación de cuenta requerida para ${username}`);
+      return res.status(200).json({
+        success: false,
+        challenge: false,
+        recovery_required: true,
+        message: result.message || 'Instagram requiere recuperación de cuenta',
+        error: result.error || 'Recuperación de cuenta requerida',
+        username: username
+      });
+    }
+
+    // Si el resultado indica challenge, retornar información específica ANTES de guardar en BD
+    if (result.challenge === true) {
+      P.info(`⚠️ Challenge detectado para ${username}: ${result.message}`);
+      return res.status(200).json({
+        success: false,
+        challenge: true,
+        needs_code: result.needs_code || false,
+        message: result.message,
+        needsUserAction: result.needsUserAction || true,
+        needsManualRetry: result.needsManualRetry !== undefined ? result.needsManualRetry : !result.needs_code,
+        autoRetry: result.autoRetry || false,
+        autoRetryIn: result.autoRetryIn || null,
+        is_new_account: result.is_new_account || false,
+        retryInstructions: result.retryInstructions || 'Verifica en Instagram y reintenta el login.',
+        challengeId: result.challengeId || null,
+        username: username
+      });
+    }
+
+    // Si el login fue exitoso, guardar credenciales en base de datos
+    if (result.success) {
+      await pool.query(`
+        INSERT INTO instagram_accounts (user_id, ig_username, created_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (user_id) 
+        DO UPDATE SET ig_username = $2, updated_at = NOW()
+      `, [userId, username]);
+    }
+    
+    // Retornar resultado del login
+    if (result.success) {
+      res.json({ 
+        success: true, 
+        message: 'Login exitoso',
+        restored: result.restored,
+        afterChallenge: result.afterChallenge || false,
+        username: username
+      });
+    } else {
+      // Si no fue exitoso y no fue un challenge, retornar error
+      res.status(400).json({
+        success: false,
+        error: result.error || result.message || 'Error en login de Instagram',
+        username: username
+      });
+    }
   } catch (error) {
     P.error(`Error en igLogin: ${error.message}`);
+    
+    // Detectar si el error es de challenge pero no fue capturado
+    const errorMsg = error.message || '';
+    if (errorMsg.includes('challenge') || errorMsg.includes('checkpoint')) {
+      return res.status(200).json({
+        success: false,
+        challenge: true,
+        message: 'Verificación requerida. Verifica en tu teléfono/app de Instagram y luego reintenta el login.',
+        needsManualRetry: true,
+        retryInstructions: '1) Verifica en Instagram (teléfono/app), 2) Espera 1-2 minutos, 3) Reintenta login.',
+        username: username || 'desconocido'
+      });
+    }
+    
     res.status(400).json({ 
       success: false, 
       error: error.message 

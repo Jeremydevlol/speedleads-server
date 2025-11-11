@@ -146,8 +146,9 @@ async function getConversationHistory(conversationId, userId, limit = 50) { // A
 
 // *** AÑADIMOS ESTA FUNCIÓN ***
 function getLastQrForUser(userId) {
-  const sessionObj = sessions.get(userId)
-  return sessionObj?.qr || null
+  const sessionObj = sessions.get(userId);
+  // El QR puede estar en el objeto de sesión o en el cache
+  return sessionObj?.qr || null;
 }
 
 /**
@@ -155,9 +156,12 @@ function getLastQrForUser(userId) {
  */
 export async function getQrCode(userId) {
   try {
+    console.log(`🔍 [QR] Solicitando QR para usuario ${userId}`);
+    
     // Verificar si ya hay una sesión activa
     const existingSession = sessions.get(userId);
     if (existingSession && existingSession.user) {
+      console.log(`✅ [QR] Usuario ${userId} ya está conectado`);
       return {
         success: true,
         message: 'WhatsApp ya está conectado',
@@ -166,17 +170,53 @@ export async function getQrCode(userId) {
       };
     }
 
-    // Iniciar sesión para generar QR
+    // Verificar si hay QR en cache primero
+    let rawQr = getCachedQr(userId);
+    if (rawQr) {
+      console.log(`✅ [QR] QR encontrado en cache para usuario ${userId}`);
+      const qrImage = await qrcode.toDataURL(rawQr);
+      return {
+        success: true,
+        message: 'Escanea este código QR con WhatsApp',
+        qr: qrImage,
+        connected: false
+      };
+    }
+
+    // Verificar si hay QR en el socket existente
+    rawQr = getLastQrForUser(userId);
+    if (rawQr) {
+      console.log(`✅ [QR] QR encontrado en socket para usuario ${userId}`);
+      const qrImage = await qrcode.toDataURL(rawQr);
+      return {
+        success: true,
+        message: 'Escanea este código QR con WhatsApp',
+        qr: qrImage,
+        connected: false
+      };
+    }
+
+    // Si no hay QR, iniciar sesión para generar uno nuevo
+    console.log(`🚀 [QR] Iniciando sesión para generar QR para usuario ${userId}`);
     await startSession(userId);
     
-    // Esperar un momento para que se genere el QR
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Esperar a que se genere el QR (con múltiples intentos)
+    console.log(`⏳ [QR] Esperando generación de QR...`);
+    for (let attempt = 0; attempt < 15; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      rawQr = getLastQrForUser(userId) || getCachedQr(userId);
+      if (rawQr) {
+        console.log(`✅ [QR] QR encontrado en intento ${attempt + 1}`);
+        break;
+      }
+      console.log(`⏳ [QR] Intento ${attempt + 1}/15: QR aún no disponible...`);
+    }
     
-    const rawQr = getLastQrForUser(userId) || getCachedQr(userId);
     if (!rawQr) {
       // Si no hay QR, puede que la sesión ya esté conectada
       const session = sessions.get(userId);
       if (session && session.user) {
+        console.log(`✅ [QR] Sesión conectada durante la espera para usuario ${userId}`);
         return {
           success: true,
           message: 'WhatsApp ya está conectado',
@@ -184,9 +224,11 @@ export async function getQrCode(userId) {
           connected: true
         };
       }
-      throw new Error('QR no disponible (no generado o ya escaneado)');
+      console.error(`❌ [QR] QR no disponible después de 15 intentos para usuario ${userId}`);
+      throw new Error('QR no disponible (no generado o ya escaneado). Espera unos segundos y vuelve a intentar.');
     }
     
+    console.log(`✅ [QR] Generando imagen QR para usuario ${userId}`);
     const qrImage = await qrcode.toDataURL(rawQr);
     return {
       success: true,
@@ -195,7 +237,7 @@ export async function getQrCode(userId) {
       connected: false
     };
   } catch (error) {
-    console.error('Error obteniendo QR:', error);
+    console.error(`❌ [QR] Error obteniendo QR para usuario ${userId}:`, error);
     throw error;
   }
 }
@@ -695,23 +737,219 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
           return { success: true, aiReply: null };
         }
 
-        // Enviar respuesta a WhatsApp con timeout
-        const sendPromise = sock.sendMessage(conversationId, { text: botReply });
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Timeout sending message')), 30000)
+        // Detectar preferencia de audio: revisar mensaje actual, historial y últimos mensajes enviados
+        const userMessageLower = (textContent || '').toLowerCase();
+        const explicitRequest = userMessageLower.includes('audio') || 
+                               userMessageLower.includes('envíame') || 
+                               userMessageLower.includes('envia') ||
+                               userMessageLower.includes('manda audio') ||
+                               userMessageLower.includes('nota de voz');
+        
+        // Revisar últimos mensajes para determinar preferencia de audio (aumentado a 10 mensajes)
+        const recentMessages = history.slice(-10); // Últimos 10 mensajes para mejor contexto
+        
+        // Buscar si el usuario pidió audio explícitamente en algún momento reciente
+        const userRequestedAudio = recentMessages.some(m => 
+          m.sender_type === 'user' && 
+          (m.text_content || '').toLowerCase().match(/\b(audio|env[ií]ame|envia|manda audio|nota de voz)\b/)
         );
         
-        const msgInfo = await Promise.race([sendPromise, timeoutPromise]);
+        const lastUserAudio = recentMessages.some(m => 
+          m.sender_type === 'user' && 
+          (m.message_type === 'audio' || (m.text_content || '').toLowerCase().includes('audio'))
+        );
+        
+        // Verificar si el mensaje actual del usuario es un audio
+        const currentMessageIsAudio = media.some(m => m.type === 'audio') || 
+                                     (textContent || '').toLowerCase().includes('audio enviado');
+        
+        // Revisar si la IA ha estado enviando audios recientemente
+        const recentAIAudio = recentMessages.filter(m => 
+          m.sender_type === 'ia' && m.message_type === 'audio'
+        ).length;
+        
+        // Revisar mensajes consecutivos de audio de la IA
+        let consecutiveAudioCount = 0;
+        for (let i = recentMessages.length - 1; i >= 0; i--) {
+          if (recentMessages[i].sender_type === 'ia' && recentMessages[i].message_type === 'audio') {
+            consecutiveAudioCount++;
+          } else if (recentMessages[i].sender_type === 'ia') {
+            break; // Se rompe la secuencia
+          }
+        }
+        
+        // Revisar si el usuario quiere volver a texto
+        const requestText = userMessageLower.includes('texto') || 
+                           userMessageLower.includes('escribe') ||
+                           userMessageLower.includes('no audio') ||
+                           userMessageLower.includes('sin audio');
+        
+        // Determinar si enviar como audio:
+        // 1. Solicitud explícita de audio (mantener modo audio por más tiempo)
+        // 2. Si el usuario envió un audio (responder con audio)
+        // 3. Si la IA ya estaba enviando audios (mantener consistencia)
+        // 4. Variar: solo después de 5-6 audios consecutivos, cambiar a texto ocasionalmente
+        let shouldSendAudio = false;
+        
+        if (requestText) {
+          // Usuario explícitamente pide texto
+          shouldSendAudio = false;
+          console.log(`📝 [WhatsApp IA] Usuario pidió texto explícitamente`);
+        } else if (currentMessageIsAudio) {
+          // Usuario envió un audio, responder con audio
+          shouldSendAudio = true;
+          console.log(`🎤 [WhatsApp IA] Usuario envió audio, respondiendo con audio`);
+        } else if (explicitRequest) {
+          // Solicitud explícita de audio - MANTENER MODO AUDIO
+          shouldSendAudio = true;
+          console.log(`🎤 [WhatsApp IA] Usuario pidió audio explícitamente - ACTIVANDO MODO AUDIO`);
+        } else if (userRequestedAudio && recentAIAudio > 0) {
+          // Usuario pidió audio antes y la IA ya está en modo audio
+          // Mantener modo audio, pero variar solo después de muchos audios consecutivos
+          if (consecutiveAudioCount >= 5) {
+            // Después de 5 audios consecutivos, variar con texto ocasionalmente
+            shouldSendAudio = (consecutiveAudioCount % 6 !== 0); // Cada 6to mensaje será texto
+            console.log(`🎤 [WhatsApp IA] Modo audio activo (${consecutiveAudioCount} consecutivos), variando: ${shouldSendAudio ? 'audio' : 'texto'}`);
+          } else {
+            // Menos de 5 consecutivos, seguir con audio
+            shouldSendAudio = true;
+            console.log(`🎤 [WhatsApp IA] Modo audio activo (${consecutiveAudioCount} consecutivos) - continuando con audio`);
+          }
+        } else if (lastUserAudio && recentAIAudio >= 1) {
+          // Usuario envió audio o mencionó audio antes, y la IA ya estaba en modo audio
+          shouldSendAudio = true;
+          console.log(`🎤 [WhatsApp IA] Continuando modo audio (usuario envió audio previamente)`);
+        } else {
+          // Por defecto, texto
+          shouldSendAudio = false;
+        }
+
+        let msgInfo;
+        
+        // Si debe enviar como audio, enviar como nota de voz
+        if (shouldSendAudio) {
+          try {
+            // Limpiar el texto antes de convertir a audio (eliminar marcadores, prefijos, etc.)
+            let cleanText = botReply.trim();
+            
+            // Eliminar marcadores de audio/transcripción que no deberían estar en el audio final
+            cleanText = cleanText
+              .replace(/\[Audio transcrito:\s*/gi, '')
+              .replace(/\[Contenido de imagen:\s*/gi, '')
+              .replace(/\[Contenido de PDF:\s*/gi, '')
+              .replace(/Final del audio/gi, '')
+              .replace(/Final de la imagen/gi, '')
+              .replace(/Final del PDF/gi, '')
+              .replace(/Quiero que seas conciso.*$/gim, '')
+              .replace(/\n{3,}/g, '\n\n') // Limpiar múltiples saltos de línea
+              .trim();
+            
+            // Validar que el texto no esté vacío después de limpiar
+            if (!cleanText || cleanText.length === 0) {
+              console.error(`❌ [WhatsApp IA] Texto vacío después de limpiar, usando texto original`);
+              cleanText = botReply.trim();
+            }
+            
+            console.log(`🎤 [WhatsApp IA] Generando nota de voz...`);
+            console.log(`📝 [WhatsApp IA] Texto original (${botReply.length} chars): "${botReply.substring(0, 150)}..."`);
+            console.log(`📝 [WhatsApp IA] Texto limpio (${cleanText.length} chars): "${cleanText.substring(0, 150)}..."`);
+            
+            const audioResult = await generateAudioWithElevenLabs(cleanText);
+            
+            if (audioResult.success && audioResult.audioBuffer) {
+              // WhatsApp requiere OGG Opus para notas de voz
+              const fs = await import('fs');
+              const path = await import('path');
+              const { exec } = await import('child_process');
+              const { promisify } = await import('util');
+              const execAsync = promisify(exec);
+              
+              const tempDir = path.join(process.cwd(), 'temp_downloads');
+              if (!fs.existsSync(tempDir)) {
+                fs.mkdirSync(tempDir, { recursive: true });
+              }
+              
+              const timestamp = Date.now();
+              const tempMp3Path = path.join(tempDir, `audio_ia_${timestamp}.mp3`);
+              const tempOggPath = path.join(tempDir, `audio_ia_${timestamp}.ogg`);
+              
+              try {
+                // Guardar MP3 temporal
+                fs.writeFileSync(tempMp3Path, audioResult.audioBuffer);
+                
+                // Convertir MP3 a OGG Opus
+                console.log(`🔄 [WhatsApp IA] Convirtiendo MP3 a OGG Opus...`);
+                const ffmpegCommand = `ffmpeg -i "${tempMp3Path}" -c:a libopus -b:a 32k -ar 24000 -ac 1 "${tempOggPath}" -y`;
+                
+                await execAsync(ffmpegCommand);
+                console.log(`✅ [WhatsApp IA] Audio convertido a OGG Opus`);
+                
+                // Leer el archivo OGG como Buffer
+                const oggBuffer = await fs.promises.readFile(tempOggPath);
+                console.log(`✅ [WhatsApp IA] Archivo OGG leído: ${(oggBuffer.length / 1024).toFixed(2)} KB`);
+                
+                // Enviar como nota de voz
+                const payload = {
+                  audio: oggBuffer,
+                  mimetype: 'audio/ogg; codecs=opus',
+                  ptt: true // PTT = Push to Talk (voice note)
+                };
+                
+                const sendPromise = sock.sendMessage(conversationId, payload);
+                const timeoutPromise = new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error('Timeout sending message')), 30000)
+                );
+                
+                msgInfo = await Promise.race([sendPromise, timeoutPromise]);
+                console.log(`✅ [WhatsApp IA] Nota de voz enviada exitosamente`);
+                
+                // Limpiar archivos temporales
+                try {
+                  if (fs.existsSync(tempMp3Path)) fs.unlinkSync(tempMp3Path);
+                  if (fs.existsSync(tempOggPath)) fs.unlinkSync(tempOggPath);
+                } catch (cleanupError) {
+                  console.warn(`⚠️ [WhatsApp IA] Error limpiando archivos temporales: ${cleanupError.message}`);
+                }
+              } catch (conversionError) {
+                console.error(`❌ [WhatsApp IA] Error convirtiendo audio: ${conversionError.message}`);
+                // Fallback a texto si falla la conversión
+                const sendPromise = sock.sendMessage(conversationId, { text: botReply });
+                const timeoutPromise = new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error('Timeout sending message')), 30000)
+                );
+                msgInfo = await Promise.race([sendPromise, timeoutPromise]);
+              }
+            } else {
+              throw new Error('No se pudo generar el audio');
+            }
+          } catch (audioError) {
+            console.error(`❌ [WhatsApp IA] Error enviando audio, fallback a texto: ${audioError.message}`);
+            // Fallback a texto si falla el audio
+            const sendPromise = sock.sendMessage(conversationId, { text: botReply });
+            const timeoutPromise = new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Timeout sending message')), 30000)
+            );
+            msgInfo = await Promise.race([sendPromise, timeoutPromise]);
+          }
+        } else {
+          // Enviar respuesta normal como texto
+          const sendPromise = sock.sendMessage(conversationId, { text: botReply });
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Timeout sending message')), 30000)
+          );
+          msgInfo = await Promise.race([sendPromise, timeoutPromise]);
+        }
 
         // Guardar mensaje de IA en BD
         if (msgInfo?.key?.id) {
+          const messageType = shouldSendAudio ? 'audio' : 'text';
           await pool.query(`
             INSERT INTO messages_new
             (conversation_id, sender_type, message_type, text_content, created_at, user_id, whatsapp_created_at, last_msg_id)
-            VALUES ($1, $2, 'text', $3, CURRENT_TIMESTAMP, $4, $5, $6)
-          `, [convId, 'ia', botReply, userId, timestamp, msgInfo.key.id]);
+            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5, $6, $7)
+          `, [convId, 'ia', messageType, botReply, userId, timestamp, msgInfo.key.id]);
 
-          console.log('💾 Mensaje de IA guardado en BD');
+          console.log(`💾 Mensaje de IA guardado en BD (tipo: ${messageType})`);
         }
 
         // Emitir eventos
@@ -723,6 +961,7 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
           timestamp: Date.now(),
           isAI: true,
           isSticker: false,
+          message_type: shouldSendAudio ? 'audio' : 'text',
           media: []
         });
 
@@ -1413,7 +1652,48 @@ export const markConversationRead = async (req, res) => {
  * 6) ENVIAR MENSAJE
  */
 
-export async function sendMessage(userId, conversationId, textContent, attachments = [], senderType = 'you') {
+/**
+ * Generar audio con ElevenLabs
+ */
+async function generateAudioWithElevenLabs(text, voiceId = 'wE71xUVnwmbR14UviISk', apiKey = '19e52e33890414d9d5978e9fa059b990c59312fdec9fb3f39e43cdaaefd80de8') {
+  try {
+    const axios = (await import('axios')).default;
+    console.log(`🎵 [WhatsApp] Generando audio con ElevenLabs: ${text.substring(0, 50)}...`);
+    
+    const response = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      {
+        text: text,
+        model_id: 'eleven_multilingual_v2',
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75,
+          style: 0.5,
+          use_speaker_boost: true
+        }
+      },
+      {
+        headers: {
+          'Accept': 'audio/mpeg',
+          'Content-Type': 'application/json',
+          'xi-api-key': apiKey
+        },
+        responseType: 'arraybuffer',
+        timeout: 30000
+      }
+    );
+
+    const audioBuffer = Buffer.from(response.data);
+    console.log(`✅ [WhatsApp] Audio generado: ${(audioBuffer.length / 1024).toFixed(2)} KB`);
+    
+    return { success: true, audioBuffer, size: audioBuffer.length };
+  } catch (error) {
+    console.error(`❌ [WhatsApp] Error generando audio con ElevenLabs: ${error.message}`);
+    throw error;
+  }
+}
+
+export async function sendMessage(userId, conversationId, textContent, attachments = [], senderType = 'you', send_as_audio = false) {
   // Verificar rate limiting
   checkRateLimit(userId);
   
@@ -1447,7 +1727,76 @@ export async function sendMessage(userId, conversationId, textContent, attachmen
 
   if ((senderType === 'you' || senderType === 'ia') && sock) {
     let msgInfo;
-    if (attachments.length) {
+    
+    // Si send_as_audio es true y no hay attachments, generar audio
+    if (send_as_audio && !attachments.length && textContent) {
+      try {
+        console.log(`🎤 [WhatsApp] Generando y enviando audio para: ${textContent.substring(0, 50)}...`);
+        const audioResult = await generateAudioWithElevenLabs(textContent);
+        
+        if (audioResult.success && audioResult.audioBuffer) {
+          // WhatsApp requiere OGG Opus para notas de voz, convertir MP3 a OGG
+          const fs = await import('fs');
+          const path = await import('path');
+          const { exec } = await import('child_process');
+          const { promisify } = await import('util');
+          const execAsync = promisify(exec);
+          
+          const tempDir = path.join(process.cwd(), 'temp_downloads');
+          if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+          }
+          
+          const timestamp = Date.now();
+          const tempMp3Path = path.join(tempDir, `audio_${timestamp}.mp3`);
+          const tempOggPath = path.join(tempDir, `audio_${timestamp}.ogg`);
+          
+          try {
+            // Guardar MP3 temporal
+            fs.writeFileSync(tempMp3Path, audioResult.audioBuffer);
+            
+            // Convertir MP3 a OGG Opus (formato requerido por WhatsApp para notas de voz)
+            console.log(`🔄 [WhatsApp] Convirtiendo MP3 a OGG Opus...`);
+            const ffmpegCommand = `ffmpeg -i "${tempMp3Path}" -c:a libopus -b:a 32k -ar 24000 -ac 1 "${tempOggPath}" -y`;
+            
+            await execAsync(ffmpegCommand);
+            console.log(`✅ [WhatsApp] Audio convertido a OGG Opus`);
+            
+            // Leer el archivo OGG como Buffer
+            const oggBuffer = await fs.promises.readFile(tempOggPath);
+            console.log(`✅ [WhatsApp] Archivo OGG leído: ${(oggBuffer.length / 1024).toFixed(2)} KB`);
+            
+            // Enviar como nota de voz (ptt: true) en formato OGG Opus
+            const payload = {
+              audio: oggBuffer,
+              mimetype: 'audio/ogg; codecs=opus',
+              ptt: true // PTT = Push to Talk (voice note). true = nota de voz
+            };
+            
+            msgInfo = await sock.sendMessage(conversationId, payload);
+            console.log(`✅ [WhatsApp] Nota de voz enviada exitosamente (${(oggBuffer.length / 1024).toFixed(2)} KB)`);
+            
+            // Limpiar archivos temporales
+            try {
+              if (fs.existsSync(tempMp3Path)) fs.unlinkSync(tempMp3Path);
+              if (fs.existsSync(tempOggPath)) fs.unlinkSync(tempOggPath);
+            } catch (cleanupError) {
+              console.warn(`⚠️ [WhatsApp] Error limpiando archivos temporales: ${cleanupError.message}`);
+            }
+          } catch (conversionError) {
+            console.error(`❌ [WhatsApp] Error convirtiendo audio: ${conversionError.message}`);
+            throw new Error(`No se pudo convertir el audio a formato compatible: ${conversionError.message}`);
+          }
+        } else {
+          throw new Error('No se pudo generar el audio');
+        }
+      } catch (audioError) {
+        console.error(`❌ [WhatsApp] Error enviando audio, fallback a texto: ${audioError.message}`);
+        console.error(`   Stack: ${audioError.stack}`);
+        // Fallback a texto si falla el audio
+        msgInfo = await sock.sendMessage(conversationId, { text: textContent });
+      }
+    } else if (attachments.length) {
       // NOTA: Actualmente solo se envía el primer adjunto
       // Para enviar múltiples, sería necesario un bucle con delays
       if (attachments.length > 1) {
@@ -1519,7 +1868,7 @@ export async function sendMessage(userId, conversationId, textContent, attachmen
  * 6.1) ENVIAR MENSAJE A NÚMERO ESPECÍFICO
  * Crea conversación si no existe y envía mensaje
  */
-export async function sendMessageToNumber(userId, phoneNumber, textContent, attachments = [], senderType = 'you', defaultCountry = '34') {
+export async function sendMessageToNumber(userId, phoneNumber, textContent, attachments = [], senderType = 'you', defaultCountry = '34', send_as_audio = false) {
   // Verificar rate limiting
   checkRateLimit(userId);
   
@@ -1581,7 +1930,75 @@ export async function sendMessageToNumber(userId, phoneNumber, textContent, atta
     let msgInfo;
     
     try {
-      if (attachments.length) {
+      // Si send_as_audio es true y no hay attachments, generar audio
+      if (send_as_audio && !attachments.length && textContent) {
+        try {
+          console.log(`🎤 [WhatsApp] Generando y enviando audio para: ${textContent.substring(0, 50)}...`);
+          const audioResult = await generateAudioWithElevenLabs(textContent);
+          
+          if (audioResult.success && audioResult.audioBuffer) {
+            // WhatsApp requiere OGG Opus para notas de voz, convertir MP3 a OGG
+            const fs = await import('fs');
+            const path = await import('path');
+            const { exec } = await import('child_process');
+            const { promisify } = await import('util');
+            const execAsync = promisify(exec);
+            
+            const tempDir = path.join(process.cwd(), 'temp_downloads');
+            if (!fs.existsSync(tempDir)) {
+              fs.mkdirSync(tempDir, { recursive: true });
+            }
+            
+            const timestamp = Date.now();
+            const tempMp3Path = path.join(tempDir, `audio_${timestamp}.mp3`);
+            const tempOggPath = path.join(tempDir, `audio_${timestamp}.ogg`);
+            
+            try {
+              // Guardar MP3 temporal
+              fs.writeFileSync(tempMp3Path, audioResult.audioBuffer);
+              
+              // Convertir MP3 a OGG Opus (formato requerido por WhatsApp para notas de voz)
+              console.log(`🔄 [WhatsApp] Convirtiendo MP3 a OGG Opus...`);
+              const ffmpegCommand = `ffmpeg -i "${tempMp3Path}" -c:a libopus -b:a 32k -ar 24000 -ac 1 "${tempOggPath}" -y`;
+              
+              await execAsync(ffmpegCommand);
+              console.log(`✅ [WhatsApp] Audio convertido a OGG Opus`);
+              
+              // Leer el archivo OGG como Buffer
+              const oggBuffer = await fs.promises.readFile(tempOggPath);
+              console.log(`✅ [WhatsApp] Archivo OGG leído: ${(oggBuffer.length / 1024).toFixed(2)} KB`);
+              
+              // Enviar como nota de voz (ptt: true) en formato OGG Opus
+              const payload = {
+                audio: oggBuffer,
+                mimetype: 'audio/ogg; codecs=opus',
+                ptt: true // PTT = Push to Talk (voice note). true = nota de voz
+              };
+              
+              msgInfo = await sock.sendMessage(jid, payload);
+              console.log(`✅ [WhatsApp] Nota de voz enviada exitosamente (${(oggBuffer.length / 1024).toFixed(2)} KB)`);
+              
+              // Limpiar archivos temporales
+              try {
+                if (fs.existsSync(tempMp3Path)) fs.unlinkSync(tempMp3Path);
+                if (fs.existsSync(tempOggPath)) fs.unlinkSync(tempOggPath);
+              } catch (cleanupError) {
+                console.warn(`⚠️ [WhatsApp] Error limpiando archivos temporales: ${cleanupError.message}`);
+              }
+            } catch (conversionError) {
+              console.error(`❌ [WhatsApp] Error convirtiendo audio: ${conversionError.message}`);
+              throw new Error(`No se pudo convertir el audio a formato compatible: ${conversionError.message}`);
+            }
+          } else {
+            throw new Error('No se pudo generar el audio');
+          }
+        } catch (audioError) {
+          console.error(`❌ [WhatsApp] Error enviando audio, fallback a texto: ${audioError.message}`);
+          console.error(`   Stack: ${audioError.stack}`);
+          // Fallback a texto si falla el audio
+          msgInfo = await sock.sendMessage(jid, { text: textContent });
+        }
+      } else if (attachments.length) {
         // NOTA: Actualmente solo se envía el primer adjunto
         if (attachments.length > 1) {
           console.warn(`⚠️ Se recibieron ${attachments.length} adjuntos, pero solo se enviará el primero`);

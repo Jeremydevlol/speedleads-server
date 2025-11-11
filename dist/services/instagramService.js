@@ -4,6 +4,7 @@ import { IgApiClient } from 'instagram-private-api';
 import path, { dirname } from 'path';
 import pino from 'pino';
 import { fileURLToPath } from 'url';
+import axios from 'axios';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -111,6 +112,23 @@ class InstagramService {
       }
 
       const file = this.stateFile();
+      const challengeFile = path.join(STATE_DIR, `${this.userId}_challenge.json`);
+      
+      // Verificar si hay un challenge pendiente reciente
+      if (fs.existsSync(challengeFile)) {
+        try {
+          const challengeData = JSON.parse(fs.readFileSync(challengeFile, 'utf8'));
+          const challengeAge = Date.now() - challengeData.timestamp;
+          
+          // Si el challenge es reciente (menos de 30 minutos), informar al usuario
+          if (challengeAge < 30 * 60 * 1000 && challengeData.username === username) {
+            P.info(`⚠️ Hay un challenge pendiente reciente para ${username} (hace ${Math.floor(challengeAge / 60000)} minutos)`);
+            P.info(`   Intentando login normalmente. Si falla, puede que necesites verificar nuevamente.`);
+          }
+        } catch (challengeError) {
+          // Ignorar error al leer challenge
+        }
+      }
       
       // Intentar restaurar sesión existente
       if (fs.existsSync(file)) {
@@ -119,6 +137,7 @@ class InstagramService {
           await this.ig.state.deserializeCookieJar(saved.cookieJar);
           
           // Verificar que la sesión sigue válida
+          try {
           const user = await this.ig.account.currentUser();
           this.igUserId = user.pk;
           this.logged = true;
@@ -137,6 +156,16 @@ class InstagramService {
           } else {
             this.processedComments = new Set();
           }
+            
+            // Eliminar challenge pendiente si existe (sesión válida = challenge resuelto)
+            if (fs.existsSync(challengeFile)) {
+              try {
+                fs.unlinkSync(challengeFile);
+                P.info(`✅ Challenge resuelto - eliminando archivo de challenge pendiente`);
+              } catch (unlinkError) {
+                // Ignorar error al eliminar
+              }
+            }
           
           P.info(`✅ Sesión de Instagram restaurada desde disco para ${username}`);
           emitToUserIG(this.userId, 'instagram:status', { 
@@ -146,13 +175,18 @@ class InstagramService {
           });
           
           return { success: true, restored: true };
-        } catch (restoreError) {
-          P.warn(`⚠️ Sesión guardada inválida, relogueando: ${restoreError.message}`);
+          } catch (userError) {
+            // Si falla currentUser(), la sesión expiró
+            P.warn(`⚠️ Sesión guardada inválida, relogueando: ${userError.message}`);
           // Si falla la restauración, continuar con login normal
+          }
+        } catch (restoreError) {
+          P.warn(`⚠️ Error restaurando sesión: ${restoreError.message}`);
+          // Continuar con login normal
         }
       }
 
-      // Login normal
+      // Login normal - con manejo mejorado de challenges
       try {
         P.info('Realizando login a Instagram...');
         const loginResult = await this.ig.account.login(username, password);
@@ -179,7 +213,23 @@ class InstagramService {
               processedComments: processedCommentsArray
             }), 'utf8');
 
+        // Eliminar challenge pendiente si existe (login exitoso = challenge resuelto)
+        const challengeFile = path.join(STATE_DIR, `${this.userId}_challenge.json`);
+        if (fs.existsSync(challengeFile)) {
+          try {
+            fs.unlinkSync(challengeFile);
+            P.info(`✅ Challenge resuelto - eliminando archivo de challenge pendiente`);
+          } catch (unlinkError) {
+            // Ignorar error al eliminar
+          }
+        }
+
+        // Si llegamos aquí, el login fue exitoso
         P.info(`✅ Login exitoso y cookies guardadas para ${username}`);
+        
+        // Limpiar challenge pendiente si existe
+        this.pendingChallenge = null;
+        
         emitToUserIG(this.userId, 'instagram:status', { 
           connected: true, 
           username: this.username,
@@ -190,9 +240,185 @@ class InstagramService {
       } catch (loginError) {
         const msg = String(loginError?.message || loginError);
         
+        // Log detallado del error para debugging
+        P.error(`📋 [LOGIN ERROR] Detalles completos del error:`);
+        P.error(`   Mensaje: ${msg}`);
+        P.error(`   Tipo: ${loginError?.constructor?.name || 'Desconocido'}`);
+        P.error(`   Stack: ${loginError?.stack?.substring(0, 500) || 'No disponible'}`);
+        
+        // Detectar si Instagram sugiere usar email para recuperar cuenta
+        if (msg.includes('We can send you an email') || 
+            msg.includes('email to help you get back') ||
+            msg.includes('send you an email to help') ||
+            msg.includes('email to help') ||
+            msg.includes('can send you an email')) {
+          P.error(`📧 Instagram sugiere usar email para recuperar cuenta: ${msg}`);
+          emitToUserIG(this.userId, 'instagram:alert', { 
+            type: 'account_recovery_required',
+            severity: 'warning',
+            message: 'Recuperación de cuenta requerida',
+            description: 'Instagram está sugiriendo usar el email para recuperar el acceso a tu cuenta. Esto puede indicar: 1) Problemas con las credenciales, 2) La cuenta está bloqueada o necesita verificación, 3) Instagram detectó actividad sospechosa. SOLUCIONES: 1) Verifica que el usuario y contraseña sean correctos, 2) Intenta recuperar la cuenta desde Instagram.com usando "Olvidé mi contraseña", 3) Verifica el email asociado a la cuenta, 4) Espera 24-48 horas si la cuenta fue bloqueada recientemente.',
+            username: username,
+            action_required: true,
+            instructions: [
+              'PASO 1: Verificar credenciales',
+              '  → Asegúrate de que el usuario y contraseña sean correctos',
+              '  → Intenta hacer login manualmente en Instagram.com',
+              '  → Si no puedes, sigue al paso 2',
+              '',
+              'PASO 2: Recuperar cuenta',
+              '  → Ve a Instagram.com',
+              '  → Haz clic en "Olvidé mi contraseña"',
+              '  → Ingresa tu usuario o email',
+              '  → Sigue las instrucciones para recuperar',
+              '',
+              'PASO 3: Verificar email',
+              '  → Revisa el email asociado a la cuenta',
+              '  → Busca mensajes de Instagram sobre recuperación',
+              '  → Sigue los pasos indicados en el email',
+              '',
+              'PASO 4: Esperar si está bloqueada',
+              '  → Si la cuenta fue bloqueada, espera 24-48 horas',
+              '  → No intentes login desde aquí durante ese tiempo',
+              '  → Usa la cuenta manualmente desde navegador/app'
+            ],
+            timestamp: Date.now()
+          });
+          
+          // Retornar respuesta estructurada en lugar de lanzar error
+          return {
+            success: false,
+            challenge: false,
+            error: 'Instagram requiere recuperación de cuenta',
+            message: 'Instagram está sugiriendo usar el email para recuperar el acceso. Por favor, verifica las credenciales o recupera la cuenta desde Instagram.com.',
+            username: username,
+            recovery_required: true
+          };
+        }
+        
+        // Detectar intento de login sospechoso bloqueado por Instagram
+        if (msg.includes('suspicious login') || 
+            msg.includes('Suspicious login attempt') ||
+            msg.includes('We blocked a suspicious login') ||
+            msg.includes('blocked a suspicious login attempt')) {
+          P.error(`🚨 Instagram bloqueó intento de login como sospechoso: ${msg}`);
+          emitToUserIG(this.userId, 'instagram:alert', { 
+            type: 'suspicious_login_blocked',
+            severity: 'error',
+            message: 'Intento de login bloqueado',
+            description: 'Instagram detectó el intento de login desde la API como sospechoso y lo bloqueó. Esto es normal cuando se intenta hacer login desde una API. SOLUCIONES: 1) Verifica el login desde Instagram.com o la app móvil y acepta "Fue yo" cuando aparezca la notificación, 2) Cambia la contraseña si Instagram lo sugiere, 3) Espera 24-48 horas antes de intentar desde aquí, 4) Usa la cuenta normalmente desde navegador/app durante unos días para que Instagram "confíe" en la actividad.',
+            username: username,
+            action_required: true,
+            instructions: [
+              '⚠️ INSTAGRAM BLOQUEÓ EL LOGIN COMO SOSPECHOSO',
+              '',
+              'Esto es normal cuando se intenta login desde API.',
+              '',
+              'SOLUCIÓN PASO A PASO:',
+              '',
+              '1️⃣ Verificar en Instagram (AHORA MISMO):',
+              '  → Abre Instagram en tu teléfono o navegador',
+              '  → Verás una notificación "Suspicious login attempt"',
+              '  → Toca "Fue yo" o "It was me"',
+              '  → Si aparece "Change password", cámbiala',
+              '  → Acepta todas las verificaciones',
+              '',
+              '2️⃣ Cambiar contraseña (si Instagram lo sugiere):',
+              '  → Ve a Instagram.com o la app',
+              '  → Configuración > Seguridad',
+              '  → Cambia la contraseña',
+              '  → Guarda la nueva contraseña',
+              '',
+              '3️⃣ Usar la cuenta normalmente (24-48 horas):',
+              '  → Haz login manual desde navegador/app',
+              '  → Publica 1-2 fotos',
+              '  → Da likes y sigue algunas cuentas',
+              '  → Envía algunos DMs',
+              '  → Instagram necesita ver actividad "normal"',
+              '',
+              '4️⃣ Esperar 24-48 horas:',
+              '  → No intentes login desde aquí inmediatamente',
+              '  → Instagram necesita "confiar" en la IP',
+              '  → La cuenta necesita tener historial de actividad',
+              '',
+              '5️⃣ Reintentar desde aquí:',
+              '  → Después de 24-48 horas',
+              '  → Usa la NUEVA contraseña si la cambiaste',
+              '  → El login debería funcionar',
+              '',
+              'NOTA: Si sigues recibiendo este error después de 48 horas,',
+              '      Instagram puede estar bloqueando la IP permanentemente.',
+              '      En ese caso, usa una VPN o cambia de IP.'
+            ],
+            timestamp: Date.now()
+          });
+          
+          // Retornar respuesta estructurada
+          return {
+            success: false,
+            challenge: false,
+            error: 'Login bloqueado como sospechoso',
+            message: 'Instagram bloqueó el intento de login como sospechoso. Por favor, verifica en Instagram (acepta "Fue yo") y cambia la contraseña si se solicita. Espera 24-48 horas antes de reintentar desde aquí.',
+            username: username,
+            suspicious_login_blocked: true,
+            recovery_required: false
+          };
+        }
+        
         // Detectar challenges/checkpoints
         if (msg.includes('challenge') || msg.includes('checkpoint')) {
-          P.info(`🔐 Challenge detectado para ${username}. Esperando verificación del usuario...`);
+          P.info(`🔐 Challenge detectado para ${username}. Obteniendo información del challenge...`);
+          
+          // Intentar extraer información del challenge del error
+          let challengeUrl = null;
+          let challengeChoice = null;
+          let needsCode = false;
+          let challengeState = null;
+          
+          // El error de Instagram puede contener información del challenge
+          try {
+            if (loginError.response) {
+              const responseData = loginError.response?.body || loginError.response?.data || {};
+              challengeUrl = responseData.challenge?.url || responseData.challenge_url;
+              challengeChoice = responseData.challenge?.choice;
+              
+              P.info(`📋 Información del challenge extraída:`);
+              P.info(`   URL: ${challengeUrl || 'No disponible'}`);
+              P.info(`   Choice: ${challengeChoice || 'No disponible'}`);
+            }
+            
+            // También intentar desde el objeto error directamente
+            if (loginError.challenge && typeof loginError.challenge === 'object') {
+              challengeUrl = loginError.challenge.url || challengeUrl;
+              challengeChoice = loginError.challenge.choice || challengeChoice;
+            }
+            
+            // Intentar obtener el estado del challenge para ver si requiere código
+            try {
+              P.info(`🔍 Obteniendo estado del challenge...`);
+              challengeState = await this.ig.challenge.state();
+              
+              P.info(`📋 Estado del challenge obtenido:`);
+              P.info(`   Step: ${challengeState.step_name || 'desconocido'}`);
+              P.info(`   Necesita código: ${challengeState.step_name === 'select_verify_method' || challengeState.step_name === 'verify_code'}`);
+              
+              // Detectar si necesita código
+              needsCode = challengeState.step_name === 'select_verify_method' || 
+                         challengeState.step_name === 'verify_code' ||
+                         (challengeState.fields && challengeState.fields.length > 0);
+              
+              P.info(`📱 Challenge ${needsCode ? 'REQUIERE código' : 'NO requiere código'}`);
+              
+            } catch (stateError) {
+              P.warn(`⚠️ No se pudo obtener estado del challenge: ${stateError.message}`);
+              // Asumir que necesita código si no se puede determinar
+              needsCode = true;
+            }
+          } catch (extractError) {
+            P.warn(`⚠️ No se pudo extraer información del challenge: ${extractError.message}`);
+            // Asumir que necesita código por defecto
+            needsCode = true;
+          }
           
           // Guardar información del challenge
           this.pendingChallenge = {
@@ -200,70 +426,272 @@ class InstagramService {
             password,
             timestamp: Date.now(),
             message: msg,
-            retryCount: 0
+            retryCount: 0,
+            challengeUrl: challengeUrl,
+            challengeChoice: challengeChoice,
+            needsCode: needsCode,
+            challengeState: challengeState
           };
           
-          emitToUserIG(this.userId, 'instagram:challenge', { 
-            message: 'Por favor verifica tu cuenta en Instagram y haz clic en "No he sido yo" para autorizar el dispositivo.',
+          // NO esperar automáticamente - el usuario debe verificar y luego reintentar manualmente
+          P.info(`🔐 Challenge detectado. El usuario debe verificar en su teléfono/app y luego reintentar login.`);
+          P.warn(`⚠️ IMPORTANTE: Cuentas nuevas requieren verificación manual en Instagram primero.`);
+          P.warn(`   La cuenta ${username} necesita ser verificada en Instagram.com o la app móvil.`);
+          
+          // Mensaje más específico para cuentas nuevas
+          const isNewAccount = !fs.existsSync(this.stateFile()) || 
+                               (fs.existsSync(this.stateFile()) && 
+                                Date.now() - new Date(JSON.parse(fs.readFileSync(this.stateFile(), 'utf8')).savedAt || 0).getTime() < 86400000);
+          
+          const challengeMessage = isNewAccount ? 
+            'Esta es una cuenta nueva y requiere verificación especial. Instagram bloquea logins de API en cuentas nuevas por seguridad. SOLUCIÓN: 1) Haz login MANUALMENTE en Instagram.com o la app móvil primero, 2) Usa la cuenta normalmente por 24-48 horas (posts, likes, follows), 3) Luego intenta login desde aquí. Instagram necesita "confiar" en la cuenta antes de permitir login desde API.' :
+            'Instagram requiere verificación de seguridad. Por favor: 1) Verifica en tu teléfono/app de Instagram (acepta el login), 2) Espera 2-5 minutos, 3) Reintenta el login desde aquí.';
+          
+          // SIEMPRE pedir código si el challenge requiere código (incluso para cuentas nuevas)
+          if (needsCode) {
+            P.info(`📱 Challenge requiere código de verificación para ${username}`);
+            emitToUserIG(this.userId, 'instagram:alert', { 
+              type: 'challenge_code_required',
+              severity: 'warning',
+              message: 'Código de verificación requerido',
+              description: 'Instagram requiere un código de verificación para completar el login. Por favor, ingresa el código que recibiste por SMS o Email.',
+              username: username,
+              action_required: true,
+              needs_code: true,
+              challenge_id: `challenge_${Date.now()}`,
+              instructions: [
+                'PASO 1: Revisa tu teléfono/email',
+                '  → Instagram envió un código de verificación',
+                '  → Revisa SMS o correo electrónico',
+                '  → El código es de 6 dígitos',
+                '',
+                'PASO 2: Ingresa el código',
+                '  → Usa el campo de código que aparece',
+                '  → Ingresa el código completo',
+                '  → El sistema verificará automáticamente',
+                '',
+                'Si no recibes el código:',
+                '  → Espera 30-60 segundos',
+                '  → Verifica spam/correo no deseado',
+                '  → Puedes solicitar un nuevo código'
+              ],
+              timestamp: Date.now()
+            });
+          } else {
+            // Challenge que no requiere código (o cuenta nueva)
+            emitToUserIG(this.userId, 'instagram:alert', { 
             type: 'challenge_required',
+              severity: 'warning',
+              message: isNewAccount ? 'Cuenta nueva requiere verificación manual' : 'Verificación requerida',
+              description: challengeMessage,
             username: username,
+              action_required: true,
+              is_new_account: isNewAccount,
+              needs_code: false,
+              instructions: isNewAccount ? [
+              '⚠️ CUENTA NUEVA DETECTADA',
+              '',
+              'Instagram bloquea logins de API en cuentas nuevas.',
+              '',
+              'SOLUCIÓN PASO A PASO:',
+              '',
+              '1️⃣ Haz login MANUALMENTE primero:',
+              '   → Ve a Instagram.com o abre la app móvil',
+              '   → Inicia sesión con esta cuenta',
+              '   → Completa cualquier verificación (SMS/Email)',
+              '',
+              '2️⃣ Usa la cuenta normalmente:',
+              '   → Publica 1-2 fotos',
+              '   → Da likes (50-100)',
+              '   → Sigue algunas cuentas (20-30)',
+              '   → Envía algunos DMs',
+              '',
+              '3️⃣ Espera 24-48 horas:',
+              '   → Instagram necesita "confiar" en la cuenta',
+              '   → La cuenta necesita tener actividad normal',
+              '',
+              '4️⃣ Intenta login desde aquí:',
+              '   → Después de 24-48 horas de uso manual',
+              '   → El login debería funcionar',
+              '',
+              'NOTA: Si solo verificas pero no usas la cuenta,',
+              '      Instagram seguirá bloqueando el login.'
+            ] : [
+              'PASO 1: Verificar en teléfono/app',
+              '  → Abre Instagram en tu teléfono',
+              '  → Verás una notificación de login',
+              '  → Toca "Fue yo" o acepta el login',
+              '  → Completa cualquier verificación (código SMS/Email)',
+              '',
+              'PASO 2: Esperar 2-5 minutos',
+              '  → Instagram necesita procesar la verificación',
+              '  → No intentes login inmediatamente',
+              '',
+              'PASO 3: Reintentar login',
+              '  → Vuelve a hacer login desde aquí',
+              '  → Si ya verificaste, debería funcionar',
+              '',
+              'NOTA: Si falla después de verificar, espera 5-10 minutos más'
+            ],
             challengeId: `challenge_${Date.now()}`,
-            instructions: 'Ve a Instagram.com, verifica tu identidad y autoriza el dispositivo. Luego espera 2-3 minutos.'
+            challengeUrl: challengeUrl,
+            timestamp: Date.now()
           });
+          }
           
-          // Esperar y reintentar automáticamente
-          P.info(`⏳ Esperando 60 segundos para que el usuario verifique...`);
-          await new Promise(resolve => setTimeout(resolve, 60000)); // Esperar 1 minuto
+          // Intentar resolver challenge automáticamente si hay información disponible
+          // Nota: Instagram normalmente requiere acción manual del usuario
+          // Pero podemos guardar el estado para reintentos futuros
           
-          // Reintentar login después de la verificación
-          P.info(`🔄 Reintentando login después de esperar verificación...`);
-          try {
-            const retryResult = await this.ig.account.login(username, password);
-            this.igUserId = retryResult.pk;
-            this.logged = true;
-            
-            // Guardar cookies - asegurarse de que se guarden correctamente
-            // Pequeño delay para asegurar que las cookies se establezcan
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            
-            const cookieJar = await this.ig.state.serializeCookieJar();
-            P.info(`💾 Guardando cookies después de verificación`);
-            
-            // Convertir Sets a Arrays para poder guardarlos en JSON
-            const processedMessagesArray = this.processedMessages ? Array.from(this.processedMessages) : [];
-            const processedCommentsArray = this.processedComments ? Array.from(this.processedComments) : [];
-            
-            fs.writeFileSync(file, JSON.stringify({ 
-              cookieJar,
+          P.warn(`💾 Guardando información de challenge para reintentos futuros...`);
+          
+          // Guardar challenge en archivo para reintentos
+          const challengeFile = path.join(STATE_DIR, `${this.userId}_challenge.json`);
+          fs.writeFileSync(challengeFile, JSON.stringify({
               username,
-              igUserId: this.igUserId,
-              savedAt: new Date().toISOString(),
-              processedMessages: processedMessagesArray,
-              processedComments: processedCommentsArray
+            timestamp: Date.now(),
+            challengeUrl,
+            challengeChoice,
+            retryCount: (this.pendingChallenge?.retryCount || 0)
             }), 'utf8');
             
-            P.info(`✅ Login exitoso después de verificación para ${username}`);
-            emitToUserIG(this.userId, 'instagram:status', { 
-              connected: true, 
-              username: this.username,
-              igUserId: this.igUserId,
-              message: 'Login completado después de verificación'
-            });
-            
-            this.pendingChallenge = null;
-            return { success: true, restored: false, afterChallenge: true };
-          } catch (retryError) {
-            P.warn(`⚠️ Reintento falló, el usuario aún no ha verificado: ${retryError.message}`);
-            
-            // Retornar estado de challenge pendiente
-            return { 
-              success: false, 
-              challenge: true, 
-              message: 'Challenge pendiente. El usuario debe verificar su cuenta en Instagram. Reintenta el login en unos minutos.',
-              challengeId: `challenge_${Date.now()}`,
-              needsUserAction: true
-            };
+          // Retornar estado de challenge pendiente
+          const challengeResponse = {
+            success: false, 
+            challenge: true, 
+            needs_code: needsCode, // SIEMPRE indicar si necesita código
+            message: needsCode ?
+              'Código de verificación requerido. Por favor, ingresa el código que recibiste por SMS o Email.' :
+              (isNewAccount ? 
+                'Cuenta nueva detectada. Debes usar la cuenta manualmente en Instagram por 24-48 horas antes de poder hacer login desde aquí.' :
+                'Challenge detectado. Verifica tu cuenta en Instagram (teléfono/app). El sistema intentará login automáticamente después de 3 minutos. Si prefieres, puedes reintentar manualmente.'),
+            challengeId: `challenge_${Date.now()}`,
+            needsUserAction: true,
+            needsManualRetry: needsCode ? false : false, // Si necesita código, NO manual retry (debe usar resolve-challenge)
+            autoRetry: needsCode ? false : true, // No auto-retry si necesita código
+            autoRetryIn: needsCode ? null : 180000, // 3 minutos en milisegundos
+            is_new_account: isNewAccount,
+            retryInstructions: needsCode ?
+              'Ingresa el código de verificación que recibiste por SMS o Email usando el endpoint POST /api/instagram/resolve-challenge.' :
+              (isNewAccount ?
+                'Usa la cuenta manualmente en Instagram por 24-48 horas, luego intenta login desde aquí.' :
+                'Verifica en Instagram. El sistema reintentará automáticamente en 3 minutos. También puedes reintentar manualmente.')
+          };
+          
+          // Programar reintento automático SOLO si NO necesita código (en background, no bloqueante)
+          // NO hacer auto-retry si necesita código - el usuario DEBE usar resolve-challenge
+          if (!isNewAccount && !needsCode) {
+            P.info(`⏰ Programando reintento automático en 3 minutos...`);
+            setTimeout(async () => {
+              try {
+                P.info(`🔄 Reintentando login automático después de challenge para ${username}...`);
+                const retryResult = await this.login({ username, password, proxy });
+                
+                if (retryResult.success) {
+                  P.info(`✅ Login exitoso después de reintento automático para ${username}`);
+                  emitToUserIG(this.userId, 'instagram:alert', {
+                    type: 'challenge_resolved',
+                    severity: 'success',
+                    message: 'Login exitoso',
+                    description: 'El login se completó exitosamente después de la verificación.',
+                    username: username,
+                    timestamp: Date.now()
+                  });
+                } else {
+                  P.warn(`⚠️ Reintento automático falló. El usuario debe reintentar manualmente.`);
+                  emitToUserIG(this.userId, 'instagram:alert', {
+                    type: 'challenge_retry_failed',
+                    severity: 'warning',
+                    message: 'Reintento automático falló',
+                    description: 'El sistema intentó login automático pero falló. Por favor verifica en Instagram y reintenta manualmente.',
+                    username: username,
+                    timestamp: Date.now()
+                  });
+                }
+              } catch (retryError) {
+                P.warn(`⚠️ Error en reintento automático: ${retryError.message}`);
+              }
+            }, 180000); // 3 minutos
+          } else if (needsCode && !isNewAccount) {
+            P.info(`📱 Challenge requiere código - esperando que el usuario ingrese el código...`);
           }
+          
+          return challengeResponse;
+        }
+        
+        
+        // Detectar cuenta vinculada a Facebook o bloqueo de login    
+        if (msg.includes('linked Facebook account') || 
+            msg.includes('You can log in with your linked Facebook') ||
+            msg.includes('Facebook account')) {
+          P.error(`🔗 Error de login detectado: ${msg}`);
+          
+          // Determinar si es realmente Facebook o un bloqueo genérico
+          const isFacebookLinked = msg.includes('linked Facebook account') || 
+                                   msg.includes('You can log in with your linked Facebook');
+          
+          if (isFacebookLinked) {
+            emitToUserIG(this.userId, 'instagram:alert', { 
+              type: 'facebook_linked_account',
+              severity: 'error',
+              message: 'Cuenta vinculada a Facebook',
+              description: 'Tu cuenta de Instagram está vinculada a Facebook y no permite login directo con usuario/contraseña. SOLUCIONES: 1) Desvincular la cuenta de Facebook en Instagram (Configuración > Cuenta > Facebook), 2) Usar otra cuenta de Instagram NUEVA que NO esté vinculada a Facebook desde el inicio, 3) Crear la cuenta directamente en Instagram (NO desde Facebook), 4) Intentar login manualmente en la app de Instagram primero para establecer la sesión.',
+              username: username,
+              action_required: true,
+              instructions: [
+                'SOLUCIÓN 1: Desvincular Facebook',
+                '  → Ve a Instagram.com o la app',
+                '  → Configuración > Cuenta > Facebook',
+                '  → Desvincula la cuenta de Facebook',
+                '',
+                'SOLUCIÓN 2: Crear cuenta nueva SIN Facebook',
+                '  → Crea cuenta directamente en Instagram',
+                '  → NO uses "Continuar con Facebook"',
+                '  → Usa email/teléfono para crear la cuenta',
+                '',
+                'SOLUCIÓN 3: Login manual primero',
+                '  → Haz login manual en app móvil',
+                '  → Luego intenta desde aquí',
+                '',
+                'Luego intenta login nuevamente'
+              ],
+              timestamp: Date.now()
+            });
+          } else {
+            // Bloqueo genérico de login (puede ser por otras razones)
+            emitToUserIG(this.userId, 'instagram:alert', { 
+              type: 'login_blocked',
+              severity: 'error',
+              message: 'Login bloqueado por Instagram',
+              description: `Instagram está bloqueando el login. Posibles causas: 1) La cuenta es nueva y requiere verificación, 2) Instagram detectó actividad sospechosa, 3) La cuenta necesita ser verificada manualmente primero, 4) La IP está siendo bloqueada temporalmente. SOLUCIÓN: Haz login manualmente en Instagram.com o la app móvil primero, luego espera 24-48 horas antes de intentar desde aquí.`,
+              username: username,
+              action_required: true,
+              instructions: [
+                'PASO 1: Verificar cuenta manualmente',
+                '  → Ve a Instagram.com o la app móvil',
+                '  → Inicia sesión con tu cuenta',
+                '  → Completa cualquier verificación (SMS/Email)',
+                '  → Usa la cuenta normalmente por 24-48 horas',
+                '',
+                'PASO 2: Esperar período de confianza',
+                '  → Instagram necesita "confiar" en la IP',
+                '  → Usa la cuenta desde navegador/app por 1-2 días',
+                '  → Haz posts, likes, follows normales',
+                '',
+                'PASO 3: Reintentar desde aquí',
+                '  → Después de 24-48 horas',
+                '  → Intenta login nuevamente',
+                '',
+                'Si el problema persiste, usa otra cuenta'
+              ],
+              error_message: msg,
+              timestamp: Date.now()
+            });
+          }
+          
+          throw new Error(isFacebookLinked ? 
+            'La cuenta está vinculada a Facebook. Debes desvincularla o usar otra cuenta.' : 
+            'Instagram está bloqueando el login. Verifica manualmente primero y espera 24-48 horas.');
         }
         
         // Detectar rate limit
@@ -280,8 +708,185 @@ class InstagramService {
         throw loginError;
       }
     } catch (error) {
+      // Catch del try externo (línea 102)
       P.error(`❌ Error general en login: ${error.message}`);
+      
+      const errorMsg = String(error.message || '');
+      const errorStatus = error.response?.status || error.status || 0;
+      
+      // Detectar si Instagram sugiere usar email para recuperar cuenta (en catch externo también)
+      if (errorMsg.includes('We can send you an email') || 
+          errorMsg.includes('email to help you get back') ||
+          errorMsg.includes('send you an email to help') ||
+          errorMsg.includes('email to help') ||
+          errorMsg.includes('can send you an email')) {
+        P.error(`📧 Instagram sugiere usar email para recuperar cuenta (catch externo): ${errorMsg}`);
+        emitToUserIG(this.userId, 'instagram:alert', { 
+          type: 'account_recovery_required',
+          severity: 'warning',
+          message: 'Recuperación de cuenta requerida',
+          description: 'Instagram está sugiriendo usar el email para recuperar el acceso a tu cuenta. Esto puede indicar: 1) Problemas con las credenciales, 2) La cuenta está bloqueada o necesita verificación, 3) Instagram detectó actividad sospechosa. SOLUCIONES: 1) Verifica que el usuario y contraseña sean correctos, 2) Intenta recuperar la cuenta desde Instagram.com usando "Olvidé mi contraseña", 3) Verifica el email asociado a la cuenta, 4) Espera 24-48 horas si la cuenta fue bloqueada recientemente.',
+          username: username,
+          action_required: true,
+          instructions: [
+            'PASO 1: Verificar credenciales',
+            '  → Asegúrate de que el usuario y contraseña sean correctos',
+            '  → Intenta hacer login manualmente en Instagram.com',
+            '  → Si no puedes, sigue al paso 2',
+            '',
+            'PASO 2: Recuperar cuenta',
+            '  → Ve a Instagram.com',
+            '  → Haz clic en "Olvidé mi contraseña"',
+            '  → Ingresa tu usuario o email',
+            '  → Sigue las instrucciones para recuperar',
+            '',
+            'PASO 3: Verificar email',
+            '  → Revisa el email asociado a la cuenta',
+            '  → Busca mensajes de Instagram sobre recuperación',
+            '  → Sigue los pasos indicados en el email',
+            '',
+            'PASO 4: Esperar si está bloqueada',
+            '  → Si la cuenta fue bloqueada, espera 24-48 horas',
+            '  → No intentes login desde aquí durante ese tiempo',
+            '  → Usa la cuenta manualmente desde navegador/app'
+          ],
+          timestamp: Date.now()
+        });
+        
+        return {
+          success: false,
+          challenge: false,
+          error: 'Instagram requiere recuperación de cuenta',
+          message: 'Instagram está sugiriendo usar el email para recuperar el acceso. Por favor, verifica las credenciales o recupera la cuenta desde Instagram.com.',
+          username: username,
+          recovery_required: true
+        };
+      }
+      
+      // Detectar intento de login sospechoso bloqueado (en catch externo también)
+      if (errorMsg.includes('suspicious login') || 
+          errorMsg.includes('Suspicious login attempt') ||
+          errorMsg.includes('We blocked a suspicious login') ||
+          errorMsg.includes('blocked a suspicious login attempt')) {
+        P.error(`🚨 Instagram bloqueó intento de login como sospechoso (catch externo): ${errorMsg}`);
+        emitToUserIG(this.userId, 'instagram:alert', { 
+          type: 'suspicious_login_blocked',
+          severity: 'error',
+          message: 'Intento de login bloqueado',
+          description: 'Instagram detectó el intento de login desde la API como sospechoso y lo bloqueó. Esto es normal cuando se intenta hacer login desde una API. SOLUCIONES: 1) Verifica el login desde Instagram.com o la app móvil y acepta "Fue yo" cuando aparezca la notificación, 2) Cambia la contraseña si Instagram lo sugiere, 3) Espera 24-48 horas antes de intentar desde aquí, 4) Usa la cuenta normalmente desde navegador/app durante unos días para que Instagram "confíe" en la actividad.',
+          username: username,
+          action_required: true,
+          instructions: [
+            '⚠️ INSTAGRAM BLOQUEÓ EL LOGIN COMO SOSPECHOSO',
+            '',
+            'Esto es normal cuando se intenta login desde API.',
+            '',
+            'SOLUCIÓN PASO A PASO:',
+            '',
+            '1️⃣ Verificar en Instagram (AHORA MISMO):',
+            '  → Abre Instagram en tu teléfono o navegador',
+            '  → Verás una notificación "Suspicious login attempt"',
+            '  → Toca "Fue yo" o "It was me"',
+            '  → Si aparece "Change password", cámbiala',
+            '  → Acepta todas las verificaciones',
+            '',
+            '2️⃣ Cambiar contraseña (si Instagram lo sugiere):',
+            '  → Ve a Instagram.com o la app',
+            '  → Configuración > Seguridad',
+            '  → Cambia la contraseña',
+            '  → Guarda la nueva contraseña',
+            '',
+            '3️⃣ Usar la cuenta normalmente (24-48 horas):',
+            '  → Haz login manual desde navegador/app',
+            '  → Publica 1-2 fotos',
+            '  → Da likes y sigue algunas cuentas',
+            '  → Envía algunos DMs',
+            '  → Instagram necesita ver actividad "normal"',
+            '',
+            '4️⃣ Esperar 24-48 horas:',
+            '  → No intentes login desde aquí inmediatamente',
+            '  → Instagram necesita "confiar" en la IP',
+            '  → La cuenta necesita tener historial de actividad',
+            '',
+            '5️⃣ Reintentar desde aquí:',
+            '  → Después de 24-48 horas',
+            '  → Usa la NUEVA contraseña si la cambiaste',
+            '  → El login debería funcionar',
+            '',
+            'NOTA: Si sigues recibiendo este error después de 48 horas,',
+            '      Instagram puede estar bloqueando la IP permanentemente.',
+            '      En ese caso, usa una VPN o cambia de IP.'
+          ],
+          timestamp: Date.now()
+        });
+        
+        return {
+          success: false,
+          challenge: false,
+          error: 'Login bloqueado como sospechoso',
+          message: 'Instagram bloqueó el intento de login como sospechoso. Por favor, verifica en Instagram (acepta "Fue yo") y cambia la contraseña si se solicita. Espera 24-48 horas antes de reintentar desde aquí.',
+          username: username,
+          suspicious_login_blocked: true,
+          recovery_required: false
+        };
+      }
+      
+      // Si es un error 401 después de challenge, dar instrucciones específicas
+      
+      if (errorStatus === 401 || errorMsg.includes('401') || errorMsg.includes('Unauthorized')) {
+        // Puede ser que el usuario verificó pero el login aún falla
+        if (this.pendingChallenge) {
+          P.warn(`⚠️ Login falló con 401 pero hay challenge pendiente. El usuario debe reintentar después de verificar.`);
+          emitToUserIG(this.userId, 'instagram:alert', {
+            type: 'challenge_verification_pending',
+            severity: 'warning',
+            message: 'Verificación aún pendiente',
+            description: 'El login falló después de verificación. Posibles causas: 1) Instagram aún no procesó la verificación (espera 2-5 minutos más), 2) La verificación no se completó correctamente, 3) Necesitas verificar de nuevo. SOLUCIÓN: Verifica nuevamente en Instagram, espera 2-5 minutos, y reintenta el login.',
+            username: this.pendingChallenge?.username || username,
+            action_required: true,
+            instructions: [
+              'Si ya verificaste en teléfono:',
+              '  → Espera 2-5 minutos más',
+              '  → Instagram necesita procesar la verificación',
+              '  → Luego reintenta el login',
+              '',
+              'Si no verificaste aún:',
+              '  → Abre Instagram en tu teléfono',
+              '  → Verifica el login (acepta o "Fue yo")',
+              '  → Espera 2-5 minutos',
+              '  → Reintenta el login desde aquí'
+            ],
+            timestamp: Date.now()
+          });
+          
+          // Retornar error más descriptivo
+          throw new Error('Login falló con 401. Si ya verificaste en Instagram, espera 2-5 minutos y reintenta. Si no verificaste, verifica primero en tu teléfono/app.');
+        }
+      }
+      
       emitToUserIG(this.userId, 'instagram:status', { connected: false, error: error.message });
+      
+      // Si hay un pendingChallenge, retornar información del challenge en lugar de lanzar error
+      if (this.pendingChallenge) {
+        P.info(`⚠️ Error en login pero hay challenge pendiente, retornando información del challenge`);
+        return {
+          success: false,
+          challenge: true,
+          needs_code: this.pendingChallenge.needsCode || false,
+          message: 'Error durante login, pero hay un challenge pendiente. Por favor, verifica en Instagram.',
+          needsUserAction: true,
+          needsManualRetry: !this.pendingChallenge.needsCode,
+          autoRetry: false,
+          autoRetryIn: null,
+          is_new_account: false,
+          retryInstructions: this.pendingChallenge.needsCode ? 
+            'Ingresa el código de verificación que recibiste por SMS o Email usando el endpoint /api/instagram/resolve-challenge.' :
+            'Verifica en Instagram y luego reintenta el login.',
+          challengeId: `challenge_${Date.now()}`,
+          error: error.message
+        };
+      }
+      
       throw error;
     }
   }
@@ -330,6 +935,257 @@ class InstagramService {
         return { success: true, threadId, text };
       } catch (error) {
         P.error(`❌ Error respondiendo en thread ${threadId}: ${error.message}`);
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Generar audio desde texto usando ElevenLabs
+   */
+  async generateAudioWithElevenLabs(text, voiceId = 'wE71xUVnwmbR14UviISk', apiKey = '19e52e33890414d9d5978e9fa059b990c59312fdec9fb3f39e43cdaaefd80de8') {
+    try {
+      P.info(`🎵 Generando audio con ElevenLabs: ${text.substring(0, 50)}...`);
+      
+      const response = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+        {
+          text: text,
+          model_id: 'eleven_multilingual_v2',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+            style: 0.5,
+            use_speaker_boost: true
+          }
+        },
+        {
+          headers: {
+            'Accept': 'audio/mpeg',
+            'Content-Type': 'application/json',
+            'xi-api-key': apiKey
+          },
+          responseType: 'arraybuffer',
+          timeout: 30000
+        }
+      );
+
+      const audioBuffer = Buffer.from(response.data);
+      P.info(`✅ Audio generado: ${(audioBuffer.length / 1024).toFixed(2)} KB`);
+      
+      return { success: true, audioBuffer, size: audioBuffer.length };
+    } catch (error) {
+      P.error(`❌ Error generando audio con ElevenLabs: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Enviar audio a un usuario por username
+   */
+  async sendAudio({ username, audioBuffer }) {
+    return this.limiter.schedule(async () => {
+      try {
+        if (!this.logged) {
+          throw new Error('No hay sesión activa de Instagram');
+        }
+
+        if (!audioBuffer || !Buffer.isBuffer(audioBuffer)) {
+          throw new Error('audioBuffer debe ser un Buffer válido');
+        }
+
+        P.info(`🎤 Enviando audio a ${username} (${(audioBuffer.length / 1024).toFixed(2)} KB)`);
+        
+        const userId = await this.ig.user.getIdByUsername(username);
+        const thread = this.ig.entity.directThread([String(userId)]);
+        
+        // Guardar temporalmente el audio en un archivo
+        const tempDir = path.join(process.cwd(), 'temp_downloads');
+        if (!fs.existsSync(tempDir)) {
+          fs.mkdirSync(tempDir, { recursive: true });
+        }
+        
+        const timestamp = Date.now();
+        const tempMp3Path = path.join(tempDir, `audio_${timestamp}.mp3`);
+        const tempMp4Path = path.join(tempDir, `audio_${timestamp}.mp4`);
+        
+        // Guardar el MP3 original
+        fs.writeFileSync(tempMp3Path, audioBuffer);
+        
+        try {
+          // Convertir MP3 a MP4 (formato que Instagram requiere para voice messages)
+          // Instagram espera MP4 con audio AAC, no M4A
+          P.info(`🔄 Convirtiendo MP3 a MP4 para compatibilidad con Instagram...`);
+          
+          const { exec } = await import('child_process');
+          const { promisify } = await import('util');
+          const execAsync = promisify(exec);
+          
+          // Usar ffmpeg para convertir MP3 a MP4 con audio AAC (formato que Instagram espera)
+          // -f mp4: fuerza formato MP4
+          // -c:a aac: codec de audio AAC
+          // -b:a 64k: bitrate más bajo para voz (Instagram usa 64k para voice messages)
+          // -ar 24000: sample rate 24kHz (formato de voz de Instagram)
+          // -ac 1: mono
+          // -movflags +faststart: mueve los metadatos al inicio (necesario para lectura correcta)
+          const ffmpegCommand = `ffmpeg -i "${tempMp3Path}" -f mp4 -c:a aac -b:a 64k -ar 24000 -ac 1 -movflags +faststart "${tempMp4Path}" -y`;
+          
+          try {
+            await execAsync(ffmpegCommand);
+            P.info(`✅ Audio convertido a MP4 exitosamente`);
+          } catch (ffmpegError) {
+            P.error(`❌ Error convirtiendo audio: ${ffmpegError.message}`);
+            throw new Error(`No se pudo convertir el audio a formato compatible: ${ffmpegError.message}`);
+          }
+          
+          // Verificar que el archivo MP4 existe
+          if (!fs.existsSync(tempMp4Path)) {
+            throw new Error('Archivo MP4 no se generó correctamente');
+          }
+          
+          const mp4Size = fs.statSync(tempMp4Path).size;
+          P.info(`✅ Archivo MP4 generado: ${(mp4Size / 1024).toFixed(2)} KB`);
+          
+          // Leer el archivo MP4 como Buffer
+          const voiceBuffer = await fs.promises.readFile(tempMp4Path);
+          P.info(`✅ Archivo MP4 leído a Buffer: ${(voiceBuffer.length / 1024).toFixed(2)} KB`);
+          
+          // NOTA IMPORTANTE: Instagram deshabilitó broadcastVoice ("This feature is no longer supported")
+          // Intentamos enviar como mensaje de voz, pero sabemos que fallará
+          // El error se capturará y se hará fallback a texto
+          try {
+            await thread.broadcastVoice({
+              file: voiceBuffer
+            });
+            P.info(`✅ Audio enviado exitosamente a ${username}`);
+          } catch (voiceError) {
+            // Si el error es que la función no está soportada, lanzamos un error descriptivo
+            if (voiceError.message?.includes('no longer supported') || voiceError.message?.includes('This feature is no longer supported')) {
+              throw new Error('Mensajes de voz no soportados: Instagram deshabilitó la funcionalidad de enviar mensajes de voz a través de su API. El mensaje se enviará como texto.');
+            }
+            throw voiceError;
+          }
+          return { success: true, username };
+        } finally {
+          // Limpiar archivos temporales
+          try {
+            if (fs.existsSync(tempMp3Path)) {
+              fs.unlinkSync(tempMp3Path);
+            }
+            if (fs.existsSync(tempMp4Path)) {
+              fs.unlinkSync(tempMp4Path);
+            }
+          } catch (cleanupError) {
+            P.warn(`⚠️ Error limpiando archivos temporales: ${cleanupError.message}`);
+          }
+        }
+      } catch (error) {
+        P.error(`❌ Error enviando audio a ${username}: ${error.message}`);
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Responder con audio en un thread existente
+   */
+  async replyAudio({ threadId, audioBuffer }) {
+    return this.limiter.schedule(async () => {
+      try {
+        if (!this.logged) {
+          throw new Error('No hay sesión activa de Instagram');
+        }
+
+        if (!audioBuffer || !Buffer.isBuffer(audioBuffer)) {
+          throw new Error('audioBuffer debe ser un Buffer válido');
+        }
+
+        P.info(`🎤 Respondiendo con audio en thread ${threadId} (${(audioBuffer.length / 1024).toFixed(2)} KB)`);
+        
+        const thread = this.ig.entity.directThread(threadId);
+        
+        // Guardar temporalmente el audio en un archivo
+        const tempDir = path.join(process.cwd(), 'temp_downloads');
+        if (!fs.existsSync(tempDir)) {
+          fs.mkdirSync(tempDir, { recursive: true });
+        }
+        
+        const timestamp = Date.now();
+        const tempMp3Path = path.join(tempDir, `audio_${timestamp}.mp3`);
+        const tempMp4Path = path.join(tempDir, `audio_${timestamp}.mp4`);
+        
+        // Guardar el MP3 original
+        fs.writeFileSync(tempMp3Path, audioBuffer);
+        
+        try {
+          // Convertir MP3 a MP4 (formato que Instagram requiere para voice messages)
+          // Instagram espera MP4 con audio AAC, no M4A
+          P.info(`🔄 Convirtiendo MP3 a MP4 para compatibilidad con Instagram...`);
+          
+          const { exec } = await import('child_process');
+          const { promisify } = await import('util');
+          const execAsync = promisify(exec);
+          
+          // Usar ffmpeg para convertir MP3 a MP4 con audio AAC (formato que Instagram espera)
+          // -f mp4: fuerza formato MP4
+          // -c:a aac: codec de audio AAC
+          // -b:a 64k: bitrate más bajo para voz (Instagram usa 64k para voice messages)
+          // -ar 24000: sample rate 24kHz (formato de voz de Instagram)
+          // -ac 1: mono
+          // -movflags +faststart: mueve los metadatos al inicio (necesario para lectura correcta)
+          const ffmpegCommand = `ffmpeg -i "${tempMp3Path}" -f mp4 -c:a aac -b:a 64k -ar 24000 -ac 1 -movflags +faststart "${tempMp4Path}" -y`;
+          
+          try {
+            await execAsync(ffmpegCommand);
+            P.info(`✅ Audio convertido a MP4 exitosamente`);
+          } catch (ffmpegError) {
+            P.error(`❌ Error convirtiendo audio: ${ffmpegError.message}`);
+            throw new Error(`No se pudo convertir el audio a formato compatible: ${ffmpegError.message}`);
+          }
+          
+          // Verificar que el archivo MP4 existe
+          if (!fs.existsSync(tempMp4Path)) {
+            throw new Error('Archivo MP4 no se generó correctamente');
+          }
+          
+          const mp4Size = fs.statSync(tempMp4Path).size;
+          P.info(`✅ Archivo MP4 generado: ${(mp4Size / 1024).toFixed(2)} KB`);
+          
+          // Leer el archivo MP4 como Buffer
+          const voiceBuffer = await fs.promises.readFile(tempMp4Path);
+          P.info(`✅ Archivo MP4 leído a Buffer: ${(voiceBuffer.length / 1024).toFixed(2)} KB`);
+          
+          // NOTA IMPORTANTE: Instagram deshabilitó broadcastVoice ("This feature is no longer supported")
+          // Intentamos enviar como mensaje de voz, pero sabemos que fallará
+          // El error se capturará y se hará fallback a texto
+          try {
+            await thread.broadcastVoice({
+              file: voiceBuffer
+            });
+            P.info(`✅ Audio enviado en thread ${threadId}`);
+          } catch (voiceError) {
+            // Si el error es que la función no está soportada, lanzamos un error descriptivo
+            if (voiceError.message?.includes('no longer supported') || voiceError.message?.includes('This feature is no longer supported')) {
+              throw new Error('Mensajes de voz no soportados: Instagram deshabilitó la funcionalidad de enviar mensajes de voz a través de su API. El mensaje se enviará como texto.');
+            }
+            throw voiceError;
+          }
+          return { success: true, threadId };
+        } finally {
+          // Limpiar archivos temporales
+          try {
+            if (fs.existsSync(tempMp3Path)) {
+              fs.unlinkSync(tempMp3Path);
+            }
+            if (fs.existsSync(tempMp4Path)) {
+              fs.unlinkSync(tempMp4Path);
+            }
+          } catch (cleanupError) {
+            P.warn(`⚠️ Error limpiando archivos temporales: ${cleanupError.message}`);
+          }
+        }
+      } catch (error) {
+        P.error(`❌ Error respondiendo con audio en thread ${threadId}: ${error.message}`);
         throw error;
       }
     });
@@ -595,7 +1451,7 @@ class InstagramService {
   /**
    * Responder con IA a un mensaje
    */
-  async handleIncomingWithAI({ threadId, text, aiFunction }) {
+  async handleIncomingWithAI({ threadId, text, aiFunction, respondWithAudio = false }) {
     try {
       P.info(`🤖 Generando respuesta con IA para thread ${threadId}`);
       
@@ -606,12 +1462,89 @@ class InstagramService {
         return null;
       }
 
-      await this.replyText({ threadId, text: respuesta });
-      
-      P.info(`✅ Respuesta de IA enviada: ${respuesta.substring(0, 50)}...`);
-      return respuesta;
+      // Si se solicita respuesta con audio o el mensaje original era audio, responder con audio
+      if (respondWithAudio) {
+        P.info(`🎤 Generando respuesta en audio...`);
+        const audioResult = await this.generateAudioWithElevenLabs(respuesta);
+        
+        if (audioResult.success && audioResult.audioBuffer) {
+          await this.replyAudio({ threadId, audioBuffer: audioResult.audioBuffer });
+          P.info(`✅ Respuesta de IA enviada como audio: ${respuesta.substring(0, 50)}...`);
+          return { respuesta, audio: true };
+        } else {
+          P.warn('⚠️ Error generando audio, enviando como texto');
+          await this.replyText({ threadId, text: respuesta });
+          P.info(`✅ Respuesta de IA enviada como texto: ${respuesta.substring(0, 50)}...`);
+          return { respuesta, audio: false };
+        }
+      } else {
+        await this.replyText({ threadId, text: respuesta });
+        P.info(`✅ Respuesta de IA enviada: ${respuesta.substring(0, 50)}...`);
+        return respuesta;
+      }
     } catch (error) {
       P.error(`❌ Error en handleIncomingWithAI: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Responder con IA a un mensaje de audio (transcribe el audio, genera respuesta y envía como audio)
+   */
+  async handleIncomingAudioWithAI({ threadId, audioUrl, transcribeFunction, aiFunction }) {
+    try {
+      P.info(`🎤 Procesando audio recibido en thread ${threadId}`);
+      
+      // Transcribir audio
+      let transcription = '';
+      if (transcribeFunction) {
+        try {
+          // Descargar audio
+          const audioResponse = await axios.get(audioUrl, { responseType: 'arraybuffer' });
+          const audioBuffer = Buffer.from(audioResponse.data);
+          
+          // Transcribir
+          const transcriptionResult = await transcribeFunction(audioBuffer, 'audio.mp4');
+          transcription = transcriptionResult.text || '';
+          P.info(`✅ Audio transcrito: ${transcription.substring(0, 100)}...`);
+        } catch (transcribeError) {
+          P.error(`❌ Error transcribiendo audio: ${transcribeError.message}`);
+          throw new Error('No se pudo transcribir el audio');
+        }
+      } else {
+        throw new Error('transcribeFunction es requerida');
+      }
+
+      if (!transcription || transcription.trim().length === 0) {
+        P.warn('⚠️ Transcripción vacía');
+        return null;
+      }
+
+      // Generar respuesta con IA
+      P.info(`🤖 Generando respuesta con IA para audio transcrito`);
+      const respuesta = await aiFunction(transcription);
+      
+      if (!respuesta || respuesta.trim().length === 0) {
+        P.warn('⚠️ IA no generó respuesta');
+        return null;
+      }
+
+      // Generar y enviar respuesta como audio
+      P.info(`🎤 Generando respuesta en audio...`);
+      const audioResult = await this.generateAudioWithElevenLabs(respuesta);
+      
+      if (audioResult.success && audioResult.audioBuffer) {
+        await this.replyAudio({ threadId, audioBuffer: audioResult.audioBuffer });
+        P.info(`✅ Respuesta de IA enviada como audio: ${respuesta.substring(0, 50)}...`);
+        return { transcription, respuesta, audio: true };
+      } else {
+        P.warn('⚠️ Error generando audio, enviando como texto');
+        await this.replyText({ threadId, text: respuesta });
+        P.info(`✅ Respuesta de IA enviada como texto: ${respuesta.substring(0, 50)}...`);
+        return { transcription, respuesta, audio: false };
+      }
+    } catch (error) {
+      P.error(`❌ Error en handleIncomingAudioWithAI: ${error.message}`);
       throw error;
     }
   }
@@ -627,53 +1560,101 @@ class InstagramService {
 
       P.info(`🔐 Resolviendo challenge con código: ${code}`);
       
-      // Intentar resolver el challenge
-      const challengeResult = await this.ig.challenge.resolve({
-        code: code,
-        choice: choice
-      });
+      // Si hay un choice, seleccionar método de verificación primero
+      if (choice) {
+        P.info(`📱 Seleccionando método de verificación: ${choice}`);
+        await this.ig.challenge.selectVerifyMethod(choice);
+      }
+      
+      // Enviar código de seguridad
+      P.info(`📤 Enviando código de verificación a Instagram...`);
+      const challengeResult = await this.ig.challenge.sendSecurityCode(code);
 
       if (challengeResult) {
-        P.info(`✅ Challenge resuelto exitosamente`);
+        P.info(`✅ Código enviado exitosamente`);
         
-        // Limpiar challenge pendiente
-        this.pendingChallenge = null;
+        // Verificar el estado después de enviar el código
+        const state = await this.ig.challenge.state();
         
-        // Intentar login nuevamente
-        const loginResult = await this.ig.account.login(
-          this.pendingChallenge?.username || this.username, 
-          this.password
-        );
-        
-        this.igUserId = loginResult.pk;
+        if (state.logged_in_user) {
+          // Login exitoso
+          this.igUserId = state.logged_in_user.pk;
         this.logged = true;
 
         // Guardar cookies
         const file = this.stateFile();
         const cookieJar = await this.ig.state.serializeCookieJar();
+          
+          // Convertir Sets a Arrays para poder guardarlos en JSON
+          const processedMessagesArray = this.processedMessages ? Array.from(this.processedMessages) : [];
+          const processedCommentsArray = this.processedComments ? Array.from(this.processedComments) : [];
+          
         fs.writeFileSync(file, JSON.stringify({ 
           cookieJar,
-          username: this.username,
+            username: this.pendingChallenge.username || this.username,
           igUserId: this.igUserId,
-          savedAt: new Date().toISOString()
+            savedAt: new Date().toISOString(),
+            processedMessages: processedMessagesArray,
+            processedComments: processedCommentsArray
         }), 'utf8');
+          
+          // Eliminar challenge pendiente
+          this.pendingChallenge = null;
+          
+          // Eliminar archivo de challenge si existe
+          const challengeFile = path.join(STATE_DIR, `${this.userId}_challenge.json`);
+          if (fs.existsSync(challengeFile)) {
+            try {
+              fs.unlinkSync(challengeFile);
+            } catch (unlinkError) {
+              // Ignorar error
+            }
+          }
 
         emitToUserIG(this.userId, 'instagram:status', { 
           connected: true, 
           username: this.username,
           igUserId: this.igUserId 
         });
+          
+          emitToUserIG(this.userId, 'instagram:alert', {
+            type: 'challenge_resolved',
+            severity: 'success',
+            message: 'Login exitoso',
+            description: 'El código de verificación fue correcto y el login se completó exitosamente.',
+            username: this.username,
+            timestamp: Date.now()
+          });
 
         return { success: true, message: 'Challenge resuelto y login exitoso' };
       } else {
-        throw new Error('No se pudo resolver el challenge');
+          // El código fue enviado pero aún no está logueado
+          // Puede necesitar otro paso
+          P.info(`⚠️ Código enviado pero login aún pendiente. Estado: ${state.step_name}`);
+          throw new Error('El código fue aceptado pero el login aún no está completo. Puede requerir acción adicional.');
+        }
+      } else {
+        throw new Error('No se pudo enviar el código');
       }
     } catch (error) {
       P.error(`❌ Error resolviendo challenge: ${error.message}`);
+      
+      // Detectar si el código fue incorrecto
+      if (error.message.includes('wrong') || error.message.includes('incorrect') || error.message.includes('invalid')) {
+        emitToUserIG(this.userId, 'instagram:alert', {
+          type: 'challenge_code_invalid',
+          severity: 'error',
+          message: 'Código inválido',
+          description: 'El código de verificación ingresado es incorrecto. Por favor, verifica el código e inténtalo nuevamente.',
+          username: this.pendingChallenge?.username || this.username,
+          timestamp: Date.now()
+        });
+      } else {
       emitToUserIG(this.userId, 'instagram:error', { 
         message: error.message,
         type: 'challenge_failed'
       });
+      }
       throw error;
     }
   }
@@ -724,7 +1705,7 @@ class InstagramService {
             if (fs.existsSync(file)) {
               const data = JSON.parse(fs.readFileSync(file, 'utf8'));
               if (data.cookieJar && data.username) {
-                await this.ig.state.deserializeCookieJar(JSON.stringify(data.cookieJar));
+                await this.ig.state.deserializeCookieJar(data.cookieJar);
                 this.logged = true;
                 this.username = data.username;
                 this.igUserId = data.igUserId;
@@ -963,7 +1944,7 @@ class InstagramService {
                     timestamp: comment.created_at.toString(),
                     like_count: comment.comment_like_count || 0,
                     is_verified: comment.user.is_verified || false,
-                    is_business: comment.user.is_business || false
+                      is_business: comment.user.is_business || false,
                   });
 
                   count++;
@@ -978,7 +1959,6 @@ class InstagramService {
                 if (hasMore && count < limit) {
                   await new Promise(resolve => setTimeout(resolve, 2000));
                 }
-
               } catch (pageError) {
                 P.error(`❌ Error obteniendo página de comentarios: ${pageError.message}`);
                 break;
@@ -993,13 +1973,11 @@ class InstagramService {
                 post_info: postInfo,
                 extracted_count: comments.length,
                 limit_requested: limit,
-                total_comments: postInfo.comment_count
+                  total_comments: postInfo.comment_count,
               };
             }
-
           } catch (mediaIdError) {
             P.info(`⚠️ Método con media ID ${testMediaId} falló: ${mediaIdError.message}`);
-            // Log detallado del error
             if (mediaIdError.response) {
               P.warn(`   Status: ${mediaIdError.response.status}`);
               P.warn(`   Body: ${JSON.stringify(mediaIdError.response.body || {}).substring(0, 200)}`);
@@ -1452,7 +2430,7 @@ class InstagramService {
             if (fs.existsSync(file)) {
               const data = JSON.parse(fs.readFileSync(file, 'utf8'));
               if (data.cookieJar && data.username) {
-                await this.ig.state.deserializeCookieJar(JSON.stringify(data.cookieJar));
+                await this.ig.state.deserializeCookieJar(data.cookieJar);
                 this.logged = true;
                 this.username = data.username;
                 this.igUserId = data.igUserId;
@@ -1852,7 +2830,7 @@ export async function getOrCreateIGSession(userId) {
       if (fs.existsSync(file)) {
         const data = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (data.cookieJar && data.username) {
-          await existing.ig.state.deserializeCookieJar(JSON.stringify(data.cookieJar));
+          await existing.ig.state.deserializeCookieJar(data.cookieJar);
           existing.logged = true;
           existing.username = data.username;
           existing.igUserId = data.igUserId;
@@ -1894,7 +2872,7 @@ export async function getOrCreateIGSession(userId) {
       if (fs.existsSync(file)) {
         const data = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (data.cookieJar && data.username) {
-          await service.ig.state.deserializeCookieJar(JSON.stringify(data.cookieJar));
+          await service.ig.state.deserializeCookieJar(data.cookieJar);
           service.logged = true;
           service.username = data.username;
           service.igUserId = data.igUserId;
@@ -2121,10 +3099,10 @@ export async function igSendMessage(username, message, userId = null) {
     } else {
       // Si no se proporciona userId, usar la primera sesión disponible (comportamiento antiguo para compatibilidad)
       for (const [uid, userSession] of igSessions) {
-        if (userSession.logged) {
-          session = userSession;
+      if (userSession.logged) {
+        session = userSession;
           console.log(`⚠️ [IG] No se proporcionó userId, usando sesión de usuario ${uid}`);
-          break;
+        break;
         }
       }
     }
@@ -2173,10 +3151,10 @@ export async function igGetFollowers(username, limit = 100, userId = null) {
     } else {
       // Si no se proporciona userId, usar la primera sesión disponible (comportamiento antiguo para compatibilidad)
       for (const [uid, userSession] of igSessions) {
-        if (userSession.logged) {
-          session = userSession;
+      if (userSession.logged) {
+        session = userSession;
           console.log(`⚠️ [IG] No se proporcionó userId para obtener seguidores, usando sesión de usuario ${uid}`);
-          break;
+        break;
         }
       }
     }

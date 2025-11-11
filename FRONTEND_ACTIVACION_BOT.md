@@ -436,3 +436,5 @@ Para verificar si el bot está activo:
 - **Verifica:** Que el estado del bot muestre `active: true` usando `GET /api/instagram/bot/status`
 - **Verifica:** Los logs del servidor para ver errores
 
+
+

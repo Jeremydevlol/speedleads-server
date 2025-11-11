@@ -59,80 +59,64 @@ class InstagramBotService {
     this.commentsCheckInterval = null;
     this.isGlobalRunning = false;
     
-    // Configuración global del bot con medidas anti-detección mejoradas
+    // Configuración global del bot - RESPUESTA RÁPIDA (máximo 5 segundos)
     this.config = {
       name: 'Asistente Uniclick',
       antiDetection: {
-        minDelay: 5000,      // 5 segundos mínimo entre respuestas (más humano)
-        maxDelay: 25000,     // 25 segundos máximo entre respuestas (más variado)
-        typingDelay: 3000,   // 3 segundos simulando escritura
-        readingDelay: 1500,  // 1.5 segundos simulando lectura del mensaje
+        minDelay: 500,       // 0.5 segundos mínimo entre respuestas (respuesta rápida)
+        maxDelay: 5000,      // 5 segundos máximo entre respuestas (como solicitado)
+        typingDelay: 500,    // 0.5 segundos simulando escritura (más rápido)
+        readingDelay: 300,   // 0.3 segundos simulando lectura del mensaje (más rápido)
         humanPatterns: true, // Usar patrones humanos
         randomEmojis: true,  // Emojis aleatorios
         variedResponses: true, // Respuestas variadas
         
-        // Límites de actividad para parecer humano
-        maxMessagesPerHour: 30,     // Máximo 30 mensajes por hora
-        maxMessagesPerDay: 200,     // Máximo 200 mensajes por día
-        quietHours: {               // Horas de "descanso" (menos actividad)
-          enabled: true,
-          start: 1,  // 1 AM
-          end: 7     // 7 AM
+        // Límites de actividad (mantenidos para no sobrecargar)
+        maxMessagesPerHour: 200,    // Máximo 200 mensajes por hora (aumentado)
+        maxMessagesPerDay: 1000,    // Máximo 1000 mensajes por día (aumentado)
+        quietHours: {               // Horas de "descanso" (desactivadas para respuesta rápida)
+          enabled: false,   // DESACTIVADO para responder siempre rápido
+          start: 1,
+          end: 7
         },
         
         // Variación de respuestas
         responseVariation: {
-          enabled: true,
-          skipChance: 0.05,  // 5% de probabilidad de no responder (parecer ocupado)
-          delayMultiplier: 1.5 // Multiplicador de delay en horas tranquilas
+          enabled: false,   // DESACTIVADO para que SIEMPRE responda
+          skipChance: 0,    // 0% de probabilidad de no responder (siempre responde)
+          delayMultiplier: 1.0 // Sin multiplicador
         }
       }
     };
   }
 
-  // Función para generar delay humano con variación según hora del día
+  // Función para generar delay rápido (máximo 5 segundos como solicitado)
   getHumanDelay() {
-    const { minDelay, maxDelay, quietHours, responseVariation } = this.config.antiDetection;
-    let delay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
-    
-    // Si estamos en horas tranquilas, aumentar el delay
-    if (quietHours.enabled) {
-      const currentHour = new Date().getHours();
-      if (currentHour >= quietHours.start && currentHour < quietHours.end) {
-        delay *= responseVariation.delayMultiplier;
-        console.log(`🌙 [Anti-detección] Hora tranquila detectada, delay aumentado a ${delay/1000}s`);
-      }
-    }
-    
+    const { minDelay, maxDelay } = this.config.antiDetection;
+    // Delay aleatorio entre minDelay y maxDelay (0.5s - 5s)
+    const delay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
     return delay;
   }
 
-  // Función para simular lectura del mensaje (más humano)
+  // Función para simular lectura del mensaje (rápida)
   async simulateReading(messageLength) {
     const { readingDelay } = this.config.antiDetection;
-    // Más largo el mensaje, más tiempo de "lectura"
-    const readTime = readingDelay + (messageLength * 10); // 10ms por carácter
-    await new Promise(resolve => setTimeout(resolve, Math.min(readTime, 5000))); // Máximo 5s
+    // Lectura rápida: tiempo base + pequeño incremento por carácter
+    const readTime = readingDelay + (messageLength * 2); // 2ms por carácter (más rápido)
+    await new Promise(resolve => setTimeout(resolve, Math.min(readTime, 2000))); // Máximo 2s
   }
 
-  // Función para simular escritura humana (varía según longitud de respuesta)
+  // Función para simular escritura (rápida)
   async simulateTyping(responseLength) {
     const { typingDelay } = this.config.antiDetection;
-    // Más larga la respuesta, más tiempo de "escritura"
-    const typeTime = typingDelay + (responseLength * 15); // 15ms por carácter
-    await new Promise(resolve => setTimeout(resolve, Math.min(typeTime, 8000))); // Máximo 8s
+    // Escritura rápida: tiempo base + pequeño incremento por carácter
+    const typeTime = typingDelay + (responseLength * 3); // 3ms por carácter (más rápido)
+    await new Promise(resolve => setTimeout(resolve, Math.min(typeTime, 3000))); // Máximo 3s
   }
 
-  // Función para verificar si debemos responder (anti-detección)
+  // Función para verificar si debemos responder (SIEMPRE responder)
   shouldRespond(userId) {
-    const { responseVariation } = this.config.antiDetection;
-    
-    // Pequeña probabilidad de "estar ocupado" y no responder
-    if (responseVariation.enabled && Math.random() < responseVariation.skipChance) {
-      console.log(`🤷 [Anti-detección] Simulando estar ocupado, no responder este mensaje`);
-      return false;
-    }
-    
+    // SIEMPRE responder (configuración para respuesta rápida)
     return true;
   }
 
@@ -145,8 +129,9 @@ class InstagramBotService {
     const timeSinceLastResponse = now - botData.lastResponseTime;
     const minDelay = this.config.antiDetection.minDelay;
     
-    // Verificar delay mínimo
-    if (timeSinceLastResponse < minDelay) {
+    // Verificar delay mínimo (permitir respuesta rápida)
+    // Solo verificar si han pasado menos de 0.3 segundos (para evitar spam extremo)
+    if (timeSinceLastResponse < 300) {
       return false;
     }
     
@@ -762,26 +747,109 @@ class InstagramBotService {
                 users: thread.users?.map(u => ({ username: u.username, fullName: u.full_name })) || []
               };
               
-              // Generar respuesta con IA usando la personalidad del bot activo
-              // La personalidad ya está cargada en botData.personalityData
-              console.log(`🧠 [Instagram Bot] Generando respuesta con personalidad "${botData.personalityData?.nombre || 'desconocida'}" (ID: ${botData.personalityData?.id || 'N/A'})`);
-              
-              const aiResponse = await this.generateAIResponse(userId, processedMessage, history, mediaType, mediaContent, { threadContext });
-              
-              console.log(`   Respuesta IA: "${aiResponse.substring(0, 100)}..."`);
-              
-              // Simular escritura humana (según longitud de respuesta)
-              console.log('⌨️  [Instagram Bot] Simulando escritura...');
-              await this.simulateTyping(aiResponse.length);
-              
-              console.log('📤 [Instagram Bot] Enviando respuesta...');
-              try {
-                await botData.igService.replyText({
-                  threadId: thread.thread_id,
-                  text: aiResponse
-                });
+              // Si es un audio, responder con audio usando ElevenLabs
+              if (mediaType === 'audio' && mediaContent) {
+                console.log(`🎤 [Instagram Bot] Audio detectado, respondiendo con audio usando ElevenLabs`);
                 
-                console.log(`✅ [Instagram Bot] Respuesta enviada exitosamente para ${userId}`);
+                try {
+                  // Usar la función handleIncomingAudioWithAI que transcribe, genera respuesta y envía como audio
+                  const audioResult = await botData.igService.handleIncomingAudioWithAI({
+                    threadId: thread.thread_id,
+                    audioUrl: mediaContent,
+                    transcribeFunction: transcribeAudioBuffer,
+                    aiFunction: async (transcription) => {
+                      // Generar respuesta usando la personalidad
+                      const aiResponse = await this.generateAIResponse(userId, transcription, history, 'audio', mediaContent, { threadContext });
+                      return aiResponse;
+                    }
+                  });
+                  
+                  if (audioResult && audioResult.respuesta) {
+                    console.log(`✅ [Instagram Bot] Respuesta de audio enviada exitosamente para ${userId}`);
+                    const aiResponse = audioResult.respuesta;
+                    
+                    // Agregar respuesta del bot al historial
+                    history.push({
+                      role: 'assistant',
+                      content: aiResponse,
+                      timestamp: Date.now(),
+                      mediaType: 'audio'
+                    });
+                    
+                    // Guardar historial actualizado
+                    if (!botData.conversationHistory) {
+                      botData.conversationHistory = new Map();
+                    }
+                    const savedHistory = history.slice(-50);
+                    botData.conversationHistory.set(thread.thread_id, savedHistory);
+                    if (senderUsername) {
+                      botData.conversationHistory.set(senderUsername, savedHistory);
+                    }
+                    
+                    // Marcar mensaje como procesado
+                    botData.processedMessages.add(messageId);
+                    if (alternativeMessageId) {
+                      botData.processedMessages.add(alternativeMessageId);
+                    }
+                    
+                    // Guardar en la sesión
+                    if (botData.igService && botData.igService.processedMessages) {
+                      botData.igService.processedMessages.add(messageId);
+                      if (alternativeMessageId) {
+                        botData.igService.processedMessages.add(alternativeMessageId);
+                      }
+                    }
+                    
+                    // Guardar inmediatamente en archivo
+                    if (botData.igService && typeof botData.igService.saveSession === 'function') {
+                      await botData.igService.saveSession();
+                    }
+                    
+                    this.recordMessageSent(userId);
+                    console.log(`✅ [Instagram Bot] Mensaje de audio marcado como procesado: ${messageId.substring(0, 80)}...`);
+                    
+                    // Saltar al final del procesamiento (no continuar con flujo de texto)
+                    console.log('   ' + '─'.repeat(50));
+                    const delay = this.getHumanDelay();
+                    console.log(`⏳ [Instagram Bot] Esperando ${delay/1000}s (comportamiento humano)...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue; // Salir de este mensaje y continuar con el siguiente
+                  } else {
+                    throw new Error('No se pudo generar respuesta de audio');
+                  }
+                } catch (audioError) {
+                  console.log(`❌ [Instagram Bot] Error procesando audio, fallback a texto: ${audioError.message}`);
+                  console.log(`   Stack trace: ${audioError.stack}`);
+                  // Fallback: procesar como texto normal (continúa con el flujo normal más abajo)
+                  // Cambiar mediaType a null para que se procese como texto normal
+                  mediaType = null;
+                  mediaContent = null;
+                }
+              }
+              
+              // Flujo normal para texto/imágenes/videos (o fallback de audio)
+              if (mediaType !== 'audio' || !mediaContent) {
+                // Flujo normal para texto/imágenes/videos
+                // Generar respuesta con IA usando la personalidad del bot activo
+                // La personalidad ya está cargada en botData.personalityData
+                console.log(`🧠 [Instagram Bot] Generando respuesta con personalidad "${botData.personalityData?.nombre || 'desconocida'}" (ID: ${botData.personalityData?.id || 'N/A'})`);
+                
+                const aiResponse = await this.generateAIResponse(userId, processedMessage, history, mediaType, mediaContent, { threadContext });
+                
+                console.log(`   Respuesta IA: "${aiResponse.substring(0, 100)}..."`);
+                
+                // Simular escritura humana (según longitud de respuesta)
+                console.log('⌨️  [Instagram Bot] Simulando escritura...');
+                await this.simulateTyping(aiResponse.length);
+                
+                console.log('📤 [Instagram Bot] Enviando respuesta...');
+                try {
+                  await botData.igService.replyText({
+                    threadId: thread.thread_id,
+                    text: aiResponse
+                  });
+                  
+                  console.log(`✅ [Instagram Bot] Respuesta enviada exitosamente para ${userId}`);
                 
                 // Agregar respuesta del bot al historial
                 history.push({
@@ -836,6 +904,7 @@ class InstagramBotService {
               const delay = this.getHumanDelay();
               console.log(`⏳ [Instagram Bot] Esperando ${delay/1000}s (comportamiento humano)...`);
               await new Promise(resolve => setTimeout(resolve, delay));
+              }
             }
           }
         }

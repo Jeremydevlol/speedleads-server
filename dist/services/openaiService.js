@@ -224,6 +224,22 @@ INSTRUCCIONES CRÍTICAS PARA CONTEXTO COMPLETO:
 - ⚠️ NO digas que no tienes acceso a información que está en el historial de la conversación
 - ⚠️ Mantén el contexto COMPLETO de toda la conversación
 
+🚫 IMPORTANTE - EVITA REPETICIONES:
+- ⚠️ NO repitas exactamente lo que ya dijiste en mensajes anteriores
+- ⚠️ NO uses las mismas frases o palabras una y otra vez
+- ⚠️ Si ya respondiste algo, avanza la conversación con nueva información o preguntas
+- ⚠️ Varía tu vocabulario y forma de expresarte
+- ⚠️ Si el usuario hace la misma pregunta, responde de forma diferente o con más detalle
+- ⚠️ NO copies texto de tus respuestas anteriores - crea contenido nuevo y relevante
+
+🎤 CAPACIDADES DE AUDIO:
+- ✅ SÍ PUEDES enviar mensajes de audio cuando el usuario lo pida o cuando sea apropiado
+- ✅ NO digas que no puedes enviar audios - el sistema los enviará automáticamente cuando corresponda
+- ✅ Si el usuario pide un audio, responde normalmente (el sistema convertirá tu respuesta a audio)
+- ✅ Si el usuario prefiere audios, puedes seguir comunicándote por audio hasta que indique lo contrario
+- ⚠️ NO menciones limitaciones técnicas sobre audios - solo responde naturalmente
+- ⚠️ Cuando respondas en audio, di cosas NUEVAS y relevantes - NO repitas lo mismo que antes
+
 ${hasGreeted ? 'Ya saludaste, no vuelvas a saludar.' : ''}
 ${mediaPrompt}
 
@@ -253,8 +269,10 @@ Responde en el mismo idioma que el usuario y sigue tu personalidad exactamente.`
             const completion = await openai.chat.completions.create({
                 model: 'gpt-4o-mini', // Modelo más rápido
                 messages,
-                temperature: 0.7,
+                temperature: 0.8, // Aumentado para más variación y menos repetición
                 max_tokens: 1500, // Aumentado para respuestas completas
+                frequency_penalty: 0.6, // Penaliza palabras repetidas (0-2, más alto = menos repetición)
+                presence_penalty: 0.3, // Penaliza temas repetidos (0-2, más alto = más variación)
                 stream: false
             });
 
@@ -285,8 +303,10 @@ Responde en el mismo idioma que el usuario y sigue tu personalidad exactamente.`
                     body: JSON.stringify({
                         model: 'deepseek-chat', // Modelo más rápido
                         messages,
-                        temperature: 0.7,
+                        temperature: 0.8, // Aumentado para más variación y menos repetición
                         max_tokens: 1500, // Aumentado para respuestas completas
+                        frequency_penalty: 0.6, // Penaliza palabras repetidas
+                        presence_penalty: 0.3, // Penaliza temas repetidos
                         stream: false
                     }),
                     signal: AbortSignal.timeout(15001) // 15 segundos timeout

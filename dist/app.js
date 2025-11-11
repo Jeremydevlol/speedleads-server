@@ -531,7 +531,7 @@ app.get('/api/instagram/search', async (req, res) => {
 // Endpoint para enviar mensaje directo a un usuario específico
 app.post('/api/instagram/send-message', async (req, res) => {
   console.log('📤 [SEND] Endpoint de envío de mensaje directo llamado');
-  const { username, message, userId, personalityId } = req.body;
+  const { username, message, userId, personalityId, send_as_audio = true } = req.body;
   
   if (!username || !message) {
     return res.status(400).json({
@@ -749,9 +749,129 @@ Genera SOLO el mensaje personalizado, sin explicaciones.`;
     }
     
     console.log(`📤 [SEND] Enviando mensaje a ${username}: "${finalMessage.substring(0, 60)}${finalMessage.length > 60 ? '...' : ''}"`);
+    console.log(`🎤 [SEND] Modo de envío: ${send_as_audio ? 'AUDIO' : 'TEXTO'}`);
+    console.log(`🔍 [SEND] send_as_audio value: ${send_as_audio}, type: ${typeof send_as_audio}`);
+    
+    // Obtener userId final (del body, token, o usar null para sesión por defecto)
+    let userIdToUse = actualUserId;
+    if (!userIdToUse) {
+      // Intentar obtener del token si aún no lo tenemos
+      try {
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const { validateJwt } = await import('./config/jwt.js');
+          const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+          if (decoded) {
+            userIdToUse = decoded.userId || decoded.sub || decoded.user?.id;
+            console.log(`✅ [SEND] userId obtenido del token: ${userIdToUse}`);
+          }
+        }
+      } catch (tokenError) {
+        console.log(`⚠️ [SEND] No se pudo obtener userId del token: ${tokenError.message}`);
+      }
+    }
+    
+    console.log(`🔍 [SEND] userIdToUse final: ${userIdToUse || 'null (usará sesión disponible)'}`);
     
     // Enviar mensaje real a Instagram (con userId para usar la sesión correcta)
-    const result = await igSendMessage(username, finalMessage, actualUserId);
+    let result;
+    
+    // Validar send_as_audio explícitamente
+    const shouldSendAsAudio = send_as_audio === true || send_as_audio === 'true' || (send_as_audio !== false && send_as_audio !== 'false');
+    console.log(`🔍 [SEND] Evaluación de audio: send_as_audio=${send_as_audio}, shouldSendAsAudio=${shouldSendAsAudio}`);
+    
+    if (shouldSendAsAudio) {
+      // Enviar como audio usando ElevenLabs
+      try {
+        console.log(`🎤 [SEND] ═══════════════════════════════════════════════════════`);
+        console.log(`🎤 [SEND] INICIANDO ENVÍO DE AUDIO para @${username}`);
+        console.log(`🎤 [SEND] userIdToUse: ${userIdToUse || 'null'}`);
+        
+        const { getOrCreateIGSession, igSessions } = await import('./services/instagramService.js');
+        
+        // Obtener sesión - primero buscar cualquier sesión activa existente
+        console.log(`🔍 [SEND] Obteniendo sesión de Instagram...`);
+        console.log(`   userIdToUse: ${userIdToUse || 'null'}`);
+        
+        let session = null;
+        
+        // PRIORIDAD 1: Buscar cualquier sesión activa existente (sin crear nueva)
+        console.log(`🔍 [SEND] Buscando sesiones activas existentes...`);
+        for (const [uid, userSession] of igSessions.entries()) {
+          if (userSession && userSession.logged) {
+            session = userSession;
+            userIdToUse = uid;
+            console.log(`✅ [SEND] Sesión activa encontrada: usuario ${uid}, username: ${session.username || 'sin username'}`);
+            break;
+          }
+        }
+        
+        // PRIORIDAD 2: Si no hay sesión activa pero tenemos userId, intentar obtenerla
+        if (!session && userIdToUse) {
+          console.log(`🔍 [SEND] Intentando obtener sesión con userId ${userIdToUse}...`);
+          session = await getOrCreateIGSession(userIdToUse);
+          if (session && session.logged) {
+            console.log(`✅ [SEND] Sesión obtenida con userId ${userIdToUse}: ${session.username || 'sin username'} (logged: ${session.logged})`);
+          } else {
+            console.log(`⚠️ [SEND] Sesión con userId ${userIdToUse} no está logueada`);
+            session = null;
+          }
+        }
+        
+        if (!session || !session.logged) {
+          throw new Error('No hay sesión activa de Instagram. Debe hacer login primero.');
+        }
+        
+        console.log(`✅ [SEND] Sesión final obtenida: ${session.username || 'sin username'} (logged: ${session.logged}, userId: ${session.userId || userIdToUse})`);
+        
+        // Generar audio desde el texto
+        console.log(`🎵 [SEND] Generando audio con ElevenLabs...`);
+        console.log(`   Texto: "${finalMessage.substring(0, 100)}${finalMessage.length > 100 ? '...' : ''}"`);
+        
+        const audioResult = await session.generateAudioWithElevenLabs(finalMessage);
+        
+        if (audioResult.success && audioResult.audioBuffer) {
+          console.log(`✅ [SEND] Audio generado exitosamente: ${(audioResult.audioBuffer.length / 1024).toFixed(2)} KB`);
+          
+          // Enviar audio
+          console.log(`📤 [SEND] Enviando audio a @${username}...`);
+          const audioSendResult = await session.sendAudio({
+            username: username,
+            audioBuffer: audioResult.audioBuffer
+          });
+          
+          // Normalizar respuesta para que tenga el mismo formato que igSendMessage
+          result = {
+            success: audioSendResult.success,
+            data: {
+              username: username,
+              sentAt: new Date().toISOString(),
+              status: 'sent',
+              type: 'audio'
+            },
+            message: 'Audio enviado exitosamente'
+          };
+          console.log(`🎤 [SEND] ✅✅✅ AUDIO ENVIADO EXITOSAMENTE a @${username} ✅✅✅`);
+          console.log(`🎤 [SEND] ═══════════════════════════════════════════════════════`);
+        } else {
+          throw new Error('No se pudo generar el audio - resultado inválido');
+        }
+      } catch (audioError) {
+        console.log(`❌ [SEND] ═══════════════════════════════════════════════════════`);
+        console.log(`❌ [SEND] ERROR ENVIANDO AUDIO a @${username}`);
+        console.log(`❌ [SEND] Error: ${audioError.message}`);
+        console.log(`❌ [SEND] Stack: ${audioError.stack}`);
+        console.log(`❌ [SEND] Fallback: enviando como texto`);
+        console.log(`❌ [SEND] ═══════════════════════════════════════════════════════`);
+        
+        // Fallback a texto si falla el audio
+        result = await igSendMessage(username, finalMessage, userIdToUse);
+      }
+    } else {
+      // Enviar como texto normal
+      console.log(`📝 [SEND] Enviando como texto (send_as_audio = false)`);
+      result = await igSendMessage(username, finalMessage, userIdToUse);
+    }
     
     if (result.success) {
       console.log(`✅ [SEND] Mensaje enviado exitosamente a ${username}`);
@@ -811,6 +931,7 @@ Genera SOLO el mensaje personalizado, sin explicaciones.`;
         message: 'Mensaje enviado exitosamente',
         recipient: username,
         sent_message: finalMessage,
+        sent_as_audio: send_as_audio,
         ai_generated: messageGenerated,
         personality_used: actualPersonalityId || null,
         personality_name: (messageGenerated && actualPersonalityId && personalityData) ? personalityData.nombre : null,
@@ -1149,7 +1270,7 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
     'content-type': req.headers['content-type'],
     'authorization': req.headers['authorization'] ? 'Bearer ***' : 'no presente'
   });
-  const { target_username, message, limit = 50, delay = 2000, userId, personalityId } = req.body;
+  const { target_username, message, limit = 50, delay = 2000, userId, personalityId, send_as_audio = true } = req.body;
 
   if (!target_username || !message) {
     return res.status(400).json({
@@ -1270,6 +1391,7 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
     console.log(`📤 [BULK-FOLLOWERS] Enviando mensajes a ${followersResult.followers.length} seguidores...`);
     console.log(`📝 [BULK-FOLLOWERS] MENSAJE BASE RECIBIDO: "${message}"`);
     console.log(`📝 [BULK-FOLLOWERS] Este mensaje base se usará para generar variaciones personalizadas con IA`);
+    console.log(`🎤 [BULK-FOLLOWERS] send_as_audio configurado: ${send_as_audio} (tipo: ${typeof send_as_audio})`);
 
     // Cargar personalidad si está disponible (de bot activo o desde DB)
     let personalityData = null;
@@ -1450,7 +1572,66 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
         }
         
         // Enviar mensaje usando la sesión del usuario correcto
-        const sendResult = await igSendMessage(follower.username, finalMessage, actualUserId);
+        let sendResult;
+        
+        if (send_as_audio) {
+          // Enviar como audio usando ElevenLabs
+          try {
+            console.log(`🎤 [BULK-FOLLOWERS] Generando audio para @${follower.username}...`);
+            const { getOrCreateIGSession } = await import('./services/instagramService.js');
+            
+            // Obtener userId - usar el del token si no está en body
+            let userIdToUse = actualUserId;
+            if (!userIdToUse) {
+              // Intentar obtener del token
+              try {
+                const authHeader = req.headers.authorization;
+                if (authHeader && authHeader.startsWith('Bearer ')) {
+                  const { validateJwt } = await import('./config/jwt.js');
+                  const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+                  if (decoded) {
+                    userIdToUse = decoded.userId || decoded.sub || decoded.user?.id;
+                    console.log(`✅ [BULK-FOLLOWERS] userId obtenido del token para audio: ${userIdToUse}`);
+                  }
+                }
+              } catch (tokenError) {
+                console.log(`⚠️ [BULK-FOLLOWERS] No se pudo obtener userId del token: ${tokenError.message}`);
+              }
+            }
+            
+            // Obtener sesión (con userId o sin él, usará la primera disponible)
+            const session = userIdToUse ? await getOrCreateIGSession(userIdToUse) : await getOrCreateIGSession(actualUserId);
+            
+            // Generar audio desde el texto
+            console.log(`🎵 [BULK-FOLLOWERS] Generando audio con ElevenLabs: "${finalMessage.substring(0, 50)}..."`);
+            const audioResult = await session.generateAudioWithElevenLabs(finalMessage);
+            
+            if (audioResult.success && audioResult.audioBuffer) {
+              console.log(`✅ [BULK-FOLLOWERS] Audio generado: ${(audioResult.audioBuffer.length / 1024).toFixed(2)} KB`);
+              
+              // Enviar audio
+              const audioSendResult = await session.sendAudio({
+                username: follower.username,
+                audioBuffer: audioResult.audioBuffer
+              });
+              
+              sendResult = audioSendResult;
+              console.log(`🎤 [BULK-FOLLOWERS] ✅ Audio enviado exitosamente a @${follower.username}`);
+            } else {
+              throw new Error('No se pudo generar el audio');
+            }
+          } catch (audioError) {
+            console.log(`❌ [BULK-FOLLOWERS] Error enviando audio a @${follower.username}: ${audioError.message}`);
+            console.log(`   Stack: ${audioError.stack}`);
+            console.log(`   Fallback: enviando como texto`);
+            
+            // Fallback a texto si falla el audio
+            sendResult = await igSendMessage(follower.username, finalMessage, actualUserId);
+          }
+        } else {
+          // Enviar como texto normal
+          sendResult = await igSendMessage(follower.username, finalMessage, actualUserId);
+        }
         
         if (sendResult.success) {
           sentCount++;
@@ -1459,10 +1640,11 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
             full_name: follower.full_name,
             status: 'sent',
             ai_generated: aiGenerated,
+            sent_as_audio: send_as_audio,
             message_preview: finalMessage.substring(0, 60) + '...',
             timestamp: new Date().toISOString()
           });
-          console.log(`✅ [BULK-FOLLOWERS] Mensaje ${aiGenerated ? '(IA)' : '(base)'} enviado a ${follower.username}`);
+          console.log(`✅ [BULK-FOLLOWERS] Mensaje ${aiGenerated ? '(IA)' : '(base)'} ${send_as_audio ? '(AUDIO)' : '(texto)'} enviado a ${follower.username}`);
           
           // IMPORTANTE: Marcar que ya se envió mensaje inicial a este usuario
           // Esto previene que el bot auto-responda este mensaje que acabamos de enviar
@@ -1554,6 +1736,7 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
     }
 
     console.log(`✅ [BULK-FOLLOWERS] Envío masivo completado: ${sentCount} enviados (${aiGeneratedCount} con IA), ${failedCount} fallidos`);
+    console.log(`🎤 [BULK-FOLLOWERS] Modo de envío: ${send_as_audio ? 'AUDIO' : 'TEXTO'}`);
 
     res.json({
       success: true,
@@ -1565,6 +1748,7 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
       total_followers: followersResult.followers.length,
       personality_used: actualPersonalityId || null,
       personality_name: personalityData?.nombre || null,
+      send_as_audio: send_as_audio,
       results,
       account_info: followersResult.account_info
     });
@@ -1651,6 +1835,51 @@ app.post('/api/instagram/login', async (req, res) => {
     // Hacer login real en Instagram
     const loginResult = await session.login({ username, password });
     
+    // Verificar si requiere recuperación de cuenta
+    if (loginResult.recovery_required === true) {
+      console.log(`📧 [LOGIN] Recuperación de cuenta requerida para ${username}`);
+      return res.status(200).json({
+        success: false,
+        challenge: false,
+        recovery_required: true,
+        message: loginResult.message || 'Instagram requiere recuperación de cuenta',
+        error: loginResult.error || 'Recuperación de cuenta requerida',
+        username: username
+      });
+    }
+    
+    // Verificar si el login fue bloqueado como sospechoso
+    if (loginResult.suspicious_login_blocked === true) {
+      console.log(`🚨 [LOGIN] Login bloqueado como sospechoso para ${username}`);
+      return res.status(200).json({
+        success: false,
+        challenge: false,
+        suspicious_login_blocked: true,
+        message: loginResult.message || 'Instagram bloqueó el login como sospechoso',
+        error: loginResult.error || 'Login bloqueado como sospechoso',
+        username: username
+      });
+    }
+    
+    // Verificar si hay un challenge
+    if (loginResult.challenge === true) {
+      console.log(`⚠️ [LOGIN] Challenge detectado para ${username}: ${loginResult.message}`);
+      return res.status(200).json({
+        success: false,
+        challenge: true,
+        needs_code: loginResult.needs_code || false,
+        message: loginResult.message,
+        needsUserAction: loginResult.needsUserAction || true,
+        needsManualRetry: loginResult.needsManualRetry !== undefined ? loginResult.needsManualRetry : !loginResult.needs_code,
+        autoRetry: loginResult.autoRetry || false,
+        autoRetryIn: loginResult.autoRetryIn || null,
+        is_new_account: loginResult.is_new_account || false,
+        retryInstructions: loginResult.retryInstructions || 'Verifica en Instagram y reintenta el login.',
+        challengeId: loginResult.challengeId || null,
+        username: username
+      });
+    }
+    
     if (loginResult.success) {
       console.log(`✅ [LOGIN] Login real exitoso en Instagram para: ${username} (userId: ${userId})`);
       
@@ -1674,10 +1903,11 @@ app.post('/api/instagram/login', async (req, res) => {
         userId: userId
       });
     } else {
-      console.log(`❌ Login fallido para usuario: ${username} - ${loginResult.error || 'Error desconocido'}`);
-      res.status(401).json({ 
+      console.log(`❌ Login fallido para usuario: ${username} - ${loginResult.error || loginResult.message || 'Error desconocido'}`);
+      res.status(200).json({ 
         success: false, 
-        error: loginResult.error || 'Error en login de Instagram' 
+        error: loginResult.error || loginResult.message || 'Error en login de Instagram',
+        username: username
       });
     }
   } catch (error) {

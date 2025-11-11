@@ -292,7 +292,225 @@ export default InstagramAlertsPanel;
 
 ---
 
-### **4. `private_account_target` (Error)**
+### **4. `facebook_linked_account` (Error) ⭐ NUEVO**
+
+**Cuándo:** Cuando intentas hacer login a una cuenta de Instagram vinculada a Facebook
+
+```json
+{
+  "type": "facebook_linked_account",
+  "severity": "error",
+  "message": "Cuenta vinculada a Facebook",
+  "description": "Tu cuenta de Instagram está vinculada a Facebook y no permite login directo con usuario/contraseña. Opciones: 1) Desvincular la cuenta de Facebook en Instagram (Configuración > Cuenta > Facebook), 2) Usar otra cuenta de Instagram no vinculada a Facebook, 3) Si es posible, iniciar sesión vía Facebook en la app de Instagram una vez y luego intentar desde aquí.",
+  "username": "chuliganga",
+  "action_required": true,
+  "instructions": [
+    "Ve a Instagram.com o la app",
+    "Configuración > Cuenta > Facebook",
+    "Desvincula la cuenta de Facebook",
+    "O usa otra cuenta no vinculada",
+    "Luego intenta login nuevamente"
+  ],
+  "timestamp": 1706457600000
+}
+```
+
+**Solución:**
+1. Ir a Instagram.com o la app móvil
+2. Configuración → Cuenta → Facebook
+3. Desvincular la cuenta de Facebook
+4. O usar otra cuenta de Instagram no vinculada a Facebook
+5. Intentar login nuevamente
+
+---
+
+### **5. `login_blocked` (Error) ⭐ NUEVO**
+
+**Cuándo:** Cuando Instagram bloquea el login por razones genéricas (cuenta nueva, IP bloqueada, etc.)
+
+```json
+{
+  "type": "login_blocked",
+  "severity": "error",
+  "message": "Login bloqueado por Instagram",
+  "description": "Instagram está bloqueando el login. Posibles causas: 1) La cuenta es nueva y requiere verificación, 2) Instagram detectó actividad sospechosa, 3) La cuenta necesita ser verificada manualmente primero, 4) La IP está siendo bloqueada temporalmente. SOLUCIÓN: Haz login manualmente en Instagram.com o la app móvil primero, luego espera 24-48 horas antes de intentar desde aquí.",
+  "username": "usuario",
+  "action_required": true,
+  "instructions": [
+    "PASO 1: Verificar cuenta manualmente",
+    "  → Ve a Instagram.com o la app móvil",
+    "  → Inicia sesión con tu cuenta",
+    "  → Completa cualquier verificación (SMS/Email)",
+    "  → Usa la cuenta normalmente por 24-48 horas",
+    "",
+    "PASO 2: Esperar período de confianza",
+    "  → Instagram necesita \"confiar\" en la IP",
+    "  → Usa la cuenta desde navegador/app por 1-2 días",
+    "  → Haz posts, likes, follows normales",
+    "",
+    "PASO 3: Reintentar desde aquí",
+    "  → Después de 24-48 horas",
+    "  → Intenta login nuevamente",
+    "",
+    "Si el problema persiste, usa otra cuenta"
+  ],
+  "error_message": "POST /api/v1/accounts/login/ - 400 Bad Request...",
+  "timestamp": 1706457600000
+}
+```
+
+**Solución:**
+1. Haz login manual en Instagram.com o app móvil
+2. Completa verificaciones (SMS/Email)
+3. Usa la cuenta normalmente por 24-48 horas
+4. Reintenta login desde el sistema
+
+---
+
+### **6. `challenge_code_required` (Warning) ⭐ NUEVO**
+
+**Cuándo:** Cuando Instagram requiere un código de verificación para completar el login
+
+```json
+{
+  "type": "challenge_code_required",
+  "severity": "warning",
+  "message": "Código de verificación requerido",
+  "description": "Instagram requiere un código de verificación para completar el login. Por favor, ingresa el código que recibiste por SMS o Email.",
+  "username": "dineroxig",
+  "action_required": true,
+  "needs_code": true,
+  "challenge_id": "challenge_1234567890",
+  "instructions": [
+    "PASO 1: Revisa tu teléfono/email",
+    "  → Instagram envió un código de verificación",
+    "  → Revisa SMS o correo electrónico",
+    "  → El código es de 6 dígitos",
+    "",
+    "PASO 2: Ingresa el código",
+    "  → Usa el campo de código que aparece",
+    "  → Ingresa el código completo",
+    "  → El sistema verificará automáticamente",
+    "",
+    "Si no recibes el código:",
+    "  → Espera 30-60 segundos",
+    "  → Verifica spam/correo no deseado",
+    "  → Puedes solicitar un nuevo código"
+  ],
+  "timestamp": 1234567890
+}
+```
+
+**Acción del Frontend:**
+```tsx
+if (alert.type === 'challenge_code_required') {
+  // Mostrar modal o input para ingresar código
+  setShowCodeInput(true);
+  setChallengeId(alert.challenge_id);
+  
+  // El usuario ingresa el código y llama a:
+  // POST /api/instagram/resolve-challenge
+  // Body: { code: "123456" }
+}
+```
+
+---
+
+### **7. `challenge_code_invalid` (Error) ⭐ NUEVO**
+
+**Cuándo:** Cuando el código de verificación ingresado es incorrecto
+
+```json
+{
+  "type": "challenge_code_invalid",
+  "severity": "error",
+  "message": "Código inválido",
+  "description": "El código de verificación ingresado es incorrecto. Por favor, verifica el código e inténtalo nuevamente.",
+  "username": "dineroxig",
+  "timestamp": 1234567890
+}
+```
+
+**Acción del Frontend:**
+```tsx
+if (alert.type === 'challenge_code_invalid') {
+  // Mostrar error y permitir reingresar código
+  setCodeError('Código incorrecto. Inténtalo de nuevo.');
+  setCodeInput('');
+}
+```
+
+---
+
+### **8. `challenge_required` (Warning) ⭐ NUEVO**
+
+**Cuándo:** Cuando Instagram requiere verificación de seguridad (challenge) que NO requiere código
+
+```json
+{
+  "type": "challenge_required",
+  "severity": "warning",
+  "message": "Verificación requerida",
+  "description": "Instagram requiere verificación de seguridad. Por favor: 1) Verifica en tu teléfono/app de Instagram (acepta el login), 2) Espera 1-2 minutos, 3) Reintenta el login desde aquí. El sistema NO reintentará automáticamente.",
+  "username": "dineroxig",
+  "action_required": true,
+  "instructions": [
+    "PASO 1: Verificar en teléfono/app",
+    "  → Abre Instagram en tu teléfono",
+    "  → Verás una notificación de login",
+    "  → Toca \"Fue yo\" o acepta el login",
+    "  → Completa cualquier verificación (código SMS/Email)",
+    "",
+    "PASO 2: Esperar 1-2 minutos",
+    "  → Instagram necesita procesar la verificación",
+    "  → No intentes login inmediatamente",
+    "",
+    "PASO 3: Reintentar login",
+    "  → Vuelve a hacer login desde aquí",
+    "  → Si ya verificaste, debería funcionar",
+    "",
+    "NOTA: Si falla después de verificar, espera 5-10 minutos más"
+  ],
+  "challengeId": "challenge_1706457600000",
+  "timestamp": 1706457600000
+}
+```
+
+**IMPORTANTE:** El sistema NO reintenta automáticamente. Debes reintentar manualmente después de verificar.
+
+---
+
+### **7. `challenge_verification_pending` (Warning) ⭐ NUEVO**
+
+**Cuándo:** Cuando el login falla con 401 después de verificar en teléfono
+
+```json
+{
+  "type": "challenge_verification_pending",
+  "severity": "warning",
+  "message": "Verificación aún pendiente",
+  "description": "El login falló después de verificación. Posibles causas: 1) Instagram aún no procesó la verificación (espera 2-5 minutos más), 2) La verificación no se completó correctamente, 3) Necesitas verificar de nuevo. SOLUCIÓN: Verifica nuevamente en Instagram, espera 2-5 minutos, y reintenta el login.",
+  "username": "dineroxig",
+  "action_required": true,
+  "instructions": [
+    "Si ya verificaste en teléfono:",
+    "  → Espera 2-5 minutos más",
+    "  → Instagram necesita procesar la verificación",
+    "  → Luego reintenta el login",
+    "",
+    "Si no verificaste aún:",
+    "  → Abre Instagram en tu teléfono",
+    "  → Verifica el login (acepta o \"Fue yo\")",
+    "  → Espera 2-5 minutos",
+    "  → Reintenta el login desde aquí"
+  ],
+  "timestamp": 1706457600000
+}
+```
+
+---
+
+### **8. `private_account_target` (Error)**
 
 **Cuándo:** Cuando intentas extraer seguidores de una cuenta privada
 
