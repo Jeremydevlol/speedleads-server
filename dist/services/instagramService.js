@@ -5,6 +5,7 @@ import path, { dirname } from 'path';
 import pino from 'pino';
 import { fileURLToPath } from 'url';
 import axios from 'axios';
+import puppeteer from 'puppeteer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -19,6 +20,21 @@ if (!fs.existsSync(STATE_DIR)) {
 // Store de sesiones de Instagram por usuario
 export const igSessions = new Map();
 const initializing = new Map();
+
+/**
+ * Helper seguro para convertir shortcode a media ID usando BigInt
+ * Evita el redondeo de JavaScript con números grandes
+ */
+function shortcodeToPk(code) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  let id = 0n;
+  for (const ch of code) {
+    const idx = BigInt(alphabet.indexOf(ch));
+    if (idx < 0n) throw new Error(`Shortcode inválido: ${ch}`);
+    id = id * 64n + idx;
+  }
+  return id.toString(); // Siempre como string
+}
 
 // Variable global para Socket.IO
 let globalIO = null;
@@ -99,12 +115,27 @@ class InstagramService {
    * Login a Instagram con usuario/contraseña
    * Restaura sesión desde archivo si existe
    */
-  async login({ username, password, proxy }) {
+  async login({ username, password, proxy, clientIP }) {
     try {
       P.info(`Intentando login de Instagram para ${username}`);
       
       this.username = username;
       this.ig.state.generateDevice(username);
+      
+      // Configurar IP del cliente si está disponible
+      if (clientIP && clientIP !== 'unknown') {
+        try {
+          // Establecer la IP del cliente en los headers de Instagram
+          this.ig.request.defaults.headers = {
+            ...this.ig.request.defaults.headers,
+            'X-Forwarded-For': clientIP,
+            'X-Real-IP': clientIP
+          };
+          P.info(`📍 Usando IP del cliente: ${clientIP}`);
+        } catch (ipError) {
+          P.warn(`⚠️ No se pudo configurar IP del cliente: ${ipError.message}`);
+        }
+      }
       
       if (proxy) {
         this.ig.state.proxyUrl = proxy;
@@ -941,254 +972,26 @@ class InstagramService {
   }
 
   /**
-   * Generar audio desde texto usando ElevenLabs
+   * FUNCIONES DE AUDIO ELIMINADAS
+   * Instagram deshabilitó oficialmente broadcastVoice en 2025
+   * Las funciones sendAudio, replyAudio y generateAudioWithElevenLabs han sido eliminadas
+   * Si necesitas enviar audio, usa texto o envía el audio como archivo/video
    */
-  async generateAudioWithElevenLabs(text, voiceId = 'wE71xUVnwmbR14UviISk', apiKey = '19e52e33890414d9d5978e9fa059b990c59312fdec9fb3f39e43cdaaefd80de8') {
-    try {
-      P.info(`🎵 Generando audio con ElevenLabs: ${text.substring(0, 50)}...`);
-      
-      const response = await axios.post(
-        `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-        {
-          text: text,
-          model_id: 'eleven_multilingual_v2',
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.75,
-            style: 0.5,
-            use_speaker_boost: true
-          }
-        },
-        {
-          headers: {
-            'Accept': 'audio/mpeg',
-            'Content-Type': 'application/json',
-            'xi-api-key': apiKey
-          },
-          responseType: 'arraybuffer',
-          timeout: 30000
-        }
-      );
-
-      const audioBuffer = Buffer.from(response.data);
-      P.info(`✅ Audio generado: ${(audioBuffer.length / 1024).toFixed(2)} KB`);
-      
-      return { success: true, audioBuffer, size: audioBuffer.length };
-    } catch (error) {
-      P.error(`❌ Error generando audio con ElevenLabs: ${error.message}`);
-      throw error;
-    }
-  }
 
   /**
-   * Enviar audio a un usuario por username
+   * Enviar audio a un usuario por username - DESHABILITADO
+   * @deprecated Instagram deshabilitó broadcastVoice en 2025
    */
   async sendAudio({ username, audioBuffer }) {
-    return this.limiter.schedule(async () => {
-      try {
-        if (!this.logged) {
-          throw new Error('No hay sesión activa de Instagram');
-        }
-
-        if (!audioBuffer || !Buffer.isBuffer(audioBuffer)) {
-          throw new Error('audioBuffer debe ser un Buffer válido');
-        }
-
-        P.info(`🎤 Enviando audio a ${username} (${(audioBuffer.length / 1024).toFixed(2)} KB)`);
-        
-        const userId = await this.ig.user.getIdByUsername(username);
-        const thread = this.ig.entity.directThread([String(userId)]);
-        
-        // Guardar temporalmente el audio en un archivo
-        const tempDir = path.join(process.cwd(), 'temp_downloads');
-        if (!fs.existsSync(tempDir)) {
-          fs.mkdirSync(tempDir, { recursive: true });
-        }
-        
-        const timestamp = Date.now();
-        const tempMp3Path = path.join(tempDir, `audio_${timestamp}.mp3`);
-        const tempMp4Path = path.join(tempDir, `audio_${timestamp}.mp4`);
-        
-        // Guardar el MP3 original
-        fs.writeFileSync(tempMp3Path, audioBuffer);
-        
-        try {
-          // Convertir MP3 a MP4 (formato que Instagram requiere para voice messages)
-          // Instagram espera MP4 con audio AAC, no M4A
-          P.info(`🔄 Convirtiendo MP3 a MP4 para compatibilidad con Instagram...`);
-          
-          const { exec } = await import('child_process');
-          const { promisify } = await import('util');
-          const execAsync = promisify(exec);
-          
-          // Usar ffmpeg para convertir MP3 a MP4 con audio AAC (formato que Instagram espera)
-          // -f mp4: fuerza formato MP4
-          // -c:a aac: codec de audio AAC
-          // -b:a 64k: bitrate más bajo para voz (Instagram usa 64k para voice messages)
-          // -ar 24000: sample rate 24kHz (formato de voz de Instagram)
-          // -ac 1: mono
-          // -movflags +faststart: mueve los metadatos al inicio (necesario para lectura correcta)
-          const ffmpegCommand = `ffmpeg -i "${tempMp3Path}" -f mp4 -c:a aac -b:a 64k -ar 24000 -ac 1 -movflags +faststart "${tempMp4Path}" -y`;
-          
-          try {
-            await execAsync(ffmpegCommand);
-            P.info(`✅ Audio convertido a MP4 exitosamente`);
-          } catch (ffmpegError) {
-            P.error(`❌ Error convirtiendo audio: ${ffmpegError.message}`);
-            throw new Error(`No se pudo convertir el audio a formato compatible: ${ffmpegError.message}`);
-          }
-          
-          // Verificar que el archivo MP4 existe
-          if (!fs.existsSync(tempMp4Path)) {
-            throw new Error('Archivo MP4 no se generó correctamente');
-          }
-          
-          const mp4Size = fs.statSync(tempMp4Path).size;
-          P.info(`✅ Archivo MP4 generado: ${(mp4Size / 1024).toFixed(2)} KB`);
-          
-          // Leer el archivo MP4 como Buffer
-          const voiceBuffer = await fs.promises.readFile(tempMp4Path);
-          P.info(`✅ Archivo MP4 leído a Buffer: ${(voiceBuffer.length / 1024).toFixed(2)} KB`);
-          
-          // NOTA IMPORTANTE: Instagram deshabilitó broadcastVoice ("This feature is no longer supported")
-          // Intentamos enviar como mensaje de voz, pero sabemos que fallará
-          // El error se capturará y se hará fallback a texto
-          try {
-            await thread.broadcastVoice({
-              file: voiceBuffer
-            });
-            P.info(`✅ Audio enviado exitosamente a ${username}`);
-          } catch (voiceError) {
-            // Si el error es que la función no está soportada, lanzamos un error descriptivo
-            if (voiceError.message?.includes('no longer supported') || voiceError.message?.includes('This feature is no longer supported')) {
-              throw new Error('Mensajes de voz no soportados: Instagram deshabilitó la funcionalidad de enviar mensajes de voz a través de su API. El mensaje se enviará como texto.');
-            }
-            throw voiceError;
-          }
-          return { success: true, username };
-        } finally {
-          // Limpiar archivos temporales
-          try {
-            if (fs.existsSync(tempMp3Path)) {
-              fs.unlinkSync(tempMp3Path);
-            }
-            if (fs.existsSync(tempMp4Path)) {
-              fs.unlinkSync(tempMp4Path);
-            }
-          } catch (cleanupError) {
-            P.warn(`⚠️ Error limpiando archivos temporales: ${cleanupError.message}`);
-          }
-        }
-      } catch (error) {
-        P.error(`❌ Error enviando audio a ${username}: ${error.message}`);
-        throw error;
-      }
-    });
+    throw new Error('❌ Función deshabilitada: Instagram deshabilitó oficialmente broadcastVoice en 2025. Usa texto o envía el audio como archivo/video.');
   }
 
   /**
-   * Responder con audio en un thread existente
+   * Responder con audio en un thread existente - DESHABILITADO
+   * @deprecated Instagram deshabilitó broadcastVoice en 2025
    */
   async replyAudio({ threadId, audioBuffer }) {
-    return this.limiter.schedule(async () => {
-      try {
-        if (!this.logged) {
-          throw new Error('No hay sesión activa de Instagram');
-        }
-
-        if (!audioBuffer || !Buffer.isBuffer(audioBuffer)) {
-          throw new Error('audioBuffer debe ser un Buffer válido');
-        }
-
-        P.info(`🎤 Respondiendo con audio en thread ${threadId} (${(audioBuffer.length / 1024).toFixed(2)} KB)`);
-        
-        const thread = this.ig.entity.directThread(threadId);
-        
-        // Guardar temporalmente el audio en un archivo
-        const tempDir = path.join(process.cwd(), 'temp_downloads');
-        if (!fs.existsSync(tempDir)) {
-          fs.mkdirSync(tempDir, { recursive: true });
-        }
-        
-        const timestamp = Date.now();
-        const tempMp3Path = path.join(tempDir, `audio_${timestamp}.mp3`);
-        const tempMp4Path = path.join(tempDir, `audio_${timestamp}.mp4`);
-        
-        // Guardar el MP3 original
-        fs.writeFileSync(tempMp3Path, audioBuffer);
-        
-        try {
-          // Convertir MP3 a MP4 (formato que Instagram requiere para voice messages)
-          // Instagram espera MP4 con audio AAC, no M4A
-          P.info(`🔄 Convirtiendo MP3 a MP4 para compatibilidad con Instagram...`);
-          
-          const { exec } = await import('child_process');
-          const { promisify } = await import('util');
-          const execAsync = promisify(exec);
-          
-          // Usar ffmpeg para convertir MP3 a MP4 con audio AAC (formato que Instagram espera)
-          // -f mp4: fuerza formato MP4
-          // -c:a aac: codec de audio AAC
-          // -b:a 64k: bitrate más bajo para voz (Instagram usa 64k para voice messages)
-          // -ar 24000: sample rate 24kHz (formato de voz de Instagram)
-          // -ac 1: mono
-          // -movflags +faststart: mueve los metadatos al inicio (necesario para lectura correcta)
-          const ffmpegCommand = `ffmpeg -i "${tempMp3Path}" -f mp4 -c:a aac -b:a 64k -ar 24000 -ac 1 -movflags +faststart "${tempMp4Path}" -y`;
-          
-          try {
-            await execAsync(ffmpegCommand);
-            P.info(`✅ Audio convertido a MP4 exitosamente`);
-          } catch (ffmpegError) {
-            P.error(`❌ Error convirtiendo audio: ${ffmpegError.message}`);
-            throw new Error(`No se pudo convertir el audio a formato compatible: ${ffmpegError.message}`);
-          }
-          
-          // Verificar que el archivo MP4 existe
-          if (!fs.existsSync(tempMp4Path)) {
-            throw new Error('Archivo MP4 no se generó correctamente');
-          }
-          
-          const mp4Size = fs.statSync(tempMp4Path).size;
-          P.info(`✅ Archivo MP4 generado: ${(mp4Size / 1024).toFixed(2)} KB`);
-          
-          // Leer el archivo MP4 como Buffer
-          const voiceBuffer = await fs.promises.readFile(tempMp4Path);
-          P.info(`✅ Archivo MP4 leído a Buffer: ${(voiceBuffer.length / 1024).toFixed(2)} KB`);
-          
-          // NOTA IMPORTANTE: Instagram deshabilitó broadcastVoice ("This feature is no longer supported")
-          // Intentamos enviar como mensaje de voz, pero sabemos que fallará
-          // El error se capturará y se hará fallback a texto
-          try {
-            await thread.broadcastVoice({
-              file: voiceBuffer
-            });
-            P.info(`✅ Audio enviado en thread ${threadId}`);
-          } catch (voiceError) {
-            // Si el error es que la función no está soportada, lanzamos un error descriptivo
-            if (voiceError.message?.includes('no longer supported') || voiceError.message?.includes('This feature is no longer supported')) {
-              throw new Error('Mensajes de voz no soportados: Instagram deshabilitó la funcionalidad de enviar mensajes de voz a través de su API. El mensaje se enviará como texto.');
-            }
-            throw voiceError;
-          }
-          return { success: true, threadId };
-        } finally {
-          // Limpiar archivos temporales
-          try {
-            if (fs.existsSync(tempMp3Path)) {
-              fs.unlinkSync(tempMp3Path);
-            }
-            if (fs.existsSync(tempMp4Path)) {
-              fs.unlinkSync(tempMp4Path);
-            }
-          } catch (cleanupError) {
-            P.warn(`⚠️ Error limpiando archivos temporales: ${cleanupError.message}`);
-          }
-        }
-      } catch (error) {
-        P.error(`❌ Error respondiendo con audio en thread ${threadId}: ${error.message}`);
-        throw error;
-      }
-    });
+    throw new Error('❌ Función deshabilitada: Instagram deshabilitó oficialmente broadcastVoice en 2025. Usa texto o envía el audio como archivo/video.');
   }
 
   /**
@@ -1450,6 +1253,7 @@ class InstagramService {
 
   /**
    * Responder con IA a un mensaje
+   * Nota: respondWithAudio está deshabilitado (Instagram eliminó broadcastVoice en 2025)
    */
   async handleIncomingWithAI({ threadId, text, aiFunction, respondWithAudio = false }) {
     try {
@@ -1462,26 +1266,14 @@ class InstagramService {
         return null;
       }
 
-      // Si se solicita respuesta con audio o el mensaje original era audio, responder con audio
+      // Siempre enviar como texto (audio deshabilitado por Instagram)
       if (respondWithAudio) {
-        P.info(`🎤 Generando respuesta en audio...`);
-        const audioResult = await this.generateAudioWithElevenLabs(respuesta);
-        
-        if (audioResult.success && audioResult.audioBuffer) {
-          await this.replyAudio({ threadId, audioBuffer: audioResult.audioBuffer });
-          P.info(`✅ Respuesta de IA enviada como audio: ${respuesta.substring(0, 50)}...`);
-          return { respuesta, audio: true };
-        } else {
-          P.warn('⚠️ Error generando audio, enviando como texto');
-          await this.replyText({ threadId, text: respuesta });
-          P.info(`✅ Respuesta de IA enviada como texto: ${respuesta.substring(0, 50)}...`);
-          return { respuesta, audio: false };
-        }
-      } else {
-        await this.replyText({ threadId, text: respuesta });
-        P.info(`✅ Respuesta de IA enviada: ${respuesta.substring(0, 50)}...`);
-        return respuesta;
+        P.warn('⚠️ Audio deshabilitado por Instagram, enviando como texto');
       }
+      
+      await this.replyText({ threadId, text: respuesta });
+      P.info(`✅ Respuesta de IA enviada: ${respuesta.substring(0, 50)}...`);
+      return respuesta;
     } catch (error) {
       P.error(`❌ Error en handleIncomingWithAI: ${error.message}`);
       throw error;
@@ -1489,7 +1281,8 @@ class InstagramService {
   }
 
   /**
-   * Responder con IA a un mensaje de audio (transcribe el audio, genera respuesta y envía como audio)
+   * Responder con IA a un mensaje de audio - MODIFICADO
+   * Transcribe el audio, genera respuesta y envía como TEXTO (audio deshabilitado)
    */
   async handleIncomingAudioWithAI({ threadId, audioUrl, transcribeFunction, aiFunction }) {
     try {
@@ -1529,20 +1322,11 @@ class InstagramService {
         return null;
       }
 
-      // Generar y enviar respuesta como audio
-      P.info(`🎤 Generando respuesta en audio...`);
-      const audioResult = await this.generateAudioWithElevenLabs(respuesta);
-      
-      if (audioResult.success && audioResult.audioBuffer) {
-        await this.replyAudio({ threadId, audioBuffer: audioResult.audioBuffer });
-        P.info(`✅ Respuesta de IA enviada como audio: ${respuesta.substring(0, 50)}...`);
-        return { transcription, respuesta, audio: true };
-      } else {
-        P.warn('⚠️ Error generando audio, enviando como texto');
-        await this.replyText({ threadId, text: respuesta });
-        P.info(`✅ Respuesta de IA enviada como texto: ${respuesta.substring(0, 50)}...`);
-        return { transcription, respuesta, audio: false };
-      }
+      // Enviar respuesta como texto (audio deshabilitado por Instagram)
+      P.info(`📝 Enviando respuesta como texto (audio deshabilitado por Instagram)`);
+      await this.replyText({ threadId, text: respuesta });
+      P.info(`✅ Respuesta de IA enviada como texto: ${respuesta.substring(0, 50)}...`);
+      return { transcription, respuesta, audio: false };
     } catch (error) {
       P.error(`❌ Error en handleIncomingAudioWithAI: ${error.message}`);
       throw error;
@@ -1694,7 +1478,7 @@ class InstagramService {
   /**
    * Obtener comentarios de una publicación específica por URL
    */
-  async getCommentsFromPost(postUrl, limit = 50) {
+  async getCommentsFromPost(postUrl, limit = 10000) {
     return this.limiter.schedule(async () => {
       try {
         // Verificar que haya sesión activa con cookies
@@ -1764,18 +1548,18 @@ class InstagramService {
           // Método 1: Intentar convertir shortcode a media ID manualmente
           try {
             const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-            let id = 0;
+            let id = 0n; // BigInt para evitar overflow
             
             for (let i = 0; i < shortcode.length; i++) {
               const char = shortcode[i];
-              const index = alphabet.indexOf(char);
-              if (index === -1) {
+              const index = BigInt(alphabet.indexOf(char));
+              if (index < 0n) {
                 throw new Error(`Carácter inválido en shortcode: ${char}`);
               }
-              id = id * 64 + index;
+              id = id * 64n + index;
             }
             
-            mediaId = id.toString();
+            mediaId = id.toString(); // Convertir a string
             P.info(`🔄 Media ID convertido: ${mediaId} (desde shortcode: ${shortcode})`);
             
             // Intentar obtener información real del media
@@ -1922,58 +1706,183 @@ class InstagramService {
               let hasMore = true;
               let count = 0;
 
-            while (hasMore && count < limit) {
+            let emptyPagesCount = 0;
+            let maxEmptyPages = 10; // Reintentar hasta 10 veces si no hay items (más agresivo)
+            let consecutiveErrors = 0;
+            let maxConsecutiveErrors = 5;
+            let logicalEmptyPages = 0; // páginas con solo duplicados (sin comentarios nuevos)
+            const maxLogicalEmptyPages = 5;
+            
+            while (hasMore || emptyPagesCount < maxEmptyPages) {
               try {
+                P.info(`📥 Solicitando página ${Math.floor(count / 20) + 1} de comentarios...`);
                 const items = await commentsFeed.items();
                 
                 if (!items || items.length === 0) {
-                  P.info(`⚠️ No hay más comentarios disponibles`);
+                  emptyPagesCount++;
+                  P.info(`⚠️ Página vacía (${emptyPagesCount}/${maxEmptyPages})`);
+                  
+                  if (emptyPagesCount >= maxEmptyPages) {
+                    P.info(`⚠️ No hay más comentarios después de ${emptyPagesCount} intentos`);
+                    break;
+                  }
+                  
+                  // Esperar menos tiempo para ser más rápido
+                  await new Promise(resolve => setTimeout(resolve, 1500));
+                  continue;
+                }
+                
+                // Resetear contador de errores consecutivos
+                consecutiveErrors = 0;
+
+                // Resetear contador de páginas vacías si obtuvimos items
+                emptyPagesCount = 0;
+                
+                P.info(`✅ Recibidos ${items.length} comentarios en esta página`);
+
+                let newCommentsThisPage = 0;
+                for (const comment of items) {
+                  // Evitar duplicados
+                  const commentId = comment.pk.toString();
+                  if (!comments.find(c => c.id === commentId)) {
+                    comments.push({
+                      id: commentId,
+                      post_id: shortcode,
+                      author_name: comment.user.full_name || comment.user.username,
+                      username: comment.user.username,
+                      author_avatar: comment.user.profile_pic_url,
+                      comment_text: comment.text,
+                      timestamp: comment.created_at.toString(),
+                      like_count: comment.comment_like_count || 0,
+                      is_verified: comment.user.is_verified || false,
+                      is_business: comment.user.is_business || false,
+                    });
+                    count++;
+                    newCommentsThisPage++;
+                  }
+                }
+
+                if (newCommentsThisPage === 0) {
+                  logicalEmptyPages++;
+                  P.info(`⚠️ Página sin comentarios nuevos (${logicalEmptyPages}/${maxLogicalEmptyPages})`);
+                  if (logicalEmptyPages >= maxLogicalEmptyPages) {
+                    P.info('⚠️ Demasiadas páginas sin comentarios nuevos, deteniendo extracción');
+                    break;
+                  }
+                } else {
+                  logicalEmptyPages = 0;
+                }
+                
+                P.info(`📊 Total acumulado: ${count} comentarios`);
+                
+                if (count % 20 === 0) {
+                  P.info(`📈 Progreso: ${count} comentarios extraídos...`);
+                }
+
+                // Parar si ya alcanzamos el número de comentarios del post
+                if (postInfo && postInfo.comment_count && count >= postInfo.comment_count) {
+                  P.info(`🎯 Alcanzado el total de comentarios reportado por el post (${postInfo.comment_count}), deteniendo extracción`);
                   break;
                 }
 
-                for (const comment of items) {
-                  if (count >= limit) break;
-
-                  comments.push({
-                    id: comment.pk.toString(),
-                    post_id: shortcode,
-                    author_name: comment.user.full_name || comment.user.username,
-                    username: comment.user.username,
-                    author_avatar: comment.user.profile_pic_url,
-                    comment_text: comment.text,
-                    timestamp: comment.created_at.toString(),
-                    like_count: comment.comment_like_count || 0,
-                    is_verified: comment.user.is_verified || false,
-                      is_business: comment.user.is_business || false,
-                  });
-
-                  count++;
-                }
-                
-                if (count % 10 === 0) {
-                  P.info(`📈 Progreso: ${count}/${limit} comentarios extraídos...`);
+                // Parar si alcanzamos el límite solicitado por el cliente
+                if (count >= limit) {
+                  P.info(`🎯 Alcanzado el límite solicitado de comentarios (${limit}), deteniendo extracción`);
+                  break;
                 }
 
                 hasMore = commentsFeed.isMoreAvailable();
+                P.info(`🔄 ¿Hay más disponibles? ${hasMore}`);
                 
-                if (hasMore && count < limit) {
-                  await new Promise(resolve => setTimeout(resolve, 2000));
+                if (hasMore) {
+                  // Delay reducido entre páginas (1s en lugar de 2s) para ser más rápido
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                } else {
+                  P.info(`✅ Feed indica que no hay más comentarios`);
+                  break;
                 }
               } catch (pageError) {
                 P.error(`❌ Error obteniendo página de comentarios: ${pageError.message}`);
-                break;
+                consecutiveErrors++;
+                emptyPagesCount++;
+                
+                if (consecutiveErrors >= maxConsecutiveErrors) {
+                  P.error(`❌ Demasiados errores consecutivos (${consecutiveErrors}), deteniendo extracción`);
+                  break;
+                }
+                
+                if (emptyPagesCount >= maxEmptyPages) {
+                  P.error(`❌ Demasiadas páginas vacías (${emptyPagesCount}), deteniendo extracción`);
+                  break;
+                }
+                
+                // Esperar menos tiempo antes de reintentar (1.5s en lugar de 3s)
+                await new Promise(resolve => setTimeout(resolve, 1500));
               }
             }
 
             if (comments.length > 0) {
               P.info(`✅ ${comments.length} comentarios extraídos usando media ID: ${testMediaId}`);
+              
+              // Guardar comentarios en caché para extracción incremental
+              const cacheFile = path.join(STATE_DIR, `comments_${shortcode}.json`);
+              let cachedComments = [];
+              
+              // Cargar comentarios previos si existen
+              if (fs.existsSync(cacheFile)) {
+                try {
+                  const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+                  cachedComments = cacheData.comments || [];
+                  P.info(`📦 Encontrados ${cachedComments.length} comentarios en caché previo`);
+                } catch (err) {
+                  P.warn(`⚠️ Error leyendo caché: ${err.message}`);
+                }
+              }
+              
+              // Combinar comentarios nuevos con los del caché (evitar duplicados)
+              const allComments = [...cachedComments];
+              let newCommentsCount = 0;
+              
+              for (const comment of comments) {
+                if (!allComments.find(c => c.id === comment.id)) {
+                  allComments.push(comment);
+                  newCommentsCount++;
+                }
+              }
+              
+              P.info(`✨ ${newCommentsCount} comentarios nuevos agregados (total acumulado: ${allComments.length})`);
+              
+              // Guardar todos los comentarios en caché
+              fs.writeFileSync(cacheFile, JSON.stringify({
+                shortcode,
+                post_url: postUrl,
+                total_expected: postInfo.comment_count,
+                total_cached: allComments.length,
+                last_updated: new Date().toISOString(),
+                comments: allComments
+              }, null, 2));
+              
+              P.info(`💾 Caché actualizado: ${allComments.length}/${postInfo.comment_count} comentarios guardados`);
+              
+              // Si no obtuvimos todos los comentarios, informar al usuario
+              if (allComments.length < postInfo.comment_count) {
+                const missing = postInfo.comment_count - allComments.length;
+                P.warn(`⚠️ Faltan ${missing} comentarios por extraer`);
+                P.info(`💡 Vuelve a ejecutar la extracción para obtener los comentarios faltantes`);
+              } else {
+                P.info(`🎉 ¡TODOS los ${allComments.length} comentarios han sido extraídos!`);
+              }
+              
               return {
                 success: true,
-                comments,
+                comments: allComments,
                 post_info: postInfo,
-                extracted_count: comments.length,
+                extracted_count: allComments.length,
+                new_comments: newCommentsCount,
                 limit_requested: limit,
-                  total_comments: postInfo.comment_count,
+                total_comments: postInfo.comment_count,
+                extraction_method: 'private_api_incremental',
+                is_complete: allComments.length >= postInfo.comment_count
               };
             }
           } catch (mediaIdError) {
@@ -1984,6 +1893,28 @@ class InstagramService {
             }
           }
         }
+
+          // Si llegamos aquí, intentar cargar desde caché como último recurso
+          const cacheFile = path.join(STATE_DIR, `comments_${shortcode}.json`);
+          if (fs.existsSync(cacheFile)) {
+            try {
+              const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
+              P.info(`📦 Retornando ${cacheData.comments.length} comentarios desde caché`);
+              return {
+                success: true,
+                comments: cacheData.comments,
+                post_info: postInfo,
+                extracted_count: cacheData.comments.length,
+                new_comments: 0,
+                limit_requested: limit,
+                total_comments: postInfo.comment_count,
+                extraction_method: 'cache_only',
+                is_complete: cacheData.comments.length >= postInfo.comment_count
+              };
+            } catch (err) {
+              P.warn(`⚠️ Error leyendo caché: ${err.message}`);
+            }
+          }
 
           // Método 2: Intentar con shortcode directamente (respaldo)
           try {
@@ -2151,6 +2082,197 @@ class InstagramService {
       }
     });
   }
+
+  /**
+   * Extraer TODOS los comentarios usando web scraping con Puppeteer
+   * Se usa como fallback cuando la API privada no devuelve todos los comentarios
+   */
+  async scrapeAllComments(postUrl, expectedCount) {
+    let browser;
+    try {
+      P.info(`🌐 Iniciando web scraping para obtener TODOS los ${expectedCount} comentarios...`);
+      
+      browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+      });
+      
+      const page = await browser.newPage();
+      await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36');
+      
+      P.info(`📱 Navegando a: ${postUrl}`);
+      await page.goto(postUrl, { waitForTimeout: 5000 });
+      
+      // Esperar a que carguen los comentarios
+      await page.waitForSelector('article', { timeout: 10000 });
+      
+      const comments = [];
+      let scrollAttempts = 0;
+      const maxScrolls = 50; // Máximo de scrolls para evitar loop infinito
+      
+      while (comments.length < expectedCount && scrollAttempts < maxScrolls) {
+        // Extraer comentarios visibles
+        const newComments = await page.evaluate(() => {
+          const commentElements = document.querySelectorAll('ul ul li');
+          const extracted = [];
+          
+          commentElements.forEach(el => {
+            const usernameEl = el.querySelector('a[href^="/"]');
+            const textEl = el.querySelector('span');
+            
+            if (usernameEl && textEl) {
+              const username = usernameEl.textContent.trim();
+              const text = textEl.textContent.trim();
+              
+              if (username && text && !text.startsWith('@')) {
+                extracted.push({
+                  username,
+                  text,
+                  id: `${username}_${text.substring(0, 20)}`
+                });
+              }
+            }
+          });
+          
+          return extracted;
+        });
+        
+        // Agregar solo comentarios nuevos (evitar duplicados)
+        newComments.forEach(comment => {
+          if (!comments.find(c => c.id === comment.id)) {
+            comments.push(comment);
+          }
+        });
+        
+        P.info(`📊 Scraping: ${comments.length}/${expectedCount} comentarios extraídos...`);
+        
+        // Hacer scroll para cargar más comentarios
+        await page.evaluate(() => {
+          window.scrollBy(0, 1000);
+        });
+        
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        scrollAttempts++;
+      }
+      
+      await browser.close();
+      
+      P.info(`✅ Web scraping completado: ${comments.length} comentarios extraídos`);
+      return comments;
+      
+    } catch (error) {
+      if (browser) await browser.close();
+      P.error(`❌ Error en web scraping: ${error.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * Extraer usuarios que dieron like a un post
+   * Nota: Instagram no pagina los likers y puede truncar la lista en posts grandes
+   */
+  async getLikesFromPost(postUrl, limit = 10000) {
+    return this.limiter.schedule(async () => {
+      try {
+        if (!this.logged) {
+          throw new Error('No hay sesión activa de Instagram');
+        }
+
+        P.info(`❤️ Obteniendo likes de publicación: ${postUrl}`);
+        
+        // a) Extraer shortcode de la URL (eliminar query params)
+        const cleanUrl = postUrl.split('?')[0];
+        const m = cleanUrl.match(/instagram\.com\/(?:p|reel|tv)\/([A-Za-z0-9_-]+)/);
+        if (!m) {
+          throw new Error('URL de Instagram inválida');
+        }
+        
+        const shortcode = m[1];
+        P.info(`📝 Shortcode extraído: ${shortcode}`);
+        
+        // b) Convertir shortcode a mediaId usando BigInt y resolver pk real
+        let mediaPk = shortcodeToPk(shortcode);
+        P.info(`🔄 Media ID inicial: ${mediaPk}`);
+        
+        let postInfo;
+        try {
+          const info = await this.ig.media.info(mediaPk);
+          const item = info?.items?.[0];
+          
+          if (item?.pk) {
+            mediaPk = String(item.pk);
+            P.info(`✅ Media PK real resuelto: ${mediaPk}`);
+          }
+          
+          // Detectar si el autor ocultó el contador de likes
+          const likesHidden = Boolean(item?.like_and_view_counts_disabled);
+          
+          postInfo = {
+            id: mediaPk,
+            shortcode: item?.code ?? shortcode,
+            like_count: item?.like_count ?? 0,
+            comment_count: item?.comment_count ?? 0,
+            likes_hidden: likesHidden,
+            owner: {
+              username: item?.user?.username ?? 'unknown',
+              full_name: item?.user?.full_name ?? ''
+            }
+          };
+          
+          P.info(`✅ Post info: @${postInfo.owner.username} - ${postInfo.like_count} likes${likesHidden ? ' (ocultos)' : ''}`);
+        } catch (err) {
+          P.warn(`⚠️ No se pudo obtener info del media: ${err.message}`);
+          postInfo = {
+            id: mediaPk,
+            shortcode,
+            like_count: 0,
+            comment_count: 0,
+            likes_hidden: false,
+            owner: { username: 'unknown', full_name: '' }
+          };
+        }
+        
+        // c) Pedir likers (sin paginación, Instagram devuelve lo que puede)
+        P.info(`❤️ Solicitando likers del media...`);
+        const res = await this.ig.media.likers(mediaPk);
+        
+        const likers = (res?.users ?? []).map(u => ({
+          user_id: String(u.pk),
+          username: u.username,
+          full_name: u.full_name || u.username,
+          profile_pic_url: u.profile_pic_url,
+          is_verified: !!u.is_verified,
+          is_private: !!u.is_private,
+        }));
+        
+        const totalReportedByApi = res?.user_count ?? likers.length;
+        P.info(`✅ Recibidos ${likers.length} likers (API reporta ${totalReportedByApi} total)`);
+        
+        // d) Aplicar límite en memoria
+        const sliced = likers.slice(0, Math.min(limit, likers.length));
+        
+        // e) Advertir si Instagram truncó la lista
+        if (sliced.length < totalReportedByApi) {
+          P.warn(`⚠️ Instagram truncó la lista: ${sliced.length}/${totalReportedByApi} likers`);
+          P.info(`💡 Esto es normal en posts con muchos likes - Instagram no devuelve todos`);
+        }
+        
+        return {
+          success: true,
+          likes: sliced,
+          extracted_count: sliced.length,
+          total_reported_by_api: totalReportedByApi,
+          post_info: postInfo,
+          note: 'Instagram puede truncar la lista de likers en posts grandes.'
+        };
+        
+      } catch (error) {
+        P.error(`❌ Error obteniendo likes de publicación: ${error.message}`);
+        throw error;
+      }
+    });
+  }
+
   async getRecentComments(limit = 10) {
     try {
       if (!this.logged) {
@@ -2818,10 +2940,15 @@ class InstagramService {
  * Obtener o crear sesión de Instagram para un usuario
  */
 export async function getOrCreateIGSession(userId) {
+  P.info(`🔍 getOrCreateIGSession llamado para userId: ${userId}`);
+  P.info(`   Map tiene sesión: ${igSessions.has(userId)}`);
+  
   if (igSessions.has(userId)) {
     const existing = igSessions.get(userId);
+    P.info(`   Sesión existente - logged: ${existing.logged}, username: ${existing.username}`);
     // Verificar si la sesión tiene cookies cargadas
     if (existing.logged) {
+      P.info(`   ✅ Retornando sesión existente logueada`);
       return existing;
     }
     // Si no está logueada pero existe, intentar cargar desde archivo

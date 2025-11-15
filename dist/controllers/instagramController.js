@@ -6,6 +6,31 @@ import { generateBotResponse } from '../services/openaiService.js';
 const P = pino({ name: 'instagram-controller', level: 'info' });
 
 /**
+ * Extraer la IP real del cliente considerando proxies y load balancers
+ */
+function getRealClientIP(req) {
+  // Prioridad de headers para obtener la IP real
+  const ip = 
+    req.headers['cf-connecting-ip'] ||        // Cloudflare
+    req.headers['x-real-ip'] ||                // Nginx
+    req.headers['x-forwarded-for']?.split(',')[0]?.trim() || // Proxy chain (primera IP)
+    req.headers['x-client-ip'] ||              // Apache
+    req.connection?.remoteAddress ||           // Conexión directa
+    req.socket?.remoteAddress ||               // Socket
+    req.connection?.socket?.remoteAddress ||   // Fallback
+    req.ip ||                                  // Express
+    'unknown';
+  
+  // Limpiar IPv6 localhost
+  if (ip === '::1' || ip === '::ffff:127.0.0.1') {
+    return '127.0.0.1';
+  }
+  
+  // Remover prefijo IPv6 si existe
+  return ip.replace('::ffff:', '');
+}
+
+/**
  * Login a Instagram
  * POST /api/instagram/login
  * Body: { username, password, proxy? }
@@ -26,10 +51,12 @@ export async function igLogin(req, res) {
       });
     }
 
-    P.info(`Login request para usuario ${userId}, Instagram: ${username}`);
+    // Obtener IP real del cliente
+    const clientIP = getRealClientIP(req);
+    P.info(`Login request para usuario ${userId}, Instagram: ${username}, IP: ${clientIP}`);
 
     const igService = await getOrCreateIGSession(userId);
-    const result = await igService.login({ username, password, proxy });
+    const result = await igService.login({ username, password, proxy, clientIP });
 
     // Si el resultado indica que el login fue bloqueado como sospechoso
     if (result.suspicious_login_blocked === true) {

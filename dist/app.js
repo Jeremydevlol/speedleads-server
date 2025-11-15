@@ -237,6 +237,10 @@ app.use(cors({
 // Domain security middleware ANTES de definir rutas
 import { authMiddleware, centralizeAuthMiddleware, contentTypeMiddleware, customDomainRoutingMiddleware, domainSecurityMiddleware, noCacheMiddleware } from './middleware/domainSecurity.js';
 
+// ⚙️ Configurar Express para confiar en proxies (Render, Cloudflare, etc.)
+// Esto permite extraer la IP real del cliente desde headers como X-Forwarded-For
+app.set('trust proxy', true);
+
 // Middleware de cookies (necesario para el resto de middlewares)
 app.use(cookieParser());
 
@@ -1763,6 +1767,399 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
       failed_count: 0,
       total_followers: 0
     });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// NUEVOS ENDPOINTS: Envío masivo a likers y commenters
+// ═══════════════════════════════════════════════════════════
+
+// Endpoint para enviar mensajes masivos a usuarios que dieron LIKE
+app.post('/api/instagram/bulk-send-likers', async (req, res) => {
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('📤❤️ [BULK-LIKERS] Endpoint de envío masivo a likers llamado');
+  
+  const { postUrl, message, limit = 50, delay = 2000, userId, personalityId } = req.body;
+
+  if (!postUrl || !message) {
+    return res.status(400).json({
+      success: false,
+      error: 'postUrl y message son requeridos'
+    });
+  }
+
+  try {
+    let actualUserId = userId;
+    let actualPersonalityId = personalityId;
+    
+    const { default: instagramBotService } = await import('./services/instagramBotService.js');
+    
+    // Obtener userId del token si no se proporciona
+    if (!actualUserId) {
+      try {
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const { validateJwt } = await import('./config/jwt.js');
+          const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+          if (decoded) {
+            actualUserId = decoded.userId || decoded.sub || decoded.user?.id;
+          }
+        }
+      } catch (error) {
+        console.log(`⚠️ [BULK-LIKERS] Error obteniendo userId: ${error.message}`);
+      }
+    }
+    
+    // Buscar bot activo
+    if (actualUserId && !actualPersonalityId) {
+      const botData = instagramBotService.activeBots.get(actualUserId);
+      if (botData?.isRunning && botData.personalityData) {
+        actualPersonalityId = botData.personalityData.id;
+      }
+    }
+    
+    // Buscar cualquier bot activo si no hay userId
+    if (!actualUserId || !actualPersonalityId) {
+      for (const [botUserId, botData] of instagramBotService.activeBots.entries()) {
+        if (botData?.isRunning && botData.personalityData) {
+          if (!actualUserId) actualUserId = botUserId;
+          if (!actualPersonalityId) actualPersonalityId = botData.personalityData.id;
+          if (actualUserId && actualPersonalityId) break;
+        }
+      }
+    }
+
+    const { getOrCreateIGSession, igSendMessage } = await import('./services/instagramService.js');
+    const { generateBotResponse } = await import('./services/openaiService.js');
+    const { supabaseAdmin } = await import('./config/db.js');
+
+    const igService = await getOrCreateIGSession(actualUserId);
+    const likesResult = await igService.getLikesFromPost(postUrl, parseInt(limit));
+
+    if (!likesResult.success || !likesResult.likes?.length) {
+      return res.json({
+        success: false,
+        error: likesResult.error || 'No se pudieron obtener likes',
+        sent_count: 0,
+        failed_count: 0
+      });
+    }
+
+    // Cargar personalidad
+    let personalityData = null;
+    if (actualPersonalityId && actualUserId) {
+      const botData = instagramBotService.activeBots.get(actualUserId);
+      if (botData?.personalityData?.id === actualPersonalityId) {
+        personalityData = botData.personalityData;
+      } else {
+        const { data } = await supabaseAdmin
+          .from('personalities')
+          .select('*')
+          .eq('id', actualPersonalityId)
+          .eq('users_id', actualUserId)
+          .single();
+        personalityData = data;
+      }
+    }
+
+    let sentCount = 0, failedCount = 0, aiGeneratedCount = 0;
+    const results = [];
+
+    for (let i = 0; i < likesResult.likes.length; i++) {
+      const liker = likesResult.likes[i];
+      console.log(`📨 [${i + 1}/${likesResult.likes.length}] @${liker.username}`);
+
+      try {
+        let finalMessage = message;
+        let aiGenerated = false;
+
+        if (personalityData && actualUserId && message && message.trim()) {
+          try {
+            console.log(`🧠 [BULK-LIKERS] Generando mensaje con IA para: ${liker.username}`);
+            
+            const greetingPrompt = `Eres un experto en comunicación y ventas. Tu tarea es crear un mensaje ÚNICO y DIFERENTE para este usuario que dio like, basándote en el mensaje base pero variándolo completamente.
+
+MENSAJE BASE DEL CLIENTE (REFERENCIA):
+"${message}"
+
+IMPORTANTE: Este mensaje base es solo una REFERENCIA. Debes crear una VARIACIÓN COMPLETAMENTE DIFERENTE que comunique el mismo mensaje, pero con palabras distintas, estructura diferente y enfoque único.
+
+CONTEXTO DEL USUARIO:
+- Usuario: @${liker.username}
+- Nombre: ${liker.full_name || 'No disponible'}
+- Acción: Dio like al post de @${likesResult.post_info.owner.username}
+- Post: ${likesResult.post_info.like_count} likes, ${likesResult.post_info.comment_count} comentarios
+
+PERSONALIDAD A USAR:
+Debes hablar como "${personalityData.nombre}". ${personalityData.instrucciones ? `Instrucciones: ${personalityData.instrucciones.substring(0, 250)}...` : ''}
+
+REGLAS ESTRICTAS PARA LA VARIACIÓN:
+1. ✅ VARIACIÓN COMPLETA: Crea un mensaje DIFERENTE cada vez
+2. ✅ NO REPETIR: No uses las mismas palabras exactas del mensaje base
+3. ✅ MANTENER ESENCIA: Comunica el mismo mensaje/idea pero con palabras diferentes
+4. ✅ PERSONALIZADO: Menciona que viste que le gustó el contenido
+5. ✅ NATURAL: Debe sonar como escrito por un humano
+6. ✅ ÚNICO: Este mensaje debe ser diferente a cualquier otro
+7. ✅ LÍMITE: Máximo 400 caracteres
+8. ❌ NO incluyas explicaciones, solo el mensaje final
+
+Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin comillas).`;
+
+            const aiResponse = await generateBotResponse({
+              personality: personalityData,
+              userMessage: greetingPrompt,
+              userId: actualUserId,
+              history: [],
+              mediaType: null,
+              mediaContent: null,
+              context: `Generando mensaje para liker ${liker.username}`
+            });
+
+            if (aiResponse?.trim()) {
+              finalMessage = aiResponse.trim();
+              aiGenerated = true;
+              aiGeneratedCount++;
+              console.log(`✅ [BULK-LIKERS] Mensaje generado: "${finalMessage.substring(0, 60)}..."`);
+            }
+          } catch (aiError) {
+            console.log(`⚠️ Error IA: ${aiError.message}`);
+          }
+        }
+
+        const sendResult = await igSendMessage(liker.username, finalMessage, actualUserId);
+        
+        if (sendResult.success) {
+          sentCount++;
+          results.push({ username: liker.username, status: 'sent', ai_generated: aiGenerated });
+          
+          // Guardar en historial
+          if (!igService.conversationHistory) igService.conversationHistory = new Map();
+          let history = igService.conversationHistory.get(liker.username) || [];
+          history.push({ role: 'assistant', content: finalMessage, timestamp: Date.now() });
+          igService.conversationHistory.set(liker.username, history.slice(-50));
+        } else {
+          failedCount++;
+          results.push({ username: liker.username, status: 'failed', error: sendResult.error });
+          if (sendResult.error?.includes('No hay sesión activa')) break;
+        }
+      } catch (error) {
+        failedCount++;
+        results.push({ username: liker.username, status: 'failed', error: error.message });
+        if (error.message?.includes('No hay sesión activa')) break;
+      }
+
+      if (i < likesResult.likes.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, parseInt(delay)));
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${sentCount} enviados (${aiGeneratedCount} con IA), ${failedCount} fallidos`,
+      sent_count: sentCount,
+      ai_generated_count: aiGeneratedCount,
+      failed_count: failedCount,
+      results
+    });
+
+  } catch (error) {
+    console.error('❌ [BULK-LIKERS] Error:', error.message);
+    res.json({ success: false, error: error.message, sent_count: 0, failed_count: 0 });
+  }
+});
+
+// Endpoint para enviar mensajes masivos a usuarios que COMENTARON
+app.post('/api/instagram/bulk-send-commenters', async (req, res) => {
+  console.log('═══════════════════════════════════════════════════════════');
+  console.log('📤💬 [BULK-COMMENTERS] Endpoint de envío masivo a commenters llamado');
+  
+  const { postUrl, message, limit = 50, delay = 2000, userId, personalityId } = req.body;
+
+  if (!postUrl || !message) {
+    return res.status(400).json({
+      success: false,
+      error: 'postUrl y message son requeridos'
+    });
+  }
+
+  try {
+    let actualUserId = userId;
+    let actualPersonalityId = personalityId;
+    
+    const { default: instagramBotService } = await import('./services/instagramBotService.js');
+    
+    // Obtener userId del token si no se proporciona
+    if (!actualUserId) {
+      try {
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const { validateJwt } = await import('./config/jwt.js');
+          const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+          if (decoded) {
+            actualUserId = decoded.userId || decoded.sub || decoded.user?.id;
+          }
+        }
+      } catch (error) {
+        console.log(`⚠️ [BULK-COMMENTERS] Error obteniendo userId: ${error.message}`);
+      }
+    }
+    
+    // Buscar bot activo
+    if (actualUserId && !actualPersonalityId) {
+      const botData = instagramBotService.activeBots.get(actualUserId);
+      if (botData?.isRunning && botData.personalityData) {
+        actualPersonalityId = botData.personalityData.id;
+      }
+    }
+    
+    // Buscar cualquier bot activo si no hay userId
+    if (!actualUserId || !actualPersonalityId) {
+      for (const [botUserId, botData] of instagramBotService.activeBots.entries()) {
+        if (botData?.isRunning && botData.personalityData) {
+          if (!actualUserId) actualUserId = botUserId;
+          if (!actualPersonalityId) actualPersonalityId = botData.personalityData.id;
+          if (actualUserId && actualPersonalityId) break;
+        }
+      }
+    }
+
+    const { getOrCreateIGSession, igSendMessage } = await import('./services/instagramService.js');
+    const { generateBotResponse } = await import('./services/openaiService.js');
+    const { supabaseAdmin } = await import('./config/db.js');
+
+    const igService = await getOrCreateIGSession(actualUserId);
+    const commentsResult = await igService.getCommentsFromPost(postUrl, parseInt(limit));
+
+    if (!commentsResult.success || !commentsResult.comments?.length) {
+      return res.json({
+        success: false,
+        error: commentsResult.error || 'No se pudieron obtener comentarios',
+        sent_count: 0,
+        failed_count: 0
+      });
+    }
+
+    // Cargar personalidad
+    let personalityData = null;
+    if (actualPersonalityId && actualUserId) {
+      const botData = instagramBotService.activeBots.get(actualUserId);
+      if (botData?.personalityData?.id === actualPersonalityId) {
+        personalityData = botData.personalityData;
+      } else {
+        const { data } = await supabaseAdmin
+          .from('personalities')
+          .select('*')
+          .eq('id', actualPersonalityId)
+          .eq('users_id', actualUserId)
+          .single();
+        personalityData = data;
+      }
+    }
+
+    let sentCount = 0, failedCount = 0, aiGeneratedCount = 0;
+    const results = [];
+
+    for (let i = 0; i < commentsResult.comments.length; i++) {
+      const commenter = commentsResult.comments[i];
+      console.log(`📨 [${i + 1}/${commentsResult.comments.length}] @${commenter.username}`);
+
+      try {
+        let finalMessage = message;
+        let aiGenerated = false;
+
+        if (personalityData && actualUserId && message && message.trim()) {
+          try {
+            console.log(`🧠 [BULK-COMMENTERS] Generando mensaje con IA para: ${commenter.username}`);
+            
+            const greetingPrompt = `Eres un experto en comunicación y ventas. Tu tarea es crear un mensaje ÚNICO y DIFERENTE para este usuario que comentó, basándote en el mensaje base pero variándolo completamente.
+
+MENSAJE BASE DEL CLIENTE (REFERENCIA):
+"${message}"
+
+IMPORTANTE: Este mensaje base es solo una REFERENCIA. Debes crear una VARIACIÓN COMPLETAMENTE DIFERENTE que comunique el mismo mensaje, pero con palabras distintas, estructura diferente y enfoque único.
+
+CONTEXTO DEL USUARIO:
+- Usuario: @${commenter.username}
+- Nombre: ${commenter.full_name || 'No disponible'}
+- Su comentario: "${commenter.comment_text}"
+- Likes en su comentario: ${commenter.like_count}
+- Post de: @${commentsResult.post_info.owner.username}
+
+PERSONALIDAD A USAR:
+Debes hablar como "${personalityData.nombre}". ${personalityData.instrucciones ? `Instrucciones: ${personalityData.instrucciones.substring(0, 250)}...` : ''}
+
+REGLAS ESTRICTAS PARA LA VARIACIÓN:
+1. ✅ VARIACIÓN COMPLETA: Crea un mensaje DIFERENTE cada vez
+2. ✅ NO REPETIR: No uses las mismas palabras exactas del mensaje base
+3. ✅ MANTENER ESENCIA: Comunica el mismo mensaje/idea pero con palabras diferentes
+4. ✅ PERSONALIZADO: Haz referencia natural a su comentario "${commenter.comment_text}"
+5. ✅ NATURAL: Debe sonar como escrito por un humano
+6. ✅ ÚNICO: Este mensaje debe ser diferente a cualquier otro
+7. ✅ LÍMITE: Máximo 400 caracteres
+8. ❌ NO incluyas explicaciones, solo el mensaje final
+
+Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin comillas).`;
+
+            const aiResponse = await generateBotResponse({
+              personality: personalityData,
+              userMessage: greetingPrompt,
+              userId: actualUserId,
+              history: [],
+              mediaType: null,
+              mediaContent: null,
+              context: `Generando mensaje para commenter ${commenter.username}`
+            });
+
+            if (aiResponse?.trim()) {
+              finalMessage = aiResponse.trim();
+              aiGenerated = true;
+              aiGeneratedCount++;
+              console.log(`✅ [BULK-COMMENTERS] Mensaje generado: "${finalMessage.substring(0, 60)}..."`);
+            }
+          } catch (aiError) {
+            console.log(`⚠️ Error IA: ${aiError.message}`);
+          }
+        }
+
+        const sendResult = await igSendMessage(commenter.username, finalMessage, actualUserId);
+        
+        if (sendResult.success) {
+          sentCount++;
+          results.push({ username: commenter.username, status: 'sent', ai_generated: aiGenerated });
+          
+          // Guardar en historial
+          if (!igService.conversationHistory) igService.conversationHistory = new Map();
+          let history = igService.conversationHistory.get(commenter.username) || [];
+          history.push({ role: 'assistant', content: finalMessage, timestamp: Date.now() });
+          igService.conversationHistory.set(commenter.username, history.slice(-50));
+        } else {
+          failedCount++;
+          results.push({ username: commenter.username, status: 'failed', error: sendResult.error });
+          if (sendResult.error?.includes('No hay sesión activa')) break;
+        }
+      } catch (error) {
+        failedCount++;
+        results.push({ username: commenter.username, status: 'failed', error: error.message });
+        if (error.message?.includes('No hay sesión activa')) break;
+      }
+
+      if (i < commentsResult.comments.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, parseInt(delay)));
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `${sentCount} enviados (${aiGeneratedCount} con IA), ${failedCount} fallidos`,
+      sent_count: sentCount,
+      ai_generated_count: aiGeneratedCount,
+      failed_count: failedCount,
+      results
+    });
+
+  } catch (error) {
+    console.error('❌ [BULK-COMMENTERS] Error:', error.message);
+    res.json({ success: false, error: error.message, sent_count: 0, failed_count: 0 });
   }
 });
 

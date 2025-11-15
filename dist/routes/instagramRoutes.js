@@ -27,7 +27,8 @@ router.get('/diagnostic', (req, res) => {
       'POST /api/instagram/login',
       'GET /api/instagram/status',
       'GET /api/instagram/dms',
-      'GET /api/instagram/comments'
+      'GET /api/instagram/comments',
+      'POST /api/instagram/comments/from-post'
     ]
   });
 });
@@ -388,6 +389,150 @@ router.get('/comments', async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message
+    });
+  }
+});
+
+/**
+ * @route   POST /api/instagram/comments/from-post
+ * @desc    Extraer comentarios de un post ajeno usando la URL del post
+ * @access  Private
+ */
+router.post('/comments/from-post', async (req, res) => {
+  try {
+    const userId = req.user?.userId || req.user?.id || req.user?.sub;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'No autenticado' });
+    }
+
+    const { postUrl, limit = 10000 } = req.body;
+    
+    if (!postUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requiere la URL del post (postUrl)'
+      });
+    }
+
+    console.log(`💬 [API] Extrayendo comentarios de post ajeno para usuario ${userId}`);
+    console.log(`   URL: ${postUrl}`);
+    console.log(`   Límite: ${limit}`);
+    
+    // Obtener servicio de Instagram del usuario
+    const { getOrCreateIGSession } = await import('../services/instagramService.js');
+    const igService = await getOrCreateIGSession(userId);
+    
+    console.log(`🔍 Estado de sesión: logged=${igService.logged}, username=${igService.username}`);
+    
+    // Verificar que esté logueado (sin hacer llamada a la API de Instagram)
+    if (!igService.logged) {
+      return res.status(400).json({
+        success: false,
+        error: 'No hay sesión activa de Instagram'
+      });
+    }
+
+    // Extraer comentarios del post usando la URL
+    const result = await igService.getCommentsFromPost(postUrl, parseInt(limit));
+
+    if (result.success) {
+      console.log(`✅ [API] ${result.extracted_count} comentarios extraídos del post`);
+      res.json({
+        success: true,
+        comments: result.comments,
+        post_info: result.post_info,
+        extracted_count: result.extracted_count,
+        limit_requested: result.limit_requested,
+        total_comments: result.total_comments
+      });
+    } else {
+      console.log(`❌ [API] Error extrayendo comentarios: ${result.error}`);
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        comments: [],
+        post_info: result.post_info
+      });
+    }
+
+  } catch (error) {
+    console.error(`❌ [API] Error extrayendo comentarios de post ajeno: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      comments: []
+    });
+  }
+});
+
+/**
+ * @route   POST /api/instagram/likes/from-post
+ * @desc    Extraer usuarios que dieron like a un post/reel
+ * @access  Private
+ */
+router.post('/likes/from-post', async (req, res) => {
+  try {
+    const userId = req.user?.userId || req.user?.id || req.user?.sub;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'No autenticado' });
+    }
+
+    const { postUrl, limit = 10000 } = req.body;
+    
+    if (!postUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Se requiere la URL del post (postUrl)'
+      });
+    }
+
+    console.log(`❤️ [API] Extrayendo likes de post para usuario ${userId}`);
+    console.log(`   URL: ${postUrl}`);
+    console.log(`   Límite: ${limit}`);
+    
+    // Obtener servicio de Instagram del usuario
+    const { getOrCreateIGSession } = await import('../services/instagramService.js');
+    const igService = await getOrCreateIGSession(userId);
+    
+    console.log(`🔍 Estado de sesión: logged=${igService.logged}, username=${igService.username}`);
+    
+    // Verificar que esté logueado
+    if (!igService.logged) {
+      return res.status(400).json({
+        success: false,
+        error: 'No hay sesión activa de Instagram'
+      });
+    }
+
+    // Extraer likes del post usando la URL
+    const result = await igService.getLikesFromPost(postUrl, parseInt(limit));
+
+    if (result.success) {
+      console.log(`✅ [API] ${result.extracted_count} likes extraídos (API reporta ${result.total_reported_by_api})`);
+      res.json({
+        success: true,
+        likes: result.likes,
+        post_info: result.post_info,
+        extracted_count: result.extracted_count,
+        total_reported_by_api: result.total_reported_by_api,
+        note: result.note
+      });
+    } else {
+      console.log(`❌ [API] Error extrayendo likes: ${result.error}`);
+      res.status(400).json({
+        success: false,
+        error: result.error,
+        likes: [],
+        post_info: result.post_info
+      });
+    }
+
+  } catch (error) {
+    console.error(`❌ [API] Error extrayendo likes de post: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      likes: []
     });
   }
 });
