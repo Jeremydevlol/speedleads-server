@@ -7,27 +7,101 @@ const P = pino({ name: 'instagram-controller', level: 'info' });
 
 /**
  * Extraer la IP real del cliente considerando proxies y load balancers
+ * Prioriza headers de proxies confiables (Cloudflare, Nginx, etc.)
  */
 function getRealClientIP(req) {
-  // Prioridad de headers para obtener la IP real
-  const ip = 
-    req.headers['cf-connecting-ip'] ||        // Cloudflare
-    req.headers['x-real-ip'] ||                // Nginx
-    req.headers['x-forwarded-for']?.split(',')[0]?.trim() || // Proxy chain (primera IP)
-    req.headers['x-client-ip'] ||              // Apache
-    req.connection?.remoteAddress ||           // Conexión directa
-    req.socket?.remoteAddress ||               // Socket
-    req.connection?.socket?.remoteAddress ||   // Fallback
-    req.ip ||                                  // Express
-    'unknown';
+  // Debug: Log todos los headers relevantes para verificar
+  const debugHeaders = {
+    'cf-connecting-ip': req.headers['cf-connecting-ip'],
+    'x-real-ip': req.headers['x-real-ip'],
+    'x-forwarded-for': req.headers['x-forwarded-for'],
+    'x-client-ip': req.headers['x-client-ip'],
+    'true-client-ip': req.headers['true-client-ip'], // Cloudflare Enterprise
+    'x-forwarded': req.headers['x-forwarded'],
+    'forwarded': req.headers['forwarded'],
+    'connection-remoteAddress': req.connection?.remoteAddress,
+    'socket-remoteAddress': req.socket?.remoteAddress,
+    'req.ip': req.ip
+  };
+  
+  // Prioridad de headers para obtener la IP real (más confiables primero)
+  let ip = null;
+  let source = null;
+  
+  // 1. Cloudflare (más confiable - no se puede falsificar)
+  if (req.headers['cf-connecting-ip']) {
+    ip = req.headers['cf-connecting-ip'];
+    source = 'Cloudflare (cf-connecting-ip)';
+  }
+  // 2. Cloudflare Enterprise
+  else if (req.headers['true-client-ip']) {
+    ip = req.headers['true-client-ip'];
+    source = 'Cloudflare Enterprise (true-client-ip)';
+  }
+  // 3. Nginx (confiable si está configurado correctamente)
+  else if (req.headers['x-real-ip']) {
+    ip = req.headers['x-real-ip'];
+    source = 'Nginx (x-real-ip)';
+  }
+  // 4. X-Forwarded-For (puede tener múltiples IPs, tomar la primera)
+  else if (req.headers['x-forwarded-for']) {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    // Tomar la primera IP de la cadena (cliente real)
+    ip = forwardedFor.split(',')[0].trim();
+    source = 'Proxy Chain (x-forwarded-for - primera IP)';
+  }
+  // 5. Apache
+  else if (req.headers['x-client-ip']) {
+    ip = req.headers['x-client-ip'];
+    source = 'Apache (x-client-ip)';
+  }
+  // 6. Forwarded header (RFC 7239)
+  else if (req.headers['forwarded']) {
+    const forwarded = req.headers['forwarded'];
+    const forMatch = forwarded.match(/for=([^;,\s]+)/i);
+    if (forMatch) {
+      ip = forMatch[1].replace(/[\[\]"]/g, ''); // Limpiar brackets y comillas
+      source = 'RFC 7239 (forwarded header)';
+    }
+  }
+  // 7. Conexión directa (sin proxy)
+  else if (req.connection?.remoteAddress) {
+    ip = req.connection.remoteAddress;
+    source = 'Conexión directa (connection.remoteAddress)';
+  }
+  // 8. Socket
+  else if (req.socket?.remoteAddress) {
+    ip = req.socket.remoteAddress;
+    source = 'Socket (socket.remoteAddress)';
+  }
+  // 9. Express (después de trust proxy)
+  else if (req.ip) {
+    ip = req.ip;
+    source = 'Express (req.ip)';
+  }
+  // 10. Fallback
+  else {
+    ip = 'unknown';
+    source = 'No detectado';
+  }
   
   // Limpiar IPv6 localhost
   if (ip === '::1' || ip === '::ffff:127.0.0.1') {
-    return '127.0.0.1';
+    ip = '127.0.0.1';
+    source += ' (convertido de IPv6 localhost)';
   }
   
   // Remover prefijo IPv6 si existe
-  return ip.replace('::ffff:', '');
+  ip = ip.replace('::ffff:', '');
+  
+  // Log para debugging (solo si no es localhost)
+  if (ip !== '127.0.0.1' && ip !== 'unknown') {
+    P.info(`📍 IP real detectada: ${ip} (fuente: ${source})`);
+  } else if (ip === 'unknown') {
+    P.warn(`⚠️ No se pudo detectar IP real del cliente. Headers disponibles: ${JSON.stringify(debugHeaders)}`);
+  }
+  
+  return ip;
 }
 
 /**
@@ -51,12 +125,48 @@ export async function igLogin(req, res) {
       });
     }
 
-    // Obtener IP real del cliente
+    // Obtener IP real del cliente (con detección mejorada)
     const clientIP = getRealClientIP(req);
-    P.info(`Login request para usuario ${userId}, Instagram: ${username}, IP: ${clientIP}`);
+    
+    // Validar que la IP sea válida
+    if (!clientIP || clientIP === 'unknown') {
+      P.warn(`⚠️ No se pudo obtener IP real del cliente. Usando fallback.`);
+    } else {
+      P.info(`🌍 IP real del cliente detectada: ${clientIP}`);
+    }
+    
+    // Extraer información REAL del dispositivo del cliente en tiempo real
+    const userAgent = req.headers['user-agent'] || '';
+    
+    // Extraer timezone del cliente si está disponible en headers
+    const timezoneOffset = req.headers['x-timezone-offset'] || null;
+    const timezone = req.headers['x-timezone'] || null;
+    
+    // Detectar ubicación desde headers de Cloudflare o similar
+    const country = req.headers['cf-ipcountry'] || req.headers['x-country'] || null;
+    const city = req.headers['cf-ipcity'] || req.headers['x-city'] || null;
+    
+    const deviceHeaders = {
+      'user-agent': userAgent,
+      'accept-language': req.headers['accept-language'] || 'es-ES,es;q=0.9',
+      'accept-encoding': req.headers['accept-encoding'] || 'gzip, deflate, br',
+      'sec-ch-ua': req.headers['sec-ch-ua'] || '',
+      'sec-ch-ua-platform': req.headers['sec-ch-ua-platform'] || '',
+      'sec-ch-ua-mobile': req.headers['sec-ch-ua-mobile'] || '',
+      'timezone-offset': timezoneOffset,
+      'timezone': timezone,
+      'country': country,
+      'city': city,
+      'timestamp': Date.now().toString() // Timestamp en tiempo real del cliente
+    };
+    
+    P.info(`🌍 Login request REAL - Usuario: ${userId}, Instagram: ${username}`);
+    P.info(`   📍 Ubicación: IP ${clientIP}${country ? `, País: ${country}` : ''}${city ? `, Ciudad: ${city}` : ''}`);
+    P.info(`   📱 Dispositivo: ${userAgent.substring(0, 100)}...`);
+    P.info(`   🕐 Tiempo: ${new Date().toISOString()}`);
 
     const igService = await getOrCreateIGSession(userId);
-    const result = await igService.login({ username, password, proxy, clientIP });
+    const result = await igService.login({ username, password, proxy, clientIP, deviceHeaders });
 
     // Si el resultado indica que el login fue bloqueado como sospechoso
     if (result.suspicious_login_blocked === true) {

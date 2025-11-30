@@ -78,9 +78,429 @@ class InstagramService {
   stateFile() {
     return path.join(STATE_DIR, `${this.userId}.json`);
   }
+
+  /**
+   * Cargar pool de dispositivos realistas
+   */
+  loadDevicePool() {
+    try {
+      const devicesPath = path.join(process.cwd(), 'storage', 'ig_devices', 'devices.json');
+      if (fs.existsSync(devicesPath)) {
+        const devices = JSON.parse(fs.readFileSync(devicesPath, 'utf8'));
+        P.info(`📱 Cargados ${devices.length} dispositivos del pool`);
+        return devices;
+      }
+    } catch (error) {
+      P.warn(`⚠️ Error cargando pool de dispositivos: ${error.message}`);
+    }
+    return null;
+  }
+
+  /**
+   * Generar UUID aleatorio
+   */
+  generateRandomUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  /**
+   * Generar Device ID aleatorio
+   */
+  generateRandomDeviceId() {
+    return Math.random().toString(36).substring(2, 15) + 
+           Math.random().toString(36).substring(2, 15);
+  }
+
+  /**
+   * Detectar y generar dispositivo basado en el dispositivo REAL del cliente
+   */
+  async generateRealDeviceFromHeaders(username, deviceHeaders = {}) {
+    try {
+      const userAgent = deviceHeaders['user-agent'] || '';
+      
+      if (!userAgent) {
+        P.warn('⚠️ No se detectó User-Agent, usando generación por defecto');
+        this.ig.state.generateDevice(username);
+        return null;
+      }
+
+      // Detectar dispositivo móvil o desktop desde User-Agent
+      const isMobile = /Mobile|Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent);
+      const isAndroid = /Android/i.test(userAgent);
+      const isIOS = /iPhone|iPad|iPod/i.test(userAgent);
+      
+      // Detectar dispositivos desktop reales
+      const isMac = /Macintosh|Mac OS X/i.test(userAgent);
+      const isWindows = /Windows|Win32|Win64/i.test(userAgent);
+      const isLinux = /Linux/i.test(userAgent) && !isAndroid;
+      const isDesktop = (isMac || isWindows || isLinux) && !isMobile;
+      
+      // Extraer información del User-Agent
+      let deviceString = null;
+      let androidVersion = null;
+      let build = null;
+      
+      if (isAndroid && userAgent) {
+        // Extraer versión de Android desde User-Agent
+        // Ejemplo: "Android 12" o "Android 13"
+        const androidMatch = userAgent.match(/Android\s+([\d.]+)/i);
+        if (androidMatch) {
+          androidVersion = androidMatch[1].split('.')[0]; // Solo el número principal (12, 13, etc.)
+        }
+        
+        // Intentar extraer información del dispositivo
+        // Formato típico: "Samsung SM-G991B" o "Xiaomi Redmi Note 10 Pro"
+        const deviceInfo = userAgent.match(/\(Linux; Android [\d.]+; (.+?)\)/i);
+        
+        if (deviceInfo && deviceInfo[1]) {
+          const deviceParts = deviceInfo[1].split(/[;)]/)[0].trim();
+          // El formato puede variar, usar lo que encontramos
+          P.info(`📱 Dispositivo Android detectado: ${deviceParts}`);
+          
+          // Construir deviceString en formato Instagram
+          // Formato: "VERSION/RELEASE; DPI; RESOLUTION; MANUFACTURER; MODEL; DEVICE; DEVICE"
+          // Usar valores comunes si no podemos detectarlos específicamente
+          const version = androidVersion || '30';
+          const release = androidVersion ? `${androidVersion}.0.0` : '13.0.0';
+          const dpi = '420'; // DPI común
+          const resolution = '1080x2400'; // Resolución común
+          
+          // Intentar extraer manufacturer y model
+          let manufacturer = 'samsung'; // Default
+          let model = 'SM-G991B'; // Default
+          
+          // Detectar manufacturer común
+          if (/samsung/i.test(deviceParts) || /SM-/i.test(deviceParts)) {
+            manufacturer = 'samsung';
+            const smMatch = deviceParts.match(/SM-([A-Z0-9]+)/i);
+            if (smMatch) model = `SM-${smMatch[1]}`;
+          } else if (/xiaomi|redmi|mi/i.test(deviceParts)) {
+            manufacturer = 'Xiaomi';
+            model = deviceParts.match(/(Redmi|Mi|POCO)[\s-]?([A-Z0-9\s]+)/i)?.[0] || 'Mi 9T';
+          } else if (/oneplus/i.test(deviceParts)) {
+            manufacturer = 'OnePlus';
+            model = deviceParts.match(/ONEPLUS\s+([A-Z0-9]+)/i)?.[1] || 'ONEPLUS A6003';
+          }
+          
+          deviceString = `${version}/${release}; ${dpi}dpi; ${resolution}; ${manufacturer.toLowerCase()}; ${model}; ${model.toLowerCase()}; ${model.toLowerCase()}`;
+        }
+      }
+      
+      // Si no pudimos construir un deviceString específico, detectar dispositivo desktop real
+      if (!deviceString) {
+        let detectedDevice = null;
+        let deviceInfo = '';
+        
+        // Detectar dispositivo desktop real
+        if (isDesktop) {
+          if (isMac) {
+            // Extraer versión de macOS
+            const macMatch = userAgent.match(/Mac OS X (\d+)[._](\d+)/i);
+            const macVersion = macMatch ? `${macMatch[1]}.${macMatch[2]}` : '14.0';
+            detectedDevice = {
+              type: 'Mac',
+              os: 'macOS',
+              version: macVersion,
+              platform: 'Macintosh'
+            };
+            deviceInfo = `Mac (macOS ${macVersion})`;
+            
+            // Extraer modelo si está disponible
+            if (userAgent.includes('Intel')) {
+              detectedDevice.architecture = 'Intel';
+            } else if (userAgent.includes('Apple')) {
+              detectedDevice.architecture = 'Apple Silicon';
+            }
+          } else if (isWindows) {
+            // Extraer versión de Windows
+            let windowsVersion = '10';
+            if (userAgent.includes('Windows NT 10.0')) windowsVersion = '10';
+            else if (userAgent.includes('Windows NT 11.0')) windowsVersion = '11';
+            else if (userAgent.includes('Windows NT 6.3')) windowsVersion = '8.1';
+            else if (userAgent.includes('Windows NT 6.2')) windowsVersion = '8';
+            else if (userAgent.includes('Windows NT 6.1')) windowsVersion = '7';
+            
+            detectedDevice = {
+              type: 'Windows',
+              os: 'Windows',
+              version: windowsVersion,
+              platform: 'Win32'
+            };
+            deviceInfo = `Windows ${windowsVersion}`;
+            
+            // Detectar arquitectura
+            if (userAgent.includes('WOW64') || userAgent.includes('Win64')) {
+              detectedDevice.architecture = 'x64';
+            } else {
+              detectedDevice.architecture = 'x86';
+            }
+          } else if (isLinux) {
+            // Detectar distribución Linux si es posible
+            let distro = 'Linux';
+            if (userAgent.includes('Ubuntu')) distro = 'Ubuntu';
+            else if (userAgent.includes('Fedora')) distro = 'Fedora';
+            else if (userAgent.includes('Debian')) distro = 'Debian';
+            
+            detectedDevice = {
+              type: 'Linux',
+              os: distro,
+              version: 'Unknown',
+              platform: 'Linux'
+            };
+            deviceInfo = distro;
+          }
+          
+          P.info(`💻 Dispositivo DESKTOP REAL detectado: ${deviceInfo}`);
+          P.info(`   User-Agent original: ${userAgent.substring(0, 120)}...`);
+        } else if (isIOS) {
+          P.info(`📱 Dispositivo iOS detectado - Instagram API requiere Android`);
+          deviceInfo = 'iOS';
+        } else {
+          P.info(`📱 Dispositivo no identificado - Instagram API requiere Android`);
+          deviceInfo = 'Unknown';
+        }
+        
+        // ⚠️ IMPORTANTE: Instagram API requiere deviceString Android
+        // Por eso generamos Android, pero guardamos información del dispositivo real
+        this.ig.state.generateDevice(username);
+        
+        // NO cambiar User-Agent para desktop/iOS (dejar por defecto de IgApiClient)
+        // Solo configuramos Accept-Language para mantener coherencia de idioma
+        if (deviceHeaders['accept-language']) {
+          this.ig.request.defaults.headers = {
+            ...this.ig.request.defaults.headers,
+            'Accept-Language': deviceHeaders['accept-language']
+          };
+        }
+        
+        P.info(`   📝 DeviceString Android generado (requerido por Instagram API): ${this.ig.state.deviceString?.substring(0, 60)}...`);
+        P.info(`   ✅ Dejando User-Agent por defecto de IgApiClient (Instagram Android)`);
+        
+        if (detectedDevice) {
+          // Guardar dispositivo real del cliente en la instancia para usar al guardar sesión
+          this.realDevice = detectedDevice;
+          this.realUserAgent = userAgent;
+          P.info(`   💾 Dispositivo real del cliente guardado: ${JSON.stringify(detectedDevice)}`);
+        }
+        
+        return {
+          deviceString: this.ig.state.deviceString,
+          deviceId: this.ig.state.deviceId,
+          uuid: this.ig.state.uuid,
+          phoneId: this.ig.state.phoneId,
+          isRealDevice: false, // No es dispositivo real Android
+          realDevice: detectedDevice, // Dispositivo real del cliente (desktop)
+          userAgent: userAgent, // User-Agent real del cliente guardado
+          note: `Desktop (${deviceInfo}): Using default Instagram Android fingerprint, real device info saved`
+        };
+      }
+      
+      // Configurar dispositivo detectado
+      const deviceId = `android-${this.generateRandomDeviceId()}`;
+      const uuid = this.generateRandomUUID();
+      const phoneId = this.generateRandomUUID();
+      
+      this.ig.state.deviceString = deviceString;
+      this.ig.state.deviceId = deviceId;
+      this.ig.state.uuid = uuid;
+      this.ig.state.phoneId = phoneId;
+      this.ig.state.adid = this.generateRandomUUID();
+      this.ig.state.build = build || androidVersion || '30';
+      
+      // Configurar headers reales del cliente
+      // ✅ Para Android real: SÍ usar el User-Agent real del cliente
+      // Mantiene coherencia: deviceString Android + User-Agent Android del cliente
+      this.ig.request.defaults.headers = {
+        ...this.ig.request.defaults.headers,
+        'User-Agent': userAgent, // User-Agent Android real del cliente
+        'Accept-Language': deviceHeaders['accept-language'] || 'es-ES,es;q=0.9',
+        'Accept-Encoding': deviceHeaders['accept-encoding'] || 'gzip, deflate, br'
+      };
+      
+      // Headers específicos de Chrome en Android
+      if (deviceHeaders['sec-ch-ua']) {
+        this.ig.request.defaults.headers['sec-ch-ua'] = deviceHeaders['sec-ch-ua'];
+      }
+      if (deviceHeaders['sec-ch-ua-platform']) {
+        this.ig.request.defaults.headers['sec-ch-ua-platform'] = deviceHeaders['sec-ch-ua-platform'];
+      }
+      
+      // Limpiar dispositivo real previo (es Android, no desktop)
+      this.realDevice = null;
+      this.realUserAgent = null;
+      
+      P.info(`📱 Dispositivo REAL Android detectado y configurado: ${deviceString.substring(0, 80)}...`);
+      P.info(`   ✅ User-Agent Android real: ${userAgent.substring(0, 100)}...`);
+      P.info(`   ✅ Coherencia: DeviceString Android + User-Agent Android del cliente`);
+      
+      return {
+        deviceString: deviceString,
+        deviceId: deviceId,
+        uuid: uuid,
+        phoneId: phoneId,
+        adid: this.ig.state.adid,
+        build: build || androidVersion || '30',
+        userAgent: userAgent,
+        isRealDevice: true
+      };
+      
+    } catch (error) {
+      P.warn(`⚠️ Error detectando dispositivo real: ${error.message}, usando generación por defecto`);
+      this.ig.state.generateDevice(username);
+      return null;
+    }
+  }
+
+  /**
+   * Delay humano aleatorio (simula tiempo de reacción humano)
+   */
+  async humanDelay(minMs = 500, maxMs = 2000) {
+    const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return delay;
+  }
+
+  /**
+   * Periodo de calentamiento después del login (comportamiento humano)
+   * Simula actividad normal de usuario antes de activar el bot
+   */
+  async warmUpPeriod(minutes = 30) {
+    try {
+      P.info(`🔥 Iniciando periodo de calentamiento de ${minutes} minutos para ${this.username}...`);
+      emitToUserIG(this.userId, 'instagram:status', { 
+        connected: true, 
+        username: this.username,
+        igUserId: this.igUserId,
+        warmingUp: true,
+        estimatedReadyTime: Date.now() + (minutes * 60 * 1000)
+      });
+
+      const steps = [
+        { action: 'checkProfile', delay: 30000, description: 'Revisando perfil propio...' },
+        { action: 'checkFeed', delay: 60000, description: 'Revisando feed...' },
+        { action: 'checkStories', delay: 90000, description: 'Revisando stories...' },
+        { action: 'checkDMs', delay: 120000, description: 'Revisando DMs...' },
+        { action: 'scrollFeed', delay: 300000, description: 'Navegando feed...' },
+        { action: 'likePost', delay: 600000, description: 'Simulando actividad...' },
+        { action: 'checkNotifications', delay: 900000, description: 'Revisando notificaciones...' }
+      ];
+
+      // Calcular tiempo total y ejecutar pasos
+      const totalSteps = Math.floor((minutes * 60 * 1000) / 60000); // Pasos cada minuto aproximadamente
+      
+      for (let i = 0; i < Math.min(steps.length, totalSteps); i++) {
+        const step = steps[i];
+        
+        try {
+          // Esperar delay antes de ejecutar acción
+          await new Promise(resolve => setTimeout(resolve, step.delay));
+          
+          // Agregar delay humano antes de cada acción
+          await this.humanDelay(1000, 3000);
+          
+          switch(step.action) {
+            case 'checkProfile':
+              try {
+                await this.ig.account.currentUser();
+                P.info(`👤 ${step.description}`);
+              } catch (e) {
+                P.warn(`⚠️ Error en checkProfile: ${e.message}`);
+              }
+              break;
+              
+            case 'checkFeed':
+              try {
+                const feed = this.ig.feed.timeline();
+                await feed.request();
+                P.info(`📺 ${step.description}`);
+              } catch (e) {
+                P.warn(`⚠️ Error en checkFeed: ${e.message}`);
+              }
+              break;
+              
+            case 'checkStories':
+              try {
+                const reelsFeed = this.ig.feed.reelsMedia();
+                await reelsFeed.request();
+                P.info(`📸 ${step.description}`);
+              } catch (e) {
+                P.warn(`⚠️ Error en checkStories: ${e.message}`);
+              }
+              break;
+              
+            case 'checkDMs':
+              try {
+                await this.ig.direct.inbox();
+                P.info(`💬 ${step.description}`);
+              } catch (e) {
+                P.warn(`⚠️ Error en checkDMs: ${e.message}`);
+              }
+              break;
+              
+            case 'scrollFeed':
+              try {
+                const feed2 = this.ig.feed.timeline();
+                await feed2.request();
+                const items = await feed2.items();
+                if (items && items.length > 0) {
+                  P.info(`📜 ${step.description} (${items.length} posts)`);
+                }
+              } catch (e) {
+                P.warn(`⚠️ Error en scrollFeed: ${e.message}`);
+              }
+              break;
+              
+            case 'likePost':
+              // No dar like realmente, solo simular
+              P.info(`❤️ ${step.description}`);
+              break;
+              
+            case 'checkNotifications':
+              try {
+                await this.ig.news.inbox();
+                P.info(`🔔 ${step.description}`);
+              } catch (e) {
+                P.warn(`⚠️ Error en checkNotifications: ${e.message}`);
+              }
+              break;
+          }
+          
+          // Delay aleatorio entre acciones (5-15 segundos)
+          await this.humanDelay(5000, 15000);
+          
+        } catch (error) {
+          P.warn(`⚠️ Error en warm-up ${step.action}: ${error.message}`);
+        }
+      }
+      
+      P.info(`✅ Periodo de calentamiento completado. Bot listo para operaciones.`);
+      emitToUserIG(this.userId, 'instagram:status', { 
+        connected: true,
+        warmedUp: true,
+        ready: true,
+        username: this.username,
+        igUserId: this.igUserId
+      });
+      
+    } catch (error) {
+      P.error(`❌ Error en warm-up period: ${error.message}`);
+      emitToUserIG(this.userId, 'instagram:status', { 
+        connected: true,
+        warmedUp: false,
+        ready: true, // Permitir continuar aunque haya fallado el warm-up
+        username: this.username,
+        igUserId: this.igUserId,
+        warning: 'Warm-up period falló, pero el bot está listo'
+      });
+    }
+  }
   
   /**
-   * Guardar sesión en archivo (incluyendo processedMessages y processedComments)
+   * Guardar sesión en archivo (incluyendo processedMessages, processedComments y device fingerprint)
    */
   async saveSession() {
     try {
@@ -96,16 +516,27 @@ class InstagramService {
       const processedMessagesArray = this.processedMessages ? Array.from(this.processedMessages) : [];
       const processedCommentsArray = this.processedComments ? Array.from(this.processedComments) : [];
       
+      // Guardar device fingerprint si está disponible
+      const deviceData = this.ig.state.deviceString ? {
+        deviceString: this.ig.state.deviceString,
+        deviceId: this.ig.state.deviceId,
+        uuid: this.ig.state.uuid,
+        phoneId: this.ig.state.phoneId,
+        adid: this.ig.state.adid,
+        build: this.ig.state.build
+      } : null;
+      
       fs.writeFileSync(file, JSON.stringify({ 
         cookieJar,
         username: this.username,
         igUserId: this.igUserId,
         savedAt: new Date().toISOString(),
         processedMessages: processedMessagesArray,
-        processedComments: processedCommentsArray
+        processedComments: processedCommentsArray,
+        device: deviceData
       }), 'utf8');
       
-      P.info(`💾 Sesión guardada (${processedMessagesArray.length} mensajes, ${processedCommentsArray.length} comentarios procesados)`);
+      P.info(`💾 Sesión guardada (${processedMessagesArray.length} mensajes, ${processedCommentsArray.length} comentarios procesados${deviceData ? ', fingerprint guardado' : ''})`);
     } catch (error) {
       P.warn(`⚠️ Error guardando sesión: ${error.message}`);
     }
@@ -115,27 +546,98 @@ class InstagramService {
    * Login a Instagram con usuario/contraseña
    * Restaura sesión desde archivo si existe
    */
-  async login({ username, password, proxy, clientIP }) {
+  async login({ username, password, proxy, clientIP, deviceHeaders }) {
     try {
       P.info(`Intentando login de Instagram para ${username}`);
       
       this.username = username;
-      this.ig.state.generateDevice(username);
       
-      // Configurar IP del cliente si está disponible
-      if (clientIP && clientIP !== 'unknown') {
+      // ⭐ IMPORTANTE: SIEMPRE usar dispositivo, hora y ubicación en TIEMPO REAL
+      // NO usar valores guardados - todo debe detectarse en tiempo real del cliente
+      
+      // Delay humano antes de continuar (simula tiempo de pensar)
+      await this.humanDelay(500, 1500);
+      
+      // 📍 CONFIGURAR UBICACIÓN - Mantener IP/región consistente por cuenta
+      // Si hay IP guardada, usarla; sino usar la nueva del cliente
+      const ipToUse = savedIP || clientIP;
+      
+      if (ipToUse && ipToUse !== 'unknown') {
         try {
-          // Establecer la IP del cliente en los headers de Instagram
+          // Establecer la IP (guardada o nueva) en los headers de Instagram
           this.ig.request.defaults.headers = {
             ...this.ig.request.defaults.headers,
-            'X-Forwarded-For': clientIP,
-            'X-Real-IP': clientIP
+            'X-Forwarded-For': ipToUse,
+            'X-Real-IP': ipToUse,
+            'CF-Connecting-IP': ipToUse
           };
-          P.info(`📍 Usando IP del cliente: ${clientIP}`);
+          
+          if (savedIP) {
+            P.info(`📍 Usando IP guardada para mantener consistencia: ${savedIP}`);
+            P.info(`   (IP original del cliente era: ${clientIP || 'no detectada'})`);
+          } else {
+            P.info(`📍 Ubicación REAL configurada - IP del cliente: ${clientIP}`);
+            P.info(`   ✅ Esta IP será guardada para futuros logins de esta cuenta`);
+          }
+          
+          // Validar que la IP sea válida (formato IPv4 o IPv6)
+          const ipRegex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$|^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
+          if (!ipRegex.test(ipToUse) && ipToUse !== '127.0.0.1') {
+            P.warn(`⚠️ IP detectada no tiene formato válido: ${ipToUse}`);
+          }
+          
         } catch (ipError) {
-          P.warn(`⚠️ No se pudo configurar IP del cliente: ${ipError.message}`);
+          P.warn(`⚠️ No se pudo configurar IP: ${ipError.message}`);
         }
+      } else {
+        P.warn(`⚠️ No se pudo obtener IP válida del cliente. IP recibida: ${clientIP || 'null'}`);
+        P.warn(`   Instagram puede detectar ubicación incorrecta.`);
       }
+      
+      // 🕐 CONFIGURAR HORA/TIMEZONE EN TIEMPO REAL
+      const now = new Date();
+      
+      // Usar timezone del cliente si está disponible, sino usar del servidor
+      let timezoneOffset = deviceHeaders && deviceHeaders['timezone-offset'] 
+        ? parseInt(deviceHeaders['timezone-offset']) 
+        : -now.getTimezoneOffset(); // Offset en minutos (ej: -300 para UTC-5)
+      
+      const timezone = deviceHeaders && deviceHeaders['timezone'] 
+        ? deviceHeaders['timezone'] 
+        : `UTC${timezoneOffset >= 0 ? '+' : '-'}${String(Math.floor(Math.abs(timezoneOffset) / 60)).padStart(2, '0')}:${String(Math.abs(timezoneOffset) % 60).padStart(2, '0')}`;
+      
+      const timezoneOffsetHours = Math.floor(Math.abs(timezoneOffset) / 60);
+      const timezoneOffsetMinutes = Math.abs(timezoneOffset) % 60;
+      const timezoneSign = timezoneOffset >= 0 ? '+' : '-';
+      const timezoneString = `UTC${timezoneSign}${String(timezoneOffsetHours).padStart(2, '0')}:${String(timezoneOffsetMinutes).padStart(2, '0')}`;
+      
+      // Timestamp actual en tiempo real (segundos Unix)
+      const currentTimestamp = Math.floor(Date.now() / 1000);
+      
+      // Usar timestamp del cliente si está disponible (para sincronización)
+      const clientTimestamp = deviceHeaders && deviceHeaders['timestamp'] 
+        ? Math.floor(parseInt(deviceHeaders['timestamp']) / 1000) 
+        : currentTimestamp;
+      
+      // Configurar headers de tiempo en tiempo real
+      this.ig.request.defaults.headers = {
+        ...this.ig.request.defaults.headers,
+        'Date': now.toUTCString(),
+        'X-Request-Time': currentTimestamp.toString(),
+        'X-Client-Time': clientTimestamp.toString(),
+        'X-Timezone-Offset': timezoneOffset.toString(),
+        'X-Timezone': timezone
+      };
+      
+      // Configurar headers de ubicación si están disponibles
+      if (deviceHeaders && deviceHeaders['country']) {
+        this.ig.request.defaults.headers['X-Country'] = deviceHeaders['country'];
+      }
+      if (deviceHeaders && deviceHeaders['city']) {
+        this.ig.request.defaults.headers['X-City'] = deviceHeaders['city'];
+      }
+      
+      P.info(`🕐 Hora REAL configurada - Timestamp: ${currentTimestamp}, Timezone: ${timezoneString}${deviceHeaders && deviceHeaders['country'] ? `, País: ${deviceHeaders['country']}` : ''}`);
       
       if (proxy) {
         this.ig.state.proxyUrl = proxy;
@@ -161,10 +663,29 @@ class InstagramService {
         }
       }
       
-      // Intentar restaurar sesión existente
+      // ⭐ IMPORTANTE: REUTILIZAR SIEMPRE EL MISMO DISPOSITIVO GUARDADO POR CUENTA
+      // Esto mantiene consistencia y evita detección por cambios de dispositivo
+      
+      let savedDevice = null;
+      let savedIP = null;
+      
+      // Intentar restaurar sesión existente (cookies Y dispositivo)
       if (fs.existsSync(file)) {
         try {
           const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+          
+          // ✅ RESTAURAR dispositivo guardado si existe
+          if (saved.device && saved.device.deviceString) {
+            savedDevice = saved.device;
+            P.info(`📱 Dispositivo guardado encontrado, será reutilizado: ${savedDevice.deviceString.substring(0, 60)}...`);
+          }
+          
+          // ✅ RESTAURAR IP guardada si existe
+          if (saved.clientIP) {
+            savedIP = saved.clientIP;
+            P.info(`📍 IP guardada encontrada: ${savedIP}`);
+          }
+          
           await this.ig.state.deserializeCookieJar(saved.cookieJar);
           
           // Verificar que la sesión sigue válida
@@ -172,6 +693,17 @@ class InstagramService {
           const user = await this.ig.account.currentUser();
           this.igUserId = user.pk;
           this.logged = true;
+          
+          // Si hay dispositivo guardado, restaurarlo AHORA
+          if (savedDevice) {
+            this.ig.state.deviceString = savedDevice.deviceString;
+            this.ig.state.deviceId = savedDevice.deviceId;
+            this.ig.state.uuid = savedDevice.uuid;
+            this.ig.state.phoneId = savedDevice.phoneId;
+            if (savedDevice.adid) this.ig.state.adid = savedDevice.adid;
+            if (savedDevice.build) this.ig.state.build = savedDevice.build;
+            P.info(`✅ Dispositivo guardado restaurado completamente`);
+          }
           
           // Restaurar processedMessages y processedComments desde archivo
           if (saved.processedMessages && Array.isArray(saved.processedMessages)) {
@@ -209,7 +741,7 @@ class InstagramService {
           } catch (userError) {
             // Si falla currentUser(), la sesión expiró
             P.warn(`⚠️ Sesión guardada inválida, relogueando: ${userError.message}`);
-          // Si falla la restauración, continuar con login normal
+          // Si falla la restauración, continuar con login normal PERO mantener dispositivo guardado
           }
         } catch (restoreError) {
           P.warn(`⚠️ Error restaurando sesión: ${restoreError.message}`);
@@ -219,14 +751,94 @@ class InstagramService {
 
       // Login normal - con manejo mejorado de challenges
       try {
+        // ⭐ REUTILIZAR DISPOSITIVO GUARDADO SI EXISTE, sino usar dispositivo del cliente
+        if (savedDevice && savedDevice.deviceString) {
+          // ✅ REUTILIZAR DISPOSITIVO GUARDADO (mismo dispositivo siempre por cuenta)
+          P.info(`📱 Reutilizando dispositivo guardado para mantener consistencia`);
+          this.ig.state.deviceString = savedDevice.deviceString;
+          this.ig.state.deviceId = savedDevice.deviceId;
+          this.ig.state.uuid = savedDevice.uuid;
+          this.ig.state.phoneId = savedDevice.phoneId;
+          if (savedDevice.adid) this.ig.state.adid = savedDevice.adid;
+          if (savedDevice.build) this.ig.state.build = savedDevice.build;
+          
+          // Si hay User-Agent guardado, usarlo también
+          if (savedDevice.userAgent) {
+            this.ig.request.defaults.headers = {
+              ...this.ig.request.defaults.headers,
+              'User-Agent': savedDevice.userAgent
+            };
+          }
+          
+          P.info(`   ✅ Dispositivo: ${savedDevice.deviceString.substring(0, 60)}...`);
+        } else if (deviceHeaders && deviceHeaders['user-agent'] && deviceHeaders['user-agent'].trim() !== '') {
+          // Si no hay dispositivo guardado, usar dispositivo del cliente
+          P.info(`📱 No hay dispositivo guardado, usando dispositivo del cliente en tiempo real...`);
+          P.info(`   User-Agent recibido: ${deviceHeaders['user-agent'].substring(0, 100)}...`);
+          await this.generateRealDeviceFromHeaders(username, deviceHeaders);
+        } else {
+          // Si no hay deviceHeaders o User-Agent, intentar obtenerlo de los headers de la request
+          // Esto puede pasar si se llama desde app.js directamente
+          P.warn('⚠️ No se recibió User-Agent en deviceHeaders');
+          P.warn(`   deviceHeaders existe: ${!!deviceHeaders}`);
+          P.warn(`   user-agent en deviceHeaders: ${deviceHeaders?.['user-agent'] || 'NO EXISTE'}`);
+          
+          // Intentar usar generación por defecto pero con información mínima
+          this.ig.state.generateDevice(username);
+          
+          // Si hay deviceHeaders pero sin user-agent, al menos configurar otros headers
+          if (deviceHeaders) {
+            if (deviceHeaders['accept-language']) {
+              this.ig.request.defaults.headers['Accept-Language'] = deviceHeaders['accept-language'];
+            }
+          }
+        }
+        
+        // 🕐 Configurar timestamp actual en tiempo real para el login
+        const loginTimestamp = Math.floor(Date.now() / 1000);
+        P.info(`🕐 Login iniciado en tiempo real - Timestamp: ${loginTimestamp}`);
+        
         P.info('Realizando login a Instagram...');
+        
+        // ⭐ SIMULAR COMPORTAMIENTO DE NAVEGADOR ANTES DEL LOGIN
+        // Esto ayuda a que Instagram vea la conexión como más "humana"
+        try {
+          // 1. Simular carga de página inicial (como navegador)
+          P.info('🌐 Simulando carga de página inicial (comportamiento de navegador)...');
+          await this.humanDelay(2000, 4000);
+          
+          // 2. Intentar acceder a endpoint público primero (como navegador hace)
+          try {
+            await this.ig.feed.timeline().request();
+            P.info('✅ Simulación de navegación exitosa');
+          } catch (navError) {
+            // Esto es normal si no estamos logueados, solo simula el comportamiento
+            P.info('📱 Navegación simulada (esperado sin login)');
+          }
+          
+          // 3. Delay adicional antes del login (simula tiempo de usuario ingresando datos)
+          await this.humanDelay(3000, 6000);
+          
+        } catch (simError) {
+          P.warn(`⚠️ Error en simulación de navegador: ${simError.message}, continuando con login...`);
+        }
+        
+        // Delay humano antes de intentar login (simula tiempo de pensar/ingresar datos)
+        await this.humanDelay(1500, 3000);
+        
+        P.info('🔐 Intentando login final...');
         const loginResult = await this.ig.account.login(username, password);
         this.igUserId = loginResult.pk;
         this.logged = true;
 
+        P.info(`✅ Login exitoso para ${username}, iniciando periodo de calentamiento...`);
+
         // Guardar cookies - asegurarse de que se guarden correctamente
         // Pequeño delay para asegurar que las cookies se establezcan
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        
+        // Agregar delay humano adicional después del login
+        await this.humanDelay(2000, 4000);
         
         const cookieJar = await this.ig.state.serializeCookieJar();
         P.info(`💾 Guardando cookies después del login`);
@@ -235,14 +847,36 @@ class InstagramService {
             const processedMessagesArray = this.processedMessages ? Array.from(this.processedMessages) : [];
             const processedCommentsArray = this.processedComments ? Array.from(this.processedComments) : [];
             
+            // Guardar device fingerprint si está disponible (incluyendo User-Agent real y dispositivo desktop)
+            const deviceData = this.ig.state.deviceString ? {
+              deviceString: this.ig.state.deviceString,
+              deviceId: this.ig.state.deviceId,
+              uuid: this.ig.state.uuid,
+              phoneId: this.ig.state.phoneId,
+              adid: this.ig.state.adid,
+              build: this.ig.state.build,
+              // Si es desktop, guardar User-Agent real del cliente; si es Android, guardar el de Android
+              userAgent: this.realUserAgent || this.ig.request.defaults.headers?.['User-Agent'] || null,
+              realDevice: this.realDevice || null, // Dispositivo real del cliente (desktop/Mac/Windows/Linux)
+              isRealDevice: this.realDevice ? false : true, // false si es desktop, true si es Android real
+              note: this.realDevice ? `Desktop (${this.realDevice.type}) - Real device info saved` : 'Android real'
+            } : null;
+            
+            // Guardar también la IP usada para mantener consistencia
+            const ipUsed = savedIP || clientIP || 'unknown';
+            
             fs.writeFileSync(file, JSON.stringify({ 
               cookieJar,
               username,
               igUserId: this.igUserId,
               savedAt: new Date().toISOString(),
               processedMessages: processedMessagesArray,
-              processedComments: processedCommentsArray
+              processedComments: processedCommentsArray,
+              device: deviceData,
+              clientIP: ipUsed // Guardar IP para reutilizar
             }), 'utf8');
+            
+            P.info(`💾 IP guardada para futuros logins: ${ipUsed}`);
 
         // Eliminar challenge pendiente si existe (login exitoso = challenge resuelto)
         const challengeFile = path.join(STATE_DIR, `${this.userId}_challenge.json`);
@@ -267,6 +901,16 @@ class InstagramService {
           igUserId: this.igUserId 
         });
 
+        // 🔥 PERIODO DE CALENTAMIENTO (WARM-UP) - Comportamiento humano
+        // Ejecutar en background para no bloquear la respuesta
+        const warmUpMinutes = 30; // 30 minutos de calentamiento
+        P.info(`🔥 Iniciando periodo de calentamiento de ${warmUpMinutes} minutos en background...`);
+        
+        // Ejecutar warm-up en background (no esperar)
+        this.warmUpPeriod(warmUpMinutes).catch(error => {
+          P.error(`❌ Error en warm-up period: ${error.message}`);
+        });
+
         return { success: true, restored: false };
       } catch (loginError) {
         const msg = String(loginError?.message || loginError);
@@ -278,20 +922,114 @@ class InstagramService {
         P.error(`   Stack: ${loginError?.stack?.substring(0, 500) || 'No disponible'}`);
         
         // Detectar si Instagram sugiere usar email para recuperar cuenta
+        // Esto puede ser por: cuenta nueva, credenciales incorrectas, o cuenta bloqueada
+        const errorBody = loginError.response?.body || {};
+        const errorType = errorBody.error_type || '';
+        const invalidCredentials = errorBody.invalid_credentials === true;
+        
         if (msg.includes('We can send you an email') || 
             msg.includes('email to help you get back') ||
             msg.includes('send you an email to help') ||
             msg.includes('email to help') ||
-            msg.includes('can send you an email')) {
-          P.error(`📧 Instagram sugiere usar email para recuperar cuenta: ${msg}`);
+            msg.includes('can send you an email') ||
+            (errorType === 'bad_password' && invalidCredentials)) {
+          
+          P.error(`📧 Instagram requiere recuperación/cuenta nueva: ${msg}`);
+          P.error(`   Error Type: ${errorType}`);
+          P.error(`   Invalid Credentials: ${invalidCredentials}`);
+          
+          // Determinar si es cuenta nueva o problema de credenciales
+          const isNewAccount = msg.includes('email to help') || (errorType === 'bad_password' && invalidCredentials);
+          
+          // ⚠️ NO INTENTAR LOGUEAR CUENTAS NUEVAS - Rechazar explícitamente
+          if (isNewAccount) {
+            P.error(`🚫 CUENTA NUEVA DETECTADA - Rechazando login. La cuenta debe usarse manualmente primero.`);
+            
+            emitToUserIG(this.userId, 'instagram:alert', { 
+              type: 'new_account_blocked',
+              severity: 'error',
+              message: 'Cuenta nueva bloqueada - Debe usarse manualmente primero',
+              description: 'Las cuentas NUEVAS de Instagram NO pueden hacer login desde API. Instagram bloquea esto automáticamente por seguridad. Debes usar la cuenta manualmente desde navegador/app móvil por 24-48 horas antes de poder hacer login desde aquí.',
+              username: username,
+              action_required: true,
+              is_new_account: true,
+              blocked: true,
+              instructions: [
+                '🔴 CUENTA NUEVA - BLOQUEADA',
+                '',
+                'Las cuentas nuevas NO pueden hacer login desde API.',
+                'Debes usarla manualmente primero.',
+                '',
+                '✅ SOLUCIÓN OBLIGATORIA:',
+                '',
+                '1️⃣ Usa la cuenta manualmente 48 horas:',
+                '  → Instagram.com o app móvil',
+                '  → Publica 1-2 fotos',
+                '  → Haz likes y sigue cuentas',
+                '  → Envía DMs',
+                '',
+                '2️⃣ Después de 48 horas, intenta login nuevamente',
+                '',
+                '⏰ NO intentes login desde aquí hasta que pases 48 horas'
+              ],
+              timestamp: Date.now()
+            });
+            
+            // Retornar rechazo explícito
+            return {
+              success: false,
+              challenge: false,
+              error: 'Cuenta nueva bloqueada - Requiere uso manual primero',
+              message: 'Esta cuenta es nueva y NO puede hacer login desde API. Debes usar la cuenta manualmente desde navegador/app móvil por 48 horas antes de intentar login desde aquí. Instagram bloquea automáticamente el login de API para cuentas nuevas.',
+              username: username,
+              recovery_required: false,
+              is_new_account: true,
+              blocked: true,
+              wait_time: '48 horas',
+              must_use_manually_first: true
+            };
+          }
+          
+          // Si no es cuenta nueva, manejar como recuperación normal
           emitToUserIG(this.userId, 'instagram:alert', { 
             type: 'account_recovery_required',
             severity: 'warning',
             message: 'Recuperación de cuenta requerida',
-            description: 'Instagram está sugiriendo usar el email para recuperar el acceso a tu cuenta. Esto puede indicar: 1) Problemas con las credenciales, 2) La cuenta está bloqueada o necesita verificación, 3) Instagram detectó actividad sospechosa. SOLUCIONES: 1) Verifica que el usuario y contraseña sean correctos, 2) Intenta recuperar la cuenta desde Instagram.com usando "Olvidé mi contraseña", 3) Verifica el email asociado a la cuenta, 4) Espera 24-48 horas si la cuenta fue bloqueada recientemente.',
+            description: 'Instagram está sugiriendo usar el email para recuperar el acceso a tu cuenta. Esto puede indicar: 1) Problemas con las credenciales, 2) La cuenta está bloqueada o necesita verificación, 3) Instagram detectó actividad sospechosa.',
             username: username,
             action_required: true,
-            instructions: [
+            is_new_account: false,
+            instructions: isNewAccount ? [
+              '🔴 CUENTA NUEVA - REQUIERE CALENTAMIENTO',
+              '',
+              'Las cuentas nuevas de Instagram NO pueden hacer login desde API inmediatamente.',
+              'Instagram bloquea esto por seguridad.',
+              '',
+              '✅ SOLUCIÓN (24-48 HORAS):',
+              '',
+              '1️⃣ Usar la cuenta manualmente (AHORA):',
+              '  → Abre Instagram.com o la app móvil',
+              '  → Haz login con tu usuario y contraseña',
+              '  → Verifica que el login manual funcione',
+              '',
+              '2️⃣ Activar la cuenta (próximas 24-48 horas):',
+              '  → Publica 1-2 fotos',
+              '  → Completa tu perfil (foto, bio)',
+              '  → Sigue 20-30 cuentas',
+              '  → Da likes (50-100 likes)',
+              '  → Envía algunos DMs',
+              '  → Interactúa con otras cuentas normalmente',
+              '',
+              '3️⃣ Después de 48 horas:',
+              '  → Intenta login desde aquí nuevamente',
+              '  → La cuenta ya tendrá historial "humano"',
+              '  → Instagram confiará más en la actividad',
+              '',
+              '⏰ IMPORTANTE:',
+              '  → NO intentes login desde aquí durante 48 horas',
+              '  → Solo usa la cuenta manualmente',
+              '  → Esto es normal para cuentas nuevas'
+            ] : [
               'PASO 1: Verificar credenciales',
               '  → Asegúrate de que el usuario y contraseña sean correctos',
               '  → Intenta hacer login manualmente en Instagram.com',
@@ -316,14 +1054,18 @@ class InstagramService {
             timestamp: Date.now()
           });
           
-          // Retornar respuesta estructurada en lugar de lanzar error
+          // Retornar respuesta estructurada
           return {
             success: false,
             challenge: false,
-            error: 'Instagram requiere recuperación de cuenta',
-            message: 'Instagram está sugiriendo usar el email para recuperar el acceso. Por favor, verifica las credenciales o recupera la cuenta desde Instagram.com.',
+            error: isNewAccount ? 'Cuenta nueva requiere calentamiento' : 'Instagram requiere recuperación de cuenta',
+            message: isNewAccount 
+              ? 'Esta es una cuenta nueva. Las cuentas nuevas requieren 24-48 horas de uso manual antes de poder hacer login desde API. Por favor, usa la cuenta manualmente desde navegador/app móvil durante 48 horas, luego intenta nuevamente.'
+              : 'Instagram está sugiriendo usar el email para recuperar el acceso. Por favor, verifica las credenciales o recupera la cuenta desde Instagram.com.',
             username: username,
-            recovery_required: true
+            recovery_required: true,
+            is_new_account: isNewAccount,
+            wait_time: isNewAccount ? '48 horas' : null
           };
         }
         
