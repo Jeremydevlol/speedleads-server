@@ -78,7 +78,7 @@ class InstagramService {
   stateFile() {
     return path.join(STATE_DIR, `${this.userId}.json`);
   }
-
+  
   /**
    * Cargar pool de dispositivos realistas
    */
@@ -552,11 +552,39 @@ class InstagramService {
       
       this.username = username;
       
-      // ⭐ IMPORTANTE: SIEMPRE usar dispositivo, hora y ubicación en TIEMPO REAL
-      // NO usar valores guardados - todo debe detectarse en tiempo real del cliente
-      
       // Delay humano antes de continuar (simula tiempo de pensar)
       await this.humanDelay(500, 1500);
+
+      const file = this.stateFile();
+      const challengeFile = path.join(STATE_DIR, `${this.userId}_challenge.json`);
+      
+      // ⭐ IMPORTANTE: REUTILIZAR SIEMPRE EL MISMO DISPOSITIVO GUARDADO POR CUENTA
+      // Esto mantiene consistencia y evita detección por cambios de dispositivo
+      
+      // Declarar variables primero
+      let savedDevice = null;
+      let savedIP = null;
+      
+      // Intentar cargar IP guardada ANTES de configurarla
+      if (fs.existsSync(file)) {
+        try {
+          const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+          
+          // ✅ RESTAURAR IP guardada si existe
+          if (saved.clientIP) {
+            savedIP = saved.clientIP;
+            P.info(`📍 IP guardada encontrada: ${savedIP}`);
+          }
+          
+          // ✅ RESTAURAR dispositivo guardado si existe
+          if (saved.device && saved.device.deviceString) {
+            savedDevice = saved.device;
+            P.info(`📱 Dispositivo guardado encontrado, será reutilizado: ${savedDevice.deviceString.substring(0, 60)}...`);
+          }
+        } catch (loadError) {
+          P.warn(`⚠️ Error cargando sesión guardada: ${loadError.message}`);
+        }
+      }
       
       // 📍 CONFIGURAR UBICACIÓN - Mantener IP/región consistente por cuenta
       // Si hay IP guardada, usarla; sino usar la nueva del cliente
@@ -643,9 +671,6 @@ class InstagramService {
         this.ig.state.proxyUrl = proxy;
         P.info(`Usando proxy: ${proxy}`);
       }
-
-      const file = this.stateFile();
-      const challengeFile = path.join(STATE_DIR, `${this.userId}_challenge.json`);
       
       // Verificar si hay un challenge pendiente reciente
       if (fs.existsSync(challengeFile)) {
@@ -663,29 +688,12 @@ class InstagramService {
         }
       }
       
-      // ⭐ IMPORTANTE: REUTILIZAR SIEMPRE EL MISMO DISPOSITIVO GUARDADO POR CUENTA
-      // Esto mantiene consistencia y evita detección por cambios de dispositivo
-      
-      let savedDevice = null;
-      let savedIP = null;
-      
       // Intentar restaurar sesión existente (cookies Y dispositivo)
       if (fs.existsSync(file)) {
         try {
           const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
           
-          // ✅ RESTAURAR dispositivo guardado si existe
-          if (saved.device && saved.device.deviceString) {
-            savedDevice = saved.device;
-            P.info(`📱 Dispositivo guardado encontrado, será reutilizado: ${savedDevice.deviceString.substring(0, 60)}...`);
-          }
-          
-          // ✅ RESTAURAR IP guardada si existe
-          if (saved.clientIP) {
-            savedIP = saved.clientIP;
-            P.info(`📍 IP guardada encontrada: ${savedIP}`);
-          }
-          
+          // Ya cargamos savedDevice y savedIP arriba, solo necesitamos restaurar cookies
           await this.ig.state.deserializeCookieJar(saved.cookieJar);
           
           // Verificar que la sesión sigue válida
