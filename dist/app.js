@@ -2164,13 +2164,51 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
   }
 });
 
+// ⭐ MIDDLEWARE DE DEBUG - Capturar TODAS las peticiones a /api/instagram/login ANTES del endpoint
+app.use((req, res, next) => {
+  if (req.path === '/api/instagram/login' && req.method === 'POST') {
+    console.log('');
+    console.log('🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯');
+    console.log('🚨🚨🚨 MIDDLEWARE INTERCEPTOR: Petición POST a /api/instagram/login detectada 🚨🚨🚨');
+    console.log(`   Timestamp: ${new Date().toISOString()}`);
+    console.log(`   IP: ${req.ip || req.connection?.remoteAddress || 'unknown'}`);
+    console.log(`   URL completa: ${req.originalUrl || req.url}`);
+    console.log(`   Body parseado: ${JSON.stringify(req.body) ? 'SÍ' : 'NO'}`);
+    console.log(`   Headers auth: ${req.headers.authorization ? 'PRESENTE' : 'NO'}`);
+    console.log('🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯🎯');
+    console.log('');
+  }
+  next();
+});
+
 // Endpoint de login real de Instagram (ANTES de middlewares de autenticación)
 app.post('/api/instagram/login', async (req, res) => {
-  console.log('🔐 [LOGIN] Endpoint de login de Instagram llamado');
+  // ⭐ LOG INMEDIATO - Capturar TODO desde el principio
+  console.log('═══════════════════════════════════════════════════════════════');
+  console.log('🔐 [LOGIN] ⚡ ENDPOINT DE LOGIN DE INSTAGRAM LLAMADO ⚡');
+  console.log(`📅 Hora: ${new Date().toISOString()}`);
+  console.log(`🌐 IP: ${req.ip || req.connection?.remoteAddress || 'unknown'}`);
+  console.log(`📝 Method: ${req.method}`);
+  console.log(`🛣️  Path: ${req.path || req.url}`);
+  console.log(`📦 Headers recibidos:`, {
+    'content-type': req.headers['content-type'],
+    'authorization': req.headers['authorization'] ? 'PRESENTE' : 'NO PRESENTE',
+    'user-agent': req.headers['user-agent']?.substring(0, 80) || 'NO',
+    'origin': req.headers['origin'] || 'NO',
+    'referer': req.headers['referer'] || 'NO'
+  });
+  console.log(`📨 Body recibido:`, {
+    username: req.body?.username ? 'PRESENTE' : 'NO PRESENTE',
+    password: req.body?.password ? 'PRESENTE (***)' : 'NO PRESENTE',
+    userId: req.body?.userId || 'NO EN BODY'
+  });
+  console.log('═══════════════════════════════════════════════════════════════');
+  
   const { username, password } = req.body;
   
   // Validar credenciales
   if (!username || !password) {
+    console.log(`❌ [LOGIN] Credenciales faltantes - username: ${!!username}, password: ${!!password}`);
     return res.status(400).json({
       success: false,
       error: 'Username y password son requeridos'
@@ -2180,6 +2218,7 @@ app.post('/api/instagram/login', async (req, res) => {
   try {
     // Obtener userId del token o del body
     let userId = req.body.userId;
+    console.log(`🔍 [LOGIN] userId inicial del body: ${userId || 'NO PRESENTE'}`);
     
     // Si no viene en el body, intentar obtener del token JWT
     if (!userId) {
@@ -2220,10 +2259,12 @@ app.post('/api/instagram/login', async (req, res) => {
       });
     }
     
-    console.log(`🔍 Validando credenciales para usuario: ${username} (userId: ${userId})`);
+    console.log(`🔍 [LOGIN] Validando credenciales para usuario: ${username} (userId: ${userId})`);
     
     // Importar el servicio de Instagram
+    console.log(`📦 [LOGIN] Importando servicio de Instagram...`);
     const { getOrCreateIGSession } = await import('./services/instagramService.js');
+    console.log(`✅ [LOGIN] Servicio de Instagram importado correctamente`);
     
     console.log('🔄 [LOGIN] Iniciando sesión real en Instagram...');
     
