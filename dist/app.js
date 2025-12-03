@@ -262,6 +262,7 @@ app.get('/instagram-diagnostic', (req, res) => {
     endpoints: [
       'GET /instagram-diagnostic',
       'POST /api/instagram/login',
+      'POST /api/instagram/2fa',
       'GET /api/instagram/status',
       'GET /api/instagram/dms',
       'GET /api/instagram/comments'
@@ -2356,6 +2357,20 @@ app.post('/api/instagram/login', async (req, res) => {
       deviceHeaders 
     });
     
+    // ⭐ VERIFICAR SI REQUIERE 2FA PRIMERO
+    if (loginResult.twoFA_required === true || loginResult.status === '2FA_REQUIRED') {
+      console.log(`🔐 [LOGIN] 2FA requerido para ${username}`);
+      return res.status(200).json({
+        success: false,
+        status: '2FA_REQUIRED',
+        twoFA_required: true,
+        message: loginResult.message || 'Instagram requiere código de verificación',
+        username: loginResult.username || username,
+        via: loginResult.via || 'sms',
+        verification_method: loginResult.verification_method || '1'
+      });
+    }
+    
     // Verificar si requiere recuperación de cuenta
     if (loginResult.recovery_required === true) {
       console.log(`📧 [LOGIN] Recuperación de cuenta requerida para ${username}`);
@@ -2437,6 +2452,120 @@ app.post('/api/instagram/login', async (req, res) => {
     res.status(500).json({ 
       success: false, 
       error: 'Error interno en login de Instagram: ' + error.message 
+    });
+  }
+});
+
+// Endpoint para completar login con código 2FA
+app.post('/api/instagram/2fa', async (req, res) => {
+  console.log('🔐 [2FA] Endpoint de 2FA llamado');
+  const { code } = req.body;
+  
+  // Validar código
+  if (!code || typeof code !== 'string' || code.trim().length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'Código de verificación es requerido'
+    });
+  }
+  
+  // Limpiar código (solo números)
+  const cleanCode = code.trim().replace(/\D/g, '');
+  if (cleanCode.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'Código de verificación inválido (debe contener solo números)'
+    });
+  }
+  
+  try {
+    // Obtener userId del token o del body
+    let userId = req.body.userId;
+    
+    // Si no viene en el body, intentar obtener del token JWT
+    if (!userId) {
+      try {
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const token = authHeader.substring(7);
+          const { validateJwt } = await import('./config/jwt.js');
+          try {
+            const decoded = await validateJwt({ headers: { authorization: authHeader } }, null, () => {});
+            if (decoded && decoded.userId) {
+              userId = decoded.userId;
+            } else if (decoded && decoded.sub) {
+              userId = decoded.sub;
+            } else if (decoded && decoded.user?.id) {
+              userId = decoded.user.id;
+            }
+          } catch (jwtError) {
+            console.log('⚠️ [2FA] No se pudo validar JWT, usando userId del body si está disponible');
+          }
+        }
+      } catch (error) {
+        console.log('⚠️ [2FA] Error obteniendo userId del token:', error.message);
+      }
+    }
+    
+    // Si aún no hay userId, usar un fallback
+    if (!userId) {
+      userId = req.user?.userId || req.user?.id || req.user?.sub;
+    }
+    
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        error: 'userId es requerido. Por favor proporciona el userId en el body o usa un token de autenticación válido.'
+      });
+    }
+    
+    console.log(`🔐 [2FA] Completando login 2FA para usuario ${userId} con código: ${cleanCode.substring(0, 2)}****`);
+    
+    // Importar el servicio de Instagram
+    const { getOrCreateIGSession, pending2FA } = await import('./services/instagramService.js');
+    
+    // Verificar que hay un 2FA pendiente
+    const pending = pending2FA.get(userId);
+    if (!pending) {
+      console.log(`❌ [2FA] No hay un login con 2FA pendiente para usuario ${userId}`);
+      return res.status(400).json({
+        success: false,
+        error: 'No hay un login con 2FA pendiente para este usuario',
+        message: 'Por favor, intenta hacer login nuevamente primero'
+      });
+    }
+    
+    // Crear o obtener sesión de Instagram
+    const session = await getOrCreateIGSession(userId);
+    
+    // Completar login con código 2FA
+    const result = await session.completeTwoFactorLogin(cleanCode);
+    
+    if (result.success) {
+      console.log(`✅ [2FA] Login 2FA exitoso para usuario ${userId}, Instagram: ${result.username}`);
+      res.json({
+        success: true,
+        status: 'LOGGED',
+        message: 'Login exitoso con código 2FA',
+        username: result.username,
+        igUserId: result.igUserId,
+        twoFA_completed: true
+      });
+    } else {
+      console.log(`❌ [2FA] Error completando login 2FA: ${result.error || result.message}`);
+      res.status(400).json({
+        success: false,
+        status: result.status || '2FA_FAILED',
+        error: result.error || 'Error completando login 2FA',
+        message: result.message || 'El código de verificación es incorrecto o ha expirado'
+      });
+    }
+  } catch (error) {
+    console.error(`❌ [2FA] Error en endpoint de 2FA: ${error.message}`);
+    console.error('Stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      error: 'Error interno completando login 2FA: ' + error.message
     });
   }
 });
@@ -3393,8 +3522,13 @@ import { configureSocket as configureWhatsAppSocket } from './services/whatsappS
 configureWhatsAppSocket(io);
 
 // Configurar el servicio de Instagram con Socket.IO
-import { configureIGIO } from './services/instagramService.js';
+import { configureIGIO, restoreAllSavedSessions } from './services/instagramService.js';
 configureIGIO(io);
+
+// Restaurar todas las sesiones guardadas de Instagram al iniciar el servidor
+restoreAllSavedSessions().catch(error => {
+  console.error('❌ Error restaurando sesiones de Instagram:', error.message);
+});
 
 // Hacer io disponible globalmente
 app.set('io', io);
