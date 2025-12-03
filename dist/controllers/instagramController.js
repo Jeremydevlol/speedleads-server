@@ -287,6 +287,43 @@ export async function igLogout(req, res) {
 }
 
 /**
+ * Force Logout de Instagram - Limpia TODO el estado
+ * POST /api/instagram/force-logout
+ * Usar cuando hay errores 500 o sesiones corruptas
+ */
+export async function igForceLogout(req, res) {
+  try {
+    const userId = req.user?.userId || req.user?.id || req.user?.sub;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'No autenticado' });
+    }
+
+    P.info(`🔴 [FORCE-LOGOUT] Iniciando force logout para usuario ${userId}`);
+    
+    const igService = await getOrCreateIGSession(userId);
+    const result = await igService.forceLogout();
+    removeIGSession(userId);
+
+    P.info(`✅ [FORCE-LOGOUT] Completado para usuario ${userId}`);
+    
+    res.json({ 
+      success: true, 
+      message: result.message || 'Sesión limpiada completamente. Por favor, vuelve a iniciar sesión.',
+      action: 'relogin'
+    });
+  } catch (error) {
+    P.error(`❌ [FORCE-LOGOUT] Error: ${error.message}`);
+    // Aún así intentar limpiar la sesión del mapa
+    removeIGSession(req.user?.userId || req.user?.id || req.user?.sub);
+    res.status(400).json({ 
+      success: false, 
+      error: error.message,
+      message: 'Hubo un error pero la sesión fue limpiada. Por favor, vuelve a iniciar sesión.'
+    });
+  }
+}
+
+/**
  * Enviar DM a un usuario
  * POST /api/instagram/send
  * Body: { username, text }

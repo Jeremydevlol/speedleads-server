@@ -1,6 +1,6 @@
 import Bottleneck from 'bottleneck';
 import fs from 'fs';
-import { IgApiClient } from 'instagram-private-api';
+import { IgApiClient, IgLoginTwoFactorRequiredError } from 'instagram-private-api';
 import path, { dirname } from 'path';
 import pino from 'pino';
 import { fileURLToPath } from 'url';
@@ -20,6 +20,9 @@ if (!fs.existsSync(STATE_DIR)) {
 // Store de sesiones de Instagram por usuario
 export const igSessions = new Map();
 const initializing = new Map();
+
+// Store de pendientes de 2FA por userId
+export const pending2FA = new Map();
 
 /**
  * Helper seguro para convertir shortcode a media ID usando BigInt
@@ -543,6 +546,120 @@ class InstagramService {
   }
 
   /**
+   * Completar login con código 2FA
+   * Se llama después de que el usuario ingresa el código de verificación
+   */
+  async completeTwoFactorLogin(code) {
+    try {
+      // Verificar que hay un 2FA pendiente
+      const pending = pending2FA.get(this.userId);
+      if (!pending) {
+        P.error(`❌ No hay un login con 2FA pendiente para usuario ${this.userId}`);
+        return {
+          success: false,
+          error: 'No hay un login con 2FA pendiente para este usuario',
+          message: 'Por favor, intenta hacer login nuevamente primero'
+        };
+      }
+
+      const { twoFactorIdentifier, username: igUsername, verificationMethod } = pending;
+
+      P.info(`🔐 Completando login 2FA para usuario ${igUsername} (método: ${verificationMethod === '1' ? 'SMS' : 'TOTP'})`);
+
+      // Completar login con código 2FA
+      const loggedUser = await this.ig.account.twoFactorLogin({
+        username: igUsername,
+        verificationCode: code,
+        twoFactorIdentifier,
+        verificationMethod, // '1' SMS, '0' TOTP
+        trustThisDevice: '1' // Confiar en este dispositivo
+      });
+
+      // Si llegamos aquí, el login fue exitoso
+      this.igUserId = loggedUser.pk;
+      this.logged = true;
+      this.username = igUsername;
+
+      P.info(`✅ Login 2FA exitoso para ${igUsername}`);
+
+      // Guardar sesión
+      const file = this.stateFile();
+      const cookieJar = await this.ig.state.serializeCookieJar();
+      
+      const processedMessagesArray = this.processedMessages ? Array.from(this.processedMessages) : [];
+      const processedCommentsArray = this.processedComments ? Array.from(this.processedComments) : [];
+      
+      const deviceData = this.ig.state.deviceString ? {
+        deviceString: this.ig.state.deviceString,
+        deviceId: this.ig.state.deviceId,
+        uuid: this.ig.state.uuid,
+        phoneId: this.ig.state.phoneId,
+        adid: this.ig.state.adid,
+        build: this.ig.state.build
+      } : null;
+
+      fs.writeFileSync(file, JSON.stringify({
+        cookieJar,
+        username: igUsername,
+        igUserId: this.igUserId,
+        savedAt: new Date().toISOString(),
+        processedMessages: processedMessagesArray,
+        processedComments: processedCommentsArray,
+        device: deviceData
+      }), 'utf8');
+
+      P.info(`💾 Sesión 2FA guardada para ${igUsername}`);
+
+      // Limpiar 2FA pendiente
+      pending2FA.delete(this.userId);
+
+      // Emitir evento de éxito
+      emitToUserIG(this.userId, 'instagram:status', {
+        connected: true,
+        username: igUsername,
+        igUserId: this.igUserId,
+        twoFA_completed: true
+      });
+
+      // Iniciar warm-up period en background
+      const warmUpMinutes = 30;
+      P.info(`🔥 Iniciando periodo de calentamiento de ${warmUpMinutes} minutos en background...`);
+      this.warmUpPeriod(warmUpMinutes).catch(error => {
+        P.error(`❌ Error en warm-up period: ${error.message}`);
+      });
+
+      return {
+        success: true,
+        status: 'LOGGED',
+        username: igUsername,
+        igUserId: this.igUserId,
+        twoFA_completed: true
+      };
+
+    } catch (error) {
+      const msg = String(error?.message || error);
+      P.error(`❌ Error completando login 2FA: ${msg}`);
+      P.error(`   Tipo: ${error?.constructor?.name || 'Desconocido'}`);
+
+      // Emitir evento de error
+      emitToUserIG(this.userId, 'instagram:alert', {
+        type: '2fa_failed',
+        severity: 'error',
+        message: 'Código 2FA incorrecto o expirado',
+        description: msg,
+        username: pending2FA.get(this.userId)?.username || 'unknown'
+      });
+
+      return {
+        success: false,
+        status: '2FA_FAILED',
+        error: 'Código incorrecto o expirado',
+        message: 'El código de verificación es incorrecto o ha expirado. Por favor, intenta nuevamente.'
+      };
+    }
+  }
+
+  /**
    * Login a Instagram con usuario/contraseña
    * Restaura sesión desde archivo si existe
    */
@@ -835,7 +952,76 @@ class InstagramService {
         await this.humanDelay(1500, 3000);
         
         P.info('🔐 Intentando login final...');
-        const loginResult = await this.ig.account.login(username, password);
+        P.info(`   Username: ${username}`);
+        P.info(`   Dispositivo: ${this.ig.state.deviceString?.substring(0, 60) || 'No configurado'}...`);
+        
+        let loginResult;
+        try {
+          loginResult = await this.ig.account.login(username, password);
+          P.info(`✅ Login API completado sin errores inmediatos`);
+        } catch (loginError) {
+          // Log detallado del error
+          P.error(`❌ Error capturado en login: ${loginError?.message || 'Error desconocido'}`);
+          P.error(`   Tipo de error: ${loginError?.constructor?.name || 'Desconocido'}`);
+          P.error(`   Es IgLoginTwoFactorRequiredError? ${loginError instanceof IgLoginTwoFactorRequiredError}`);
+          
+          // ⭐ DETECTAR 2FA PRIMERO (antes de otros errores)
+          if (loginError instanceof IgLoginTwoFactorRequiredError) {
+            P.info(`🔐 2FA detectado correctamente para ${username}`);
+            P.info(`🔐 2FA requerido para ${username}`);
+            
+            const twoFactorInfo = loginError.response?.body?.two_factor_info || {};
+            const igUsername = twoFactorInfo.username || username;
+            const twoFactorIdentifier = twoFactorInfo.two_factor_identifier;
+            const totpTwoFactorOn = twoFactorInfo.totp_two_factor_on === true;
+            
+            // Determinar método de verificación: '0' = TOTP (app), '1' = SMS
+            const verificationMethod = totpTwoFactorOn ? '0' : '1';
+            
+            if (!twoFactorIdentifier) {
+              P.error(`⚠️ 2FA requerido pero no se encontró two_factor_identifier`);
+              throw new Error('2FA requerido pero información incompleta');
+            }
+            
+            // Guardar información de 2FA pendiente
+            pending2FA.set(this.userId, {
+              twoFactorIdentifier,
+              username: igUsername,
+              verificationMethod,
+              createdAt: Date.now()
+            });
+            
+            P.info(`💾 Información de 2FA guardada para usuario ${this.userId}`);
+            P.info(`   Método: ${verificationMethod === '1' ? 'SMS' : 'TOTP (app)'}`);
+            
+            // Emitir evento por Socket.IO
+            emitToUserIG(this.userId, 'instagram:2fa_required', {
+              username: igUsername,
+              via: verificationMethod === '1' ? 'sms' : 'app',
+              message: verificationMethod === '1' 
+                ? 'Instagram requiere código de verificación enviado por SMS'
+                : 'Instagram requiere código de verificación de tu app de autenticación'
+            });
+            
+            // Retornar respuesta indicando que se requiere 2FA
+            return {
+              success: false,
+              twoFA_required: true,
+              status: '2FA_REQUIRED',
+              username: igUsername,
+              verification_method: verificationMethod,
+              via: verificationMethod === '1' ? 'sms' : 'app',
+              message: verificationMethod === '1'
+                ? 'Instagram requiere código de verificación enviado por SMS'
+                : 'Instagram requiere código de verificación de tu app de autenticación'
+            };
+          }
+          
+          // Si no es 2FA, relanzar el error para que sea manejado por el catch general
+          throw loginError;
+        }
+        
+        // Si llegamos aquí, el login fue exitoso (sin 2FA)
         this.igUserId = loginResult.pk;
         this.logged = true;
 
@@ -1934,6 +2120,7 @@ class InstagramService {
   /**
    * Obtener bandeja de entrada (inbox)
    * Retorna threads con mensajes recientes
+   * Maneja errores 500 con alertas al usuario
    */
   async fetchInbox() {
     try {
@@ -1973,6 +2160,35 @@ class InstagramService {
       return processedThreads;
     } catch (error) {
       P.error(`❌ Error obteniendo inbox: ${error.message}`);
+      
+      // Detectar error 500 de Instagram (sesión corrupta o bloqueada)
+      if (error.message && error.message.includes('500')) {
+        P.error('🔴 Error 500 detectado - La sesión de Instagram puede estar corrupta o bloqueada');
+        
+        // Marcar la sesión como problemática
+        this.sessionCorrupted = true;
+        
+        // Emitir alerta al usuario
+        emitToUserIG(this.userId, 'instagram:alert', {
+          type: 'session_error',
+          severity: 'error',
+          title: 'Sesión de Instagram con problemas',
+          message: 'Instagram está rechazando las solicitudes. Es posible que necesites volver a iniciar sesión.',
+          description: 'Esto puede ocurrir por: cambio de IP, actividad sospechosa detectada, o sesión expirada.',
+          action: 'relogin',
+          actionLabel: 'Volver a iniciar sesión',
+          username: this.username
+        });
+        
+        // Emitir estado desconectado
+        emitToUserIG(this.userId, 'instagram:status', {
+          connected: false,
+          username: this.username,
+          error: 'session_corrupted',
+          message: 'La sesión necesita ser renovada'
+        });
+      }
+      
       throw error;
     }
   }
@@ -2221,6 +2437,81 @@ class InstagramService {
       return { success: true };
     } catch (error) {
       P.error(`❌ Error en logout: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Forzar logout completo - Limpia TODO el estado de la sesión
+   * Usar cuando hay errores 500 o sesiones corruptas
+   */
+  async forceLogout() {
+    try {
+      P.info(`🔴 FORCE LOGOUT para usuario ${this.userId}`);
+      
+      // 1. Eliminar archivo de estado principal
+      const file = this.stateFile();
+      if (fs.existsSync(file)) {
+        fs.unlinkSync(file);
+        P.info('✅ Archivo de sesión principal eliminado');
+      }
+      
+      // 2. Eliminar archivos de cookies adicionales
+      const cookiesDir = path.join(STATE_DIR, 'cookies');
+      if (fs.existsSync(cookiesDir)) {
+        const userCookieFile = path.join(cookiesDir, `${this.userId}.json`);
+        if (fs.existsSync(userCookieFile)) {
+          fs.unlinkSync(userCookieFile);
+          P.info('✅ Archivo de cookies eliminado');
+        }
+      }
+      
+      // 3. Eliminar cualquier archivo relacionado con este usuario
+      const stateFiles = fs.readdirSync(STATE_DIR);
+      for (const stateFile of stateFiles) {
+        if (stateFile.includes(this.userId)) {
+          const filePath = path.join(STATE_DIR, stateFile);
+          if (fs.statSync(filePath).isFile()) {
+            fs.unlinkSync(filePath);
+            P.info(`✅ Archivo adicional eliminado: ${stateFile}`);
+          }
+        }
+      }
+      
+      // 4. Limpiar estado en memoria
+      this.logged = false;
+      this.igUserId = null;
+      this.username = null;
+      this.sessionCorrupted = false;
+      this.pendingChallenge = null;
+      
+      // 5. Recrear instancia de IgApiClient
+      this.ig = new IgApiClient();
+      
+      // 6. Limpiar pending 2FA si existe
+      if (pending2FA.has(this.userId)) {
+        pending2FA.delete(this.userId);
+        P.info('✅ 2FA pendiente eliminado');
+      }
+      
+      // 7. Emitir estado desconectado
+      emitToUserIG(this.userId, 'instagram:status', { 
+        connected: false,
+        forceLogout: true,
+        message: 'Sesión limpiada completamente. Por favor, vuelve a iniciar sesión.'
+      });
+      
+      P.info(`✅ FORCE LOGOUT completado para usuario ${this.userId}`);
+      
+      return { 
+        success: true, 
+        message: 'Sesión limpiada completamente. Por favor, vuelve a iniciar sesión con tus credenciales de Instagram.'
+      };
+    } catch (error) {
+      P.error(`❌ Error en forceLogout: ${error.message}`);
+      // Aún así, limpiar lo que se pueda
+      this.logged = false;
+      this.igUserId = null;
       throw error;
     }
   }
@@ -3708,9 +3999,6 @@ export async function getOrCreateIGSession(userId) {
         const data = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (data.cookieJar && data.username) {
           await existing.ig.state.deserializeCookieJar(data.cookieJar);
-          existing.logged = true;
-          existing.username = data.username;
-          existing.igUserId = data.igUserId;
           
           // Restaurar processedMessages y processedComments
           if (data.processedMessages && Array.isArray(data.processedMessages)) {
@@ -3727,8 +4015,47 @@ export async function getOrCreateIGSession(userId) {
             existing.processedComments = new Set();
           }
           
-          P.info(`✅ Sesión restaurada desde archivo para usuario ${userId}`);
-          return existing;
+          // Restaurar dispositivo guardado si existe
+          if (data.device && data.device.deviceString) {
+            existing.ig.state.deviceString = data.device.deviceString;
+            existing.ig.state.deviceId = data.device.deviceId;
+            existing.ig.state.uuid = data.device.uuid;
+            existing.ig.state.phoneId = data.device.phoneId;
+            if (data.device.adid) existing.ig.state.adid = data.device.adid;
+            if (data.device.build) existing.ig.state.build = data.device.build;
+            P.info(`✅ Dispositivo guardado restaurado desde archivo`);
+          }
+          
+          // Restaurar IP guardada si existe (para mantener consistencia)
+          if (data.clientIP && data.clientIP !== 'unknown') {
+            existing.ig.request.defaults.headers = {
+              ...existing.ig.request.defaults.headers,
+              'X-Forwarded-For': data.clientIP,
+              'X-Real-IP': data.clientIP,
+              'CF-Connecting-IP': data.clientIP
+            };
+            P.info(`📍 IP guardada restaurada: ${data.clientIP}`);
+          }
+          
+          // ⭐ IMPORTANTE: Verificar que la sesión sea válida antes de marcar como logged
+          try {
+            P.info(`🔍 Verificando validez de sesión restaurada...`);
+            const user = await existing.ig.account.currentUser();
+            existing.logged = true;
+            existing.username = data.username;
+            existing.igUserId = user.pk || data.igUserId;
+            P.info(`✅ Sesión restaurada desde archivo y VERIFICADA como válida para usuario ${userId}`);
+            P.info(`   Username: ${existing.username}, UserID: ${existing.igUserId}`);
+            return existing;
+          } catch (verifyError) {
+            // Si falla la verificación, la sesión expiró
+            P.warn(`⚠️ Sesión guardada inválida o expirada (${verifyError.message?.substring(0, 100)}), se requerirá nuevo login`);
+            P.warn(`   Esto es normal si las cookies expiraron o Instagram cerró la sesión`);
+            existing.logged = false;
+            existing.username = null;
+            existing.igUserId = null;
+            // No retornar aquí, dejar que continúe y cree nueva sesión si es necesario
+          }
         }
       }
     } catch (restoreError) {
@@ -3750,9 +4077,6 @@ export async function getOrCreateIGSession(userId) {
         const data = JSON.parse(fs.readFileSync(file, 'utf8'));
         if (data.cookieJar && data.username) {
           await service.ig.state.deserializeCookieJar(data.cookieJar);
-          service.logged = true;
-          service.username = data.username;
-          service.igUserId = data.igUserId;
           
           // Restaurar processedMessages y processedComments
           if (data.processedMessages && Array.isArray(data.processedMessages)) {
@@ -3769,7 +4093,45 @@ export async function getOrCreateIGSession(userId) {
             service.processedComments = new Set();
           }
           
-          P.info(`✅ Sesión cargada desde archivo para usuario ${userId}`);
+          // Restaurar dispositivo guardado si existe
+          if (data.device && data.device.deviceString) {
+            service.ig.state.deviceString = data.device.deviceString;
+            service.ig.state.deviceId = data.device.deviceId;
+            service.ig.state.uuid = data.device.uuid;
+            service.ig.state.phoneId = data.device.phoneId;
+            if (data.device.adid) service.ig.state.adid = data.device.adid;
+            if (data.device.build) service.ig.state.build = data.device.build;
+            P.info(`✅ Dispositivo guardado restaurado desde archivo`);
+          }
+          
+          // Restaurar IP guardada si existe (para mantener consistencia)
+          if (data.clientIP && data.clientIP !== 'unknown') {
+            service.ig.request.defaults.headers = {
+              ...service.ig.request.defaults.headers,
+              'X-Forwarded-For': data.clientIP,
+              'X-Real-IP': data.clientIP,
+              'CF-Connecting-IP': data.clientIP
+            };
+            P.info(`📍 IP guardada restaurada: ${data.clientIP}`);
+          }
+          
+          // ⭐ IMPORTANTE: Verificar que la sesión sea válida antes de marcar como logged
+          try {
+            P.info(`🔍 Verificando validez de sesión restaurada...`);
+            const user = await service.ig.account.currentUser();
+            service.logged = true;
+            service.username = data.username;
+            service.igUserId = user.pk || data.igUserId;
+            P.info(`✅ Sesión cargada desde archivo y VERIFICADA como válida para usuario ${userId}`);
+            P.info(`   Username: ${service.username}, UserID: ${service.igUserId}`);
+          } catch (verifyError) {
+            // Si falla la verificación, la sesión expiró
+            P.warn(`⚠️ Sesión guardada inválida o expirada (${verifyError.message?.substring(0, 100)}), se requerirá nuevo login`);
+            P.warn(`   Esto es normal si las cookies expiraron o Instagram cerró la sesión`);
+            service.logged = false;
+            service.username = null;
+            service.igUserId = null;
+          }
         }
       }
     } catch (loadError) {
@@ -3785,6 +4147,106 @@ export async function getOrCreateIGSession(userId) {
   initializing.delete(userId);
 
   return service;
+}
+
+/**
+ * Restaurar todas las sesiones guardadas al iniciar el servidor
+ * Esto ayuda a mantener las sesiones activas después de reinicios
+ */
+export async function restoreAllSavedSessions() {
+  try {
+    P.info(`🔄 Intentando restaurar todas las sesiones guardadas...`);
+    
+    if (!fs.existsSync(STATE_DIR)) {
+      P.info(`ℹ️ No hay directorio de sesiones, no hay sesiones que restaurar`);
+      return;
+    }
+    
+    const files = fs.readdirSync(STATE_DIR);
+    const sessionFiles = files.filter(f => f.endsWith('.json') && !f.includes('_challenge'));
+    
+    if (sessionFiles.length === 0) {
+      P.info(`ℹ️ No hay archivos de sesión guardados`);
+      return;
+    }
+    
+    P.info(`📁 Encontrados ${sessionFiles.length} archivo(s) de sesión`);
+    
+    for (const file of sessionFiles) {
+      try {
+        const userId = file.replace('.json', '');
+        const filePath = path.join(STATE_DIR, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        
+        if (!data.cookieJar || !data.username) {
+          P.info(`⚠️ Archivo ${file} no tiene cookies válidas, saltando`);
+          continue;
+        }
+        
+        // Solo restaurar si no existe ya en memoria
+        if (igSessions.has(userId)) {
+          P.info(`ℹ️ Sesión para usuario ${userId} ya existe en memoria, saltando restauración`);
+          continue;
+        }
+        
+        P.info(`📥 Restaurando sesión para usuario ${userId} (${data.username})...`);
+        
+        // Crear sesión y restaurarla
+        const service = new InstagramService(userId);
+        await service.ig.state.deserializeCookieJar(data.cookieJar);
+        
+        // Restaurar dispositivo
+        if (data.device && data.device.deviceString) {
+          service.ig.state.deviceString = data.device.deviceString;
+          service.ig.state.deviceId = data.device.deviceId;
+          service.ig.state.uuid = data.device.uuid;
+          service.ig.state.phoneId = data.device.phoneId;
+          if (data.device.adid) service.ig.state.adid = data.device.adid;
+          if (data.device.build) service.ig.state.build = data.device.build;
+        }
+        
+        // Restaurar IP
+        if (data.clientIP && data.clientIP !== 'unknown') {
+          service.ig.request.defaults.headers = {
+            ...service.ig.request.defaults.headers,
+            'X-Forwarded-For': data.clientIP,
+            'X-Real-IP': data.clientIP,
+            'CF-Connecting-IP': data.clientIP
+          };
+        }
+        
+        // Restaurar datos procesados
+        if (data.processedMessages && Array.isArray(data.processedMessages)) {
+          service.processedMessages = new Set(data.processedMessages);
+        }
+        if (data.processedComments && Array.isArray(data.processedComments)) {
+          service.processedComments = new Set(data.processedComments);
+        }
+        
+        // Verificar validez de sesión (pero no bloquear si falla)
+        try {
+          const user = await service.ig.account.currentUser();
+          service.logged = true;
+          service.username = data.username;
+          service.igUserId = user.pk || data.igUserId;
+          igSessions.set(userId, service);
+          P.info(`✅ Sesión restaurada exitosamente para ${data.username}`);
+        } catch (verifyError) {
+          P.warn(`⚠️ Sesión para ${data.username} expiró (${verifyError.message?.substring(0, 50)}), se requerirá nuevo login`);
+          // No agregar a igSessions si está expirada, pero tampoco bloquear
+        }
+        
+      } catch (fileError) {
+        P.warn(`⚠️ Error restaurando sesión desde ${file}: ${fileError.message}`);
+      }
+    }
+    
+    const restoredCount = Array.from(igSessions.values()).filter(s => s.logged).length;
+    P.info(`✅ Restauración completada: ${restoredCount} sesión(es) activa(s) de ${sessionFiles.length} archivo(s)`);
+    
+  } catch (error) {
+    P.error(`❌ Error restaurando sesiones guardadas: ${error.message}`);
+  }
 }
 
 /**

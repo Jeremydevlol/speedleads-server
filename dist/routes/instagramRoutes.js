@@ -2,6 +2,7 @@ import express from 'express';
 import { validateJwt } from '../config/jwt.js';
 import {
     igChallengeStatus,
+    igForceLogout,
     igGetMessages,
     igLogin,
     igLogout,
@@ -25,6 +26,8 @@ router.get('/diagnostic', (req, res) => {
     endpoints: [
       'GET /api/instagram/diagnostic',
       'POST /api/instagram/login',
+      'POST /api/instagram/logout',
+      'POST /api/instagram/force-logout (para errores 500)',
       'GET /api/instagram/status',
       'GET /api/instagram/dms',
       'GET /api/instagram/comments',
@@ -49,6 +52,14 @@ router.post('/login', igLogin);
  * @access  Private
  */
 router.post('/logout', igLogout);
+
+/**
+ * @route   POST /api/instagram/force-logout
+ * @desc    Forzar cierre de sesión y limpiar TODO el estado
+ *          Usar cuando hay errores 500 o sesiones corruptas
+ * @access  Private
+ */
+router.post('/force-logout', igForceLogout);
 
 /**
  * @route   POST /api/instagram/send
@@ -342,6 +353,21 @@ router.get('/dms', async (req, res) => {
   } catch (error) {
     console.error(`❌ [API] Error obteniendo DMs: ${error.message}`);
     console.error('Stack trace:', error.stack);
+    
+    // Detectar error 500 de Instagram y sugerir force-logout
+    if (error.message && error.message.includes('500')) {
+      console.log('🔴 [API] Error 500 detectado - Sesión posiblemente corrupta');
+      return res.status(500).json({
+        success: false,
+        error: 'La sesión de Instagram parece estar corrupta',
+        message: 'Instagram está rechazando las solicitudes. Usa "Forzar cierre de sesión" para limpiar y volver a conectar.',
+        action: 'force_logout',
+        actionLabel: 'Forzar cierre de sesión',
+        actionEndpoint: '/api/instagram/force-logout',
+        debug: 'Error 500 de Instagram API'
+      });
+    }
+    
     res.status(500).json({
       success: false,
       error: error.message,
