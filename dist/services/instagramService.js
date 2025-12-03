@@ -562,19 +562,97 @@ class InstagramService {
         };
       }
 
-      const { twoFactorIdentifier, username: igUsername, verificationMethod } = pending;
+      const { twoFactorIdentifier, username: igUsername, verificationMethod, availableMethods } = pending;
 
-      P.info(`🔐 Completando login 2FA para usuario ${igUsername} (método: ${verificationMethod === '1' ? 'SMS' : 'TOTP'})`);
+      P.info(`🔐 Completando login 2FA para usuario ${igUsername}`);
+      P.info(`   Métodos disponibles: ${availableMethods ? availableMethods.map(m => m.name).join(', ') : 'SMS/Email/App'}`);
+      
+      // ⭐ Limpiar y validar código 2FA (acepta códigos de app, SMS o email)
+      let formattedCode = String(code).trim();
+      
+      // Eliminar espacios, guiones y otros caracteres no numéricos
+      formattedCode = formattedCode.replace(/[\s\-_\.]/g, '');
+      
+      // Solo permitir números
+      formattedCode = formattedCode.replace(/\D/g, '');
+      
+      // Validar longitud mínima (códigos 2FA suelen ser de 6 dígitos)
+      if (formattedCode.length < 6) {
+        P.error(`❌ Código 2FA muy corto: ${formattedCode.length} dígitos (original: ${code})`);
+        return {
+          success: false,
+          status: '2FA_FAILED',
+          error: 'Código de verificación inválido',
+          message: `El código debe tener al menos 6 dígitos. Código recibido: ${code.length} caracteres.`
+        };
+      }
+      
+      // Para códigos más largos, tomar los últimos 6 dígitos (a veces vienen con prefijo)
+      if (formattedCode.length > 6) {
+        P.warn(`⚠️ Código 2FA más largo de lo esperado (${formattedCode.length} dígitos), usando últimos 6 dígitos`);
+        formattedCode = formattedCode.slice(-6);
+      }
+      
+      P.info(`📝 Código 2FA procesado: ${formattedCode.length} dígitos (original recibido: "${code}")`);
+      P.info(`   ✅ El código puede venir de: App Authenticator, SMS o Email`);
+      P.info(`📋 Parámetros para twoFactorLogin: username=${igUsername}, identifier=${twoFactorIdentifier.substring(0, 30)}..., method=${verificationMethod}`);
 
       // Completar login con código 2FA
-      const loggedUser = await this.ig.account.twoFactorLogin({
-        username: igUsername,
-        verificationCode: code,
-        twoFactorIdentifier,
-        verificationMethod, // '1' SMS, '0' TOTP
-        trustThisDevice: '1' // Confiar en este dispositivo
-      });
-
+      // ⭐ IMPORTANTE: Intentar primero con el método principal
+      // Si falla, intentaremos con otros métodos disponibles
+      let loggedUser;
+      let lastError;
+      
+      // Intentar con el método principal primero
+      try {
+        P.info(`🔄 Intentando login 2FA con método principal: ${verificationMethod === '1' ? 'SMS/Email' : 'TOTP (app)'}`);
+        loggedUser = await this.ig.account.twoFactorLogin({
+          username: igUsername,
+          verificationCode: formattedCode,
+          twoFactorIdentifier,
+          verificationMethod, // '1' SMS/Email, '0' TOTP
+          trustThisDevice: '1' // Confiar en este dispositivo
+        });
+        P.info(`✅ Login 2FA exitoso con método principal`);
+      } catch (primaryError) {
+        P.warn(`⚠️ Falló con método principal (${verificationMethod === '1' ? 'SMS/Email' : 'TOTP'}), error: ${primaryError.message}`);
+        lastError = primaryError;
+        
+        // Si hay métodos alternativos disponibles, intentar con ellos
+        if (availableMethods && availableMethods.length > 1) {
+          P.info(`🔄 Intentando con métodos alternativos disponibles...`);
+          
+          for (const altMethod of availableMethods) {
+            // Saltar el método que ya intentamos
+            if (altMethod.method === verificationMethod) continue;
+            
+            try {
+              P.info(`🔄 Intentando con método alternativo: ${altMethod.name} (método: ${altMethod.method})`);
+              loggedUser = await this.ig.account.twoFactorLogin({
+                username: igUsername,
+                verificationCode: formattedCode,
+                twoFactorIdentifier,
+                verificationMethod: altMethod.method,
+                trustThisDevice: '1'
+              });
+              P.info(`✅ Login 2FA exitoso con método alternativo: ${altMethod.name}`);
+              break; // Si funciona, salir del loop
+            } catch (altError) {
+              P.warn(`⚠️ Falló con método alternativo ${altMethod.name}: ${altError.message}`);
+              lastError = altError;
+              continue; // Intentar siguiente método
+            }
+          }
+        }
+        
+        // Si todos los métodos fallaron, lanzar el último error
+        if (!loggedUser) {
+          throw lastError;
+        }
+      }
+      
+      P.info(`✅ Login 2FA exitoso recibido de Instagram`);
+      
       // Si llegamos aquí, el login fue exitoso
       this.igUserId = loggedUser.pk;
       this.logged = true;
@@ -974,33 +1052,64 @@ class InstagramService {
             const igUsername = twoFactorInfo.username || username;
             const twoFactorIdentifier = twoFactorInfo.two_factor_identifier;
             const totpTwoFactorOn = twoFactorInfo.totp_two_factor_on === true;
+            const smsTwoFactorOn = twoFactorInfo.sms_two_factor_on === true;
+            const emailTwoFactorOn = twoFactorInfo.email_two_factor_on === true;
             
-            // Determinar método de verificación: '0' = TOTP (app), '1' = SMS
-            const verificationMethod = totpTwoFactorOn ? '0' : '1';
+            // ⭐ Detectar métodos disponibles
+            const availableMethods = [];
+            if (totpTwoFactorOn) availableMethods.push({ method: '0', name: 'TOTP (app)', via: 'app' });
+            if (smsTwoFactorOn) availableMethods.push({ method: '1', name: 'SMS', via: 'sms' });
+            if (emailTwoFactorOn) availableMethods.push({ method: '1', name: 'Email', via: 'email' }); // Email usa método '1' también
+            
+            // Determinar método principal: prioridad TOTP > SMS > Email
+            // Pero el código aceptará códigos de cualquiera de los métodos disponibles
+            let verificationMethod = '1'; // Default a SMS/Email
+            let via = 'sms';
+            if (totpTwoFactorOn) {
+              verificationMethod = '0';
+              via = 'app';
+            } else if (smsTwoFactorOn) {
+              verificationMethod = '1';
+              via = 'sms';
+            } else if (emailTwoFactorOn) {
+              verificationMethod = '1';
+              via = 'email';
+            }
             
             if (!twoFactorIdentifier) {
               P.error(`⚠️ 2FA requerido pero no se encontró two_factor_identifier`);
               throw new Error('2FA requerido pero información incompleta');
             }
             
-            // Guardar información de 2FA pendiente
+            // Guardar información de 2FA pendiente (incluyendo métodos disponibles)
             pending2FA.set(this.userId, {
               twoFactorIdentifier,
               username: igUsername,
               verificationMethod,
+              availableMethods, // Guardar todos los métodos disponibles
+              totpTwoFactorOn,
+              smsTwoFactorOn,
+              emailTwoFactorOn,
               createdAt: Date.now()
             });
             
             P.info(`💾 Información de 2FA guardada para usuario ${this.userId}`);
-            P.info(`   Método: ${verificationMethod === '1' ? 'SMS' : 'TOTP (app)'}`);
+            P.info(`   Métodos disponibles: ${availableMethods.map(m => m.name).join(', ') || 'SMS/Email'}`);
+            P.info(`   Método principal: ${availableMethods[0]?.name || via}`);
+            
+            // Crear mensaje que indique todos los métodos disponibles
+            const methodsText = [];
+            if (totpTwoFactorOn) methodsText.push('app de autenticación');
+            if (smsTwoFactorOn) methodsText.push('SMS');
+            if (emailTwoFactorOn) methodsText.push('email');
+            const viaText = methodsText.length > 0 ? methodsText.join(', ') : 'SMS o email';
             
             // Emitir evento por Socket.IO
             emitToUserIG(this.userId, 'instagram:2fa_required', {
               username: igUsername,
-              via: verificationMethod === '1' ? 'sms' : 'app',
-              message: verificationMethod === '1' 
-                ? 'Instagram requiere código de verificación enviado por SMS'
-                : 'Instagram requiere código de verificación de tu app de autenticación'
+              via: via,
+              availableMethods: availableMethods.map(m => m.via),
+              message: `Instagram requiere código de verificación. Puedes usar el código de: ${viaText}`
             });
             
             // Retornar respuesta indicando que se requiere 2FA
@@ -1010,10 +1119,9 @@ class InstagramService {
               status: '2FA_REQUIRED',
               username: igUsername,
               verification_method: verificationMethod,
-              via: verificationMethod === '1' ? 'sms' : 'app',
-              message: verificationMethod === '1'
-                ? 'Instagram requiere código de verificación enviado por SMS'
-                : 'Instagram requiere código de verificación de tu app de autenticación'
+              via: via,
+              availableMethods: availableMethods.map(m => m.via),
+              message: `Instagram requiere código de verificación. Puedes usar el código de: ${viaText}`
             };
           }
           

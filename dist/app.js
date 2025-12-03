@@ -2405,9 +2405,10 @@ app.post('/api/instagram/login', async (req, res) => {
         success: false,
         status: '2FA_REQUIRED',
         twoFA_required: true,
-        message: loginResult.message || 'Instagram requiere código de verificación',
+        message: loginResult.message || 'Instagram requiere código de verificación. Puedes usar el código de tu app authenticator, SMS o email.',
         username: loginResult.username || username,
         via: loginResult.via || 'sms',
+        availableMethods: loginResult.availableMethods || ['sms', 'email', 'app'],
         verification_method: loginResult.verification_method || '1'
       });
     }
