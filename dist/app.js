@@ -1082,10 +1082,324 @@ app.post('/api/instagram/import-leads', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════
+// FUNCIÓN PARA VERIFICAR SI UNA CUENTA NECESITA DESCANSO
+// ═══════════════════════════════════════════════════════════
+async function checkAccountHealth(supabase, igAccount) {
+  try {
+    if (!supabase || !igAccount) return { healthy: true };
+
+    // Usar RPC para consultar errores recientes (últimas 24h)
+    const { data, error } = await supabase.rpc('get_bulk_stats', { days_ago: 1 });
+    
+    if (error || !data) return { healthy: true };
+
+    // Filtrar por cuenta específica
+    const accountErrors = data.filter(d => 
+      d.instagram_account === igAccount && d.error_type
+    );
+
+    const totalErrors = accountErrors.length;
+    const blocked403 = accountErrors.filter(d => d.error_code === 403).length;
+    const rateLimited = accountErrors.filter(d => d.error_code === 429 || d.error_type?.includes('rate')).length;
+
+    // Reglas de salud de cuenta
+    if (blocked403 >= 5) {
+      return {
+        healthy: false,
+        reason: 'too_many_blocks',
+        message: `⚠️ La cuenta @${igAccount} ha sido bloqueada ${blocked403} veces en las últimas 24h. Debe descansar 24 horas antes de volver a enviar mensajes.`,
+        waitHours: 24,
+        errors: { total: totalErrors, blocked: blocked403, rateLimited }
+      };
+    }
+
+    if (rateLimited >= 10) {
+      return {
+        healthy: false,
+        reason: 'rate_limited',
+        message: `⚠️ La cuenta @${igAccount} ha alcanzado el límite de envíos ${rateLimited} veces. Espera al menos 6 horas.`,
+        waitHours: 6,
+        errors: { total: totalErrors, blocked: blocked403, rateLimited }
+      };
+    }
+
+    if (totalErrors >= 20) {
+      return {
+        healthy: false,
+        reason: 'too_many_errors',
+        message: `⚠️ La cuenta @${igAccount} tiene ${totalErrors} errores en 24h. Recomendamos esperar 12 horas.`,
+        waitHours: 12,
+        errors: { total: totalErrors, blocked: blocked403, rateLimited }
+      };
+    }
+
+    // Cuenta especial: tomasgraciaoficial - siempre intentar login
+    if (igAccount === 'tomasgraciaoficial') {
+      console.log('🌟 Cuenta especial tomasgraciaoficial detectada - forzando login si es necesario');
+    }
+
+    return { 
+      healthy: true, 
+      errors: { total: totalErrors, blocked: blocked403, rateLimited }
+    };
+
+  } catch (err) {
+    console.log('Error verificando salud de cuenta:', err.message);
+    return { healthy: true };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// FUNCIÓN HELPER PARA GUARDAR ESTADÍSTICAS DE ENVÍO MASIVO
+// ═══════════════════════════════════════════════════════════
+async function saveBulkSendStat(supabase, data) {
+  try {
+    // Verificar que supabase existe
+    if (!supabase) {
+      console.log('⚠️ Supabase no disponible para guardar estadística');
+      return { errorType: null, errorCode: null, status: data.success ? 'sent' : 'failed' };
+    }
+    
+    // Parsear el error para determinar tipo
+    let errorType = null;
+    let errorCode = null;
+    
+    if (data.error) {
+      const errorStr = data.error.toString().toLowerCase();
+      
+      if (errorStr.includes('403') || errorStr.includes('forbidden')) {
+        errorCode = '403';
+        if (errorStr.includes('new account') || errorStr.includes('cuenta nueva')) {
+          errorType = 'new_account_blocked';
+        } else if (errorStr.includes('spam')) {
+          errorType = 'spam_detected';
+        } else if (errorStr.includes('rate') || errorStr.includes('limit')) {
+          errorType = 'rate_limited';
+        } else {
+          errorType = 'dm_blocked';
+        }
+      } else if (errorStr.includes('429')) {
+        errorCode = '429';
+        errorType = 'rate_limited';
+      } else if (errorStr.includes('challenge') || errorStr.includes('checkpoint')) {
+        errorType = 'challenge_required';
+      } else if (errorStr.includes('not found') || errorStr.includes('no existe')) {
+        errorType = 'user_not_found';
+      } else if (errorStr.includes('session') || errorStr.includes('login')) {
+        errorType = 'session_expired';
+      } else {
+        errorType = 'unknown_error';
+      }
+    }
+    
+    const status = data.success ? 'sent' : (errorType === 'rate_limited' ? 'rate_limited' : (errorType === 'dm_blocked' || errorType === 'new_account_blocked' ? 'blocked' : 'failed'));
+    
+    // Usar nombres de columnas correctos de la tabla existente
+    const { error: insertError } = await supabase
+      .from('bulk_send_stats')
+      .insert({
+        sender_user_id: data.userId || null,
+        instagram_account: data.igAccount || 'unknown',
+        instagram_account_id: data.igAccountId || null,
+        target_username: data.recipientUsername,
+        target_user_id: data.recipientId || null,
+        error_code: errorCode ? parseInt(errorCode) : null,
+        error_type: errorType,
+        error_message: data.error || null,
+        message_content: data.message || null,
+        is_ai_generated: data.aiGenerated || false,
+        personality_id: data.personalityId || null,
+        campaign_id: data.campaignId || null,
+        bulk_send_type: data.bulkType || 'unknown',
+        metadata: data.metadata || null
+      });
+    
+    if (insertError) {
+      console.log(`⚠️ Error guardando estadística: ${insertError.message}`);
+    }
+    
+    return { errorType, errorCode, status };
+  } catch (err) {
+    console.log(`⚠️ Error en saveBulkSendStat: ${err.message}`);
+    return { errorType: 'save_error', errorCode: null, status: 'failed' };
+  }
+}
+
+// Endpoint para obtener estadísticas de envío masivo (ADMIN)
+app.get('/api/admin/bulk-send-stats', async (req, res) => {
+  try {
+    const { supabaseAdmin } = await import('./config/db.js');
+    const { userId, dateFrom, dateTo, status, limit = 100 } = req.query;
+    
+    let query = supabaseAdmin
+      .from('bulk_send_stats')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit));
+    
+    if (userId) query = query.eq('user_id', userId);
+    if (status) query = query.eq('status', status);
+    if (dateFrom) query = query.gte('created_at', dateFrom);
+    if (dateTo) query = query.lte('created_at', dateTo);
+    
+    const { data, error } = await query;
+    
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+    
+    // Calcular resumen
+    const summary = {
+      total: data.length,
+      sent: data.filter(d => d.status === 'sent').length,
+      failed: data.filter(d => d.status === 'failed').length,
+      blocked: data.filter(d => d.status === 'blocked').length,
+      rate_limited: data.filter(d => d.status === 'rate_limited').length,
+      success_rate: data.length > 0 ? Math.round(100 * data.filter(d => d.status === 'sent').length / data.length) : 0
+    };
+    
+    // Agrupar errores por tipo
+    const errorsByType = {};
+    data.filter(d => d.status !== 'sent').forEach(d => {
+      const type = d.error_type || 'unknown';
+      if (!errorsByType[type]) {
+        errorsByType[type] = { count: 0, sample: d.error_message, users: [] };
+      }
+      errorsByType[type].count++;
+      if (errorsByType[type].users.length < 10) {
+        errorsByType[type].users.push(d.recipient_username);
+      }
+    });
+    
+    res.json({
+      success: true,
+      summary,
+      errorsByType,
+      details: data
+    });
+    
+  } catch (error) {
+    console.error('Error obteniendo estadísticas:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Endpoint para obtener resumen rápido de estadísticas (ADMIN)
+app.get('/api/admin/bulk-send-summary', async (req, res) => {
+  try {
+    const { supabaseAdmin } = await import('./config/db.js');
+    const { userId, days = 7 } = req.query;
+
+    // Usar RPC con el cliente Supabase
+    const { data, error } = await supabaseAdmin.rpc('get_bulk_stats', { days_ago: parseInt(days) });
+
+    // Filtrar por userId si se especifica
+    let filteredData = data || [];
+    if (userId && filteredData.length > 0) {
+      filteredData = filteredData.filter(d => d.sender_user_id === userId);
+    }
+
+    if (error) {
+      console.log('Error accediendo a bulk_send_stats:', error.message);
+      return res.json({
+        success: true,
+        period: `${days} días`,
+        totals: { total: 0, sent: 0, failed: 0, blocked: 0, rate_limited: 0, success_rate: 0 },
+        byDay: {},
+        byAccount: {},
+        byType: {},
+        topErrors: [],
+        note: 'Error: ' + error.message
+      });
+    }
+    
+    // Determinar status basado en error_type (null = sent, valor = failed)
+    const getStatus = (d) => {
+      if (!d.error_type) return 'sent';
+      if (d.error_type.includes('rate') || d.error_code === 429) return 'rate_limited';
+      if (d.error_type.includes('block') || d.error_code === 403) return 'blocked';
+      return 'failed';
+    };
+
+    // Agrupar por día
+    const byDay = {};
+    filteredData.forEach(d => {
+      const day = d.created_at?.split('T')[0] || 'unknown';
+      if (!byDay[day]) {
+        byDay[day] = { sent: 0, failed: 0, blocked: 0, rate_limited: 0, total: 0 };
+      }
+      const status = getStatus(d);
+      byDay[day][status] = (byDay[day][status] || 0) + 1;
+      byDay[day].total++;
+    });
+
+    // Agrupar por cuenta (usar instagram_account)
+    const byAccount = {};
+    filteredData.forEach(d => {
+      const account = d.instagram_account || 'unknown';
+      if (!byAccount[account]) {
+        byAccount[account] = { sent: 0, failed: 0, blocked: 0, rate_limited: 0, total: 0 };
+      }
+      const status = getStatus(d);
+      byAccount[account][status] = (byAccount[account][status] || 0) + 1;
+      byAccount[account].total++;
+    });
+
+    // Top errores
+    const errorCounts = {};
+    filteredData.filter(d => d.error_type).forEach(d => {
+      errorCounts[d.error_type] = (errorCounts[d.error_type] || 0) + 1;
+    });
+
+    // Agrupar por tipo de envío (commenters, likers, followers, etc.)
+    const byType = {};
+    filteredData.forEach(d => {
+      const type = d.bulk_send_type || 'unknown';
+      if (!byType[type]) {
+        byType[type] = { sent: 0, failed: 0, total: 0 };
+      }
+      if (!d.error_type) byType[type].sent++;
+      else byType[type].failed++;
+      byType[type].total++;
+    });
+
+    // Calcular totales
+    const sent = filteredData.filter(d => !d.error_type).length;
+    const failed = filteredData.filter(d => d.error_type && !d.error_type.includes('rate') && !d.error_type.includes('block')).length;
+    const blocked = filteredData.filter(d => d.error_type?.includes('block') || d.error_code === 403).length;
+    const rateLimited = filteredData.filter(d => d.error_type?.includes('rate') || d.error_code === 429).length;
+
+    res.json({
+      success: true,
+      period: `${days} días`,
+      totals: {
+        total: filteredData.length,
+        sent: sent,
+        failed: failed,
+        blocked: blocked,
+        rate_limited: rateLimited,
+        success_rate: filteredData.length > 0 ? Math.round(100 * sent / filteredData.length) : 0
+      },
+      byDay,
+      byAccount,
+      byType,
+      topErrors: Object.entries(errorCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([type, count]) => ({ type, count }))
+    });
+    
+  } catch (error) {
+    console.error('Error obteniendo resumen:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Endpoint para envío masivo desde lista de usernames (ANTES de middlewares de autenticación)
 app.post('/api/instagram/bulk-send-list', async (req, res) => {
   console.log('📤📋 [BULK-LIST] Endpoint de envío masivo desde lista llamado');
-  const { usernames, message, delay = 2000 } = req.body;
+  const { usernames, message, delay = 20000 } = req.body;
 
   if (!usernames || !Array.isArray(usernames) || usernames.length === 0) {
     return res.status(400).json({
@@ -1275,7 +1589,7 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
     'content-type': req.headers['content-type'],
     'authorization': req.headers['authorization'] ? 'Bearer ***' : 'no presente'
   });
-  const { target_username, message, limit = 50, delay = 2000, userId, personalityId, send_as_audio = true } = req.body;
+  const { target_username, message, limit = 50, delay = 20000, userId, personalityId, send_as_audio = true } = req.body;
 
   if (!target_username || !message) {
     return res.status(400).json({
@@ -1468,9 +1782,20 @@ app.post('/api/instagram/bulk-send-followers', async (req, res) => {
     let failedCount = 0;
     let aiGeneratedCount = 0;
     const results = [];
+    const MAX_FAILURES = 5;
+    let stoppedEarly = false;
+    let stopReason = '';
 
     // Enviar mensajes a cada seguidor con delay
     for (let i = 0; i < followersResult.followers.length; i++) {
+      // Detener si hay demasiados fallos
+      if (failedCount >= MAX_FAILURES) {
+        stoppedEarly = true;
+        stopReason = `Envío detenido: ${failedCount} mensajes fallaron. La cuenta necesita descansar.`;
+        console.log(`🛑 [BULK-FOLLOWERS] ${stopReason}`);
+        break;
+      }
+      
       const follower = followersResult.followers[i];
       
       try {
@@ -1698,14 +2023,32 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
           }
         } else {
           failedCount++;
+          
+          // Guardar estadística del error
+          const statResult = await saveBulkSendStat(supabaseAdmin, {
+            userId: actualUserId,
+            igAccount: session?.username || 'unknown',
+            recipientUsername: follower.username,
+            recipientId: follower.pk || null,
+            message: finalMessage,
+            success: false,
+            error: sendResult.error,
+            bulkType: 'followers',
+            sourcePostUrl: null,
+            aiGenerated: aiGenerated,
+            personalityId: actualPersonalityId
+          });
+          
           results.push({
             username: follower.username,
             full_name: follower.full_name,
             status: 'failed',
             error: sendResult.error,
+            error_type: statResult.errorType,
+            error_code: statResult.errorCode,
             timestamp: new Date().toISOString()
           });
-          console.log(`❌ [BULK-FOLLOWERS] Error enviando a ${follower.username}: ${sendResult.error}`);
+          console.log(`❌ [BULK-FOLLOWERS] Error enviando a ${follower.username}: ${sendResult.error} (tipo: ${statResult.errorType})`);
           
           // Si el error indica que no hay sesión activa, detener el proceso
           if (sendResult.error && sendResult.error.includes('No hay sesión activa')) {
@@ -1716,14 +2059,29 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
         }
       } catch (error) {
         failedCount++;
+        
+        // Guardar estadística del error
+        const statResult = await saveBulkSendStat(supabaseAdmin, {
+          userId: actualUserId,
+          igAccount: session?.username || 'unknown',
+          recipientUsername: follower.username,
+          message: finalMessage,
+          success: false,
+          error: error.message,
+          bulkType: 'followers',
+          aiGenerated: aiGenerated,
+          personalityId: actualPersonalityId
+        });
+        
         results.push({
           username: follower.username,
           full_name: follower.full_name,
           status: 'failed',
           error: error.message,
+          error_type: statResult.errorType,
           timestamp: new Date().toISOString()
         });
-        console.log(`❌ [BULK-FOLLOWERS] Error enviando a ${follower.username}: ${error.message}`);
+        console.log(`❌ [BULK-FOLLOWERS] Error enviando a ${follower.username}: ${error.message} (tipo: ${statResult.errorType})`);
         
         // Si el error indica que no hay sesión activa, detener el proceso
         if (error.message && error.message.includes('No hay sesión activa')) {
@@ -1744,16 +2102,22 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
     console.log(`🎤 [BULK-FOLLOWERS] Modo de envío: ${send_as_audio ? 'AUDIO' : 'TEXTO'}`);
 
     res.json({
-      success: true,
-      message: `Envío masivo completado: ${sentCount} mensajes enviados (${aiGeneratedCount} generados con IA), ${failedCount} fallidos`,
+      success: !stoppedEarly,
+      message: stoppedEarly 
+        ? `⚠️ Envío detenido: ${sentCount} enviados, ${failedCount} fallaron. ${stopReason}`
+        : `Envío masivo completado: ${sentCount} mensajes enviados (${aiGeneratedCount} generados con IA), ${failedCount} fallidos`,
       target_username,
       sent_count: sentCount,
       ai_generated_count: aiGeneratedCount,
       failed_count: failedCount,
+      stopped_early: stoppedEarly,
+      stop_reason: stopReason || null,
       total_followers: followersResult.followers.length,
       personality_used: actualPersonalityId || null,
       personality_name: personalityData?.nombre || null,
       send_as_audio: send_as_audio,
+      delay_ms: delay,
+      delay_seconds: delay / 1000,
       results,
       account_info: followersResult.account_info
     });
@@ -1780,7 +2144,7 @@ app.post('/api/instagram/bulk-send-likers', async (req, res) => {
   console.log('═══════════════════════════════════════════════════════════');
   console.log('📤❤️ [BULK-LIKERS] Endpoint de envío masivo a likers llamado');
   
-  const { postUrl, message, limit = 50, delay = 2000, userId, personalityId } = req.body;
+  const { postUrl, message, limit = 50, delay = 20000, userId, personalityId } = req.body;
 
   if (!postUrl || !message) {
     return res.status(400).json({
@@ -1835,6 +2199,22 @@ app.post('/api/instagram/bulk-send-likers', async (req, res) => {
     const { supabaseAdmin } = await import('./config/db.js');
 
     const igService = await getOrCreateIGSession(actualUserId);
+    
+    // Verificar salud de la cuenta antes de enviar
+    const accountHealth = await checkAccountHealth(supabaseAdmin, igService.username);
+    if (!accountHealth.healthy) {
+      console.log(`⚠️ [BULK-LIKERS] Cuenta ${igService.username} necesita descanso: ${accountHealth.reason}`);
+      return res.json({
+        success: false,
+        error: accountHealth.message,
+        account_status: 'needs_rest',
+        wait_hours: accountHealth.waitHours,
+        errors_24h: accountHealth.errors,
+        sent_count: 0,
+        failed_count: 0
+      });
+    }
+    
     const likesResult = await igService.getLikesFromPost(postUrl, parseInt(limit));
 
     if (!likesResult.success || !likesResult.likes?.length) {
@@ -1865,8 +2245,19 @@ app.post('/api/instagram/bulk-send-likers', async (req, res) => {
 
     let sentCount = 0, failedCount = 0, aiGeneratedCount = 0;
     const results = [];
+    const MAX_FAILURES = 5;
+    let stoppedEarly = false;
+    let stopReason = '';
 
     for (let i = 0; i < likesResult.likes.length; i++) {
+      // Detener si hay demasiados fallos
+      if (failedCount >= MAX_FAILURES) {
+        stoppedEarly = true;
+        stopReason = `Envío detenido: ${failedCount} mensajes fallaron. La cuenta necesita descansar.`;
+        console.log(`🛑 [BULK-LIKERS] ${stopReason}`);
+        break;
+      }
+      
       const liker = likesResult.likes[i];
       console.log(`📨 [${i + 1}/${likesResult.likes.length}] @${liker.username}`);
 
@@ -1955,11 +2346,17 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
     }
 
     res.json({
-      success: true,
-      message: `${sentCount} enviados (${aiGeneratedCount} con IA), ${failedCount} fallidos`,
+      success: !stoppedEarly,
+      message: stoppedEarly 
+        ? `⚠️ Envío detenido: ${sentCount} enviados, ${failedCount} fallaron. ${stopReason}`
+        : `${sentCount} enviados (${aiGeneratedCount} con IA), ${failedCount} fallidos`,
       sent_count: sentCount,
       ai_generated_count: aiGeneratedCount,
       failed_count: failedCount,
+      stopped_early: stoppedEarly,
+      stop_reason: stopReason || null,
+      delay_ms: delay,
+      delay_seconds: delay / 1000,
       results
     });
 
@@ -1974,7 +2371,7 @@ app.post('/api/instagram/bulk-send-commenters', async (req, res) => {
   console.log('═══════════════════════════════════════════════════════════');
   console.log('📤💬 [BULK-COMMENTERS] Endpoint de envío masivo a commenters llamado');
   
-  const { postUrl, message, limit = 50, delay = 2000, userId, personalityId } = req.body;
+  const { postUrl, message, limit = 50, delay = 20000, userId, personalityId } = req.body;
 
   if (!postUrl || !message) {
     return res.status(400).json({
@@ -2029,6 +2426,22 @@ app.post('/api/instagram/bulk-send-commenters', async (req, res) => {
     const { supabaseAdmin } = await import('./config/db.js');
 
     const igService = await getOrCreateIGSession(actualUserId);
+    
+    // Verificar salud de la cuenta antes de enviar
+    const accountHealth = await checkAccountHealth(supabaseAdmin, igService.username);
+    if (!accountHealth.healthy) {
+      console.log(`⚠️ [BULK-COMMENTERS] Cuenta ${igService.username} necesita descanso: ${accountHealth.reason}`);
+      return res.json({
+        success: false,
+        error: accountHealth.message,
+        account_status: 'needs_rest',
+        wait_hours: accountHealth.waitHours,
+        errors_24h: accountHealth.errors,
+        sent_count: 0,
+        failed_count: 0
+      });
+    }
+    
     const commentsResult = await igService.getCommentsFromPost(postUrl, parseInt(limit));
 
     if (!commentsResult.success || !commentsResult.comments?.length) {
@@ -2059,8 +2472,19 @@ app.post('/api/instagram/bulk-send-commenters', async (req, res) => {
 
     let sentCount = 0, failedCount = 0, aiGeneratedCount = 0;
     const results = [];
+    const MAX_FAILURES = 5;
+    let stoppedEarly = false;
+    let stopReason = '';
 
     for (let i = 0; i < commentsResult.comments.length; i++) {
+      // Detener si hay demasiados fallos
+      if (failedCount >= MAX_FAILURES) {
+        stoppedEarly = true;
+        stopReason = `Envío detenido: ${failedCount} mensajes fallaron. La cuenta necesita descansar.`;
+        console.log(`🛑 [BULK-COMMENTERS] ${stopReason}`);
+        break;
+      }
+      
       const commenter = commentsResult.comments[i];
       console.log(`📨 [${i + 1}/${commentsResult.comments.length}] @${commenter.username}`);
 
@@ -2123,11 +2547,26 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
         }
 
         const sendResult = await igSendMessage(commenter.username, finalMessage, actualUserId);
-        
+
+        // Guardar estadística en base de datos
+        const statResult = await saveBulkSendStat(supabaseAdmin, {
+          userId: actualUserId,
+          igAccount: igService.username || 'unknown',
+          recipientUsername: commenter.username,
+          recipientId: commenter.pk || null,
+          message: finalMessage,
+          success: sendResult.success,
+          error: sendResult.error || null,
+          bulkType: 'commenters',
+          sourcePostUrl: postUrl,
+          aiGenerated: aiGenerated,
+          personalityId: actualPersonalityId
+        });
+
         if (sendResult.success) {
           sentCount++;
           results.push({ username: commenter.username, status: 'sent', ai_generated: aiGenerated });
-          
+
           // Guardar en historial
           if (!igService.conversationHistory) igService.conversationHistory = new Map();
           let history = igService.conversationHistory.get(commenter.username) || [];
@@ -2135,11 +2574,32 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
           igService.conversationHistory.set(commenter.username, history.slice(-50));
         } else {
           failedCount++;
-          results.push({ username: commenter.username, status: 'failed', error: sendResult.error });
+          results.push({ 
+            username: commenter.username, 
+            status: 'failed', 
+            error: sendResult.error,
+            error_type: statResult.errorType,
+            error_code: statResult.errorCode
+          });
           if (sendResult.error?.includes('No hay sesión activa')) break;
         }
       } catch (error) {
         failedCount++;
+        
+        // Guardar estadística del error
+        await saveBulkSendStat(supabaseAdmin, {
+          userId: actualUserId,
+          igAccount: igService?.username || 'unknown',
+          recipientUsername: commenter.username,
+          message: finalMessage,
+          success: false,
+          error: error.message,
+          bulkType: 'commenters',
+          sourcePostUrl: postUrl,
+          aiGenerated: aiGenerated,
+          personalityId: actualPersonalityId
+        });
+        
         results.push({ username: commenter.username, status: 'failed', error: error.message });
         if (error.message?.includes('No hay sesión activa')) break;
       }
@@ -2150,11 +2610,17 @@ Genera SOLO el mensaje personalizado final (sin explicaciones, sin prefijos, sin
     }
 
     res.json({
-      success: true,
-      message: `${sentCount} enviados (${aiGeneratedCount} con IA), ${failedCount} fallidos`,
+      success: !stoppedEarly,
+      message: stoppedEarly 
+        ? `⚠️ Envío detenido: ${sentCount} enviados, ${failedCount} fallaron. ${stopReason}`
+        : `${sentCount} enviados (${aiGeneratedCount} con IA), ${failedCount} fallidos`,
       sent_count: sentCount,
       ai_generated_count: aiGeneratedCount,
       failed_count: failedCount,
+      stopped_early: stoppedEarly,
+      stop_reason: stopReason || null,
+      delay_ms: delay,
+      delay_seconds: delay / 1000,
       results
     });
 
