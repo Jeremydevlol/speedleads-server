@@ -15,7 +15,42 @@ import { saveIncomingMessage } from '../controllers/whatsappController.js';
 import { analyzeImageBufferWithVision, analyzePdfBufferWithVision } from '../services/googleVisionService.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
-const limit = pLimit(5);
+const limit = pLimit(8);
+const CONTACT_PROGRESS_EVERY = 10;
+const PROFILE_PICTURE_TIMEOUT_MS = 5000;
+const SYNC_CONTACT_TIMEOUT_MS = 12000; // por contacto (Supabase puede tardar)
+const STORE_FETCH_TIMEOUT_MS = 8000;   // store.chats.all() / toJSON()
+
+function withTimeout(promise, ms, fallback = null) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
+  ]).catch(() => fallback);
+}
+
+/** Ejecuta syncContactWithRetry con timeout; si se excede, no bloquea el lote. */
+async function syncContactWithTimeout(sock, userId, jid, newName, newPhotoUrl, waUserId) {
+  await withTimeout(
+    syncContactWithRetry(sock, userId, jid, newName, newPhotoUrl, waUserId),
+    SYNC_CONTACT_TIMEOUT_MS,
+    undefined
+  );
+}
+
+/** Resuelve userId desde token JWT; si falla verify y FORCE_LOGIN=true, usa decode (p. ej. token Supabase). */
+function getUserIdFromSocketToken(token) {
+  if (!token) return null;
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    return payload.userId || payload.sub || null;
+  } catch (err) {
+    if (process.env.FORCE_LOGIN === 'true') {
+      const decoded = jwt.decode(token);
+      if (decoded && (decoded.userId || decoded.sub)) return decoded.userId || decoded.sub;
+    }
+    return null;
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -54,8 +89,10 @@ export function getCachedQr(userId) {
 export function emitToUser(userId, event, data) {
   if (globalIO) {
     globalIO.to(userId).emit(event, data);
-    console.log(`📡 [emitToUser] Evento "${event}" emitido a usuario ${userId}`, data ? `con datos: ${JSON.stringify(data).substring(0, 100)}` : 'sin datos');
-  } else {
+    if (event !== 'contact-progress' || process.env.VERBOSE_WHATSAPP === '1') {
+      console.log(`📡 [emitToUser] Evento "${event}" emitido a usuario ${userId}`, data ? `con datos: ${JSON.stringify(data).substring(0, 80)}` : 'sin datos');
+    }
+  } else if (event !== 'contact-progress') {
     console.warn(`⚠️ [emitToUser] globalIO no configurado, no se puede emitir evento "${event}" a usuario ${userId}`);
   }
 }
@@ -223,7 +260,7 @@ export async function startSession(userId) {
       version,
       auth: state,
       logger: P,
-      browser: ['Uniclick CRM', 'Chrome', '10.15.7'], // Personalizar el navegador que se muestra
+      browser: ['SpeedLeads CRM', 'Chrome', '10.15.7'], // Personalizar el navegador que se muestra
       defaultQueryTimeoutMs: 60000,
       printQRInTerminal: false,
       markOnlineOnConnect: true,
@@ -275,15 +312,15 @@ export async function startSession(userId) {
         console.log(`📡 [connection.open] Listener messages.upsert está activo para userId=${userId}`);
         emitToUser(userId, "session-ready", true);
         
-        // Obtener y guardar la foto de perfil del usuario de WhatsApp
+        // Obtener y guardar la foto de perfil del usuario de WhatsApp (con timeout)
         if (sock.user && sock.user.id) {
           try {
-            const userProfilePicture = await sock.profilePictureUrl(sock.user.id, 'image');
-            console.log(`✅ Foto de perfil de WhatsApp obtenida para userId=${userId}`);
-            
-            // Guardar en profilesusers
-            try {
-              await pool.query(
+            const userProfilePicture = await withTimeout(sock.profilePictureUrl(sock.user.id, 'image'), PROFILE_PICTURE_TIMEOUT_MS, null);
+            if (userProfilePicture) {
+              console.log(`✅ Foto de perfil de WhatsApp obtenida para userId=${userId}`);
+              // Guardar en profilesusers
+              try {
+                await pool.query(
                 `INSERT INTO public.profilesusers (user_id, avatar_url, username)
                  VALUES ($1, $2, COALESCE((SELECT username FROM profilesusers WHERE user_id = $1), 'user'))
                  ON CONFLICT (user_id) DO UPDATE
@@ -308,6 +345,7 @@ export async function startSession(userId) {
             } catch (authError) {
               console.error(`⚠️ Error actualizando user_metadata: ${authError.message}`);
             }
+            }
           } catch (profileError) {
             console.warn(`⚠️ No se pudo obtener foto de perfil de WhatsApp para userId=${userId}: ${profileError.message}`);
           }
@@ -327,38 +365,33 @@ export async function startSession(userId) {
             const waUserId = sock.user.id.split('@')[0].split(':')[0];
             console.log(`🔍 [Carga manual] Intentando obtener chats para userId=${userId}, waUserId=${waUserId}, sock.user.id=${sock.user.id}`);
             
-            // Intentar obtener chats desde el store si está disponible
+            // Intentar obtener chats desde el store si está disponible (con timeout para no colgar)
             let chats = [];
             try {
-              // Método 1: Intentar usar el store de baileys
               if (sock.store && typeof sock.store.chats === 'object') {
                 try {
-                  // Intentar obtener todos los chats usando el método all() del store
                   if (typeof sock.store.chats.all === 'function') {
-                    const chatKeys = await sock.store.chats.all();
-                    chats = chatKeys.map(chat => {
+                    const raw = await withTimeout(sock.store.chats.all(), STORE_FETCH_TIMEOUT_MS, []);
+                    chats = (Array.isArray(raw) ? raw : []).map(chat => {
                       const chatId = typeof chat.id === 'string' ? chat.id : (chat.id || '');
                       return {
                         id: chatId,
                         name: chat.name || chat.subject || chat.notify || '',
                         notify: chat.notify || ''
                       };
-                    }).filter(chat => chat.id); // Filtrar chats sin ID
-                    console.log(`📱 [Carga manual] Chats obtenidos desde store.all(): ${chats.length}`);
+                    }).filter(chat => chat.id);
+                    if (chats.length) console.log(`📱 [Carga manual] store.all(): ${chats.length}`);
                   } else if (typeof sock.store.chats.toJSON === 'function') {
-                    // Alternativa: usar toJSON si está disponible
-                    const chatsObj = await sock.store.chats.toJSON();
-                    chats = Object.entries(chatsObj).map(([id, chat]) => ({
+                    const chatsObj = await withTimeout(sock.store.chats.toJSON(), STORE_FETCH_TIMEOUT_MS, {});
+                    chats = Object.entries(chatsObj || {}).map(([id, chat]) => ({
                       id: id,
-                      name: chat.name || chat.subject || chat.notify || '',
-                      notify: chat.notify || ''
+                      name: (chat && chat.name) || chat?.subject || chat?.notify || '',
+                      notify: (chat && chat.notify) || ''
                     }));
-                    console.log(`📱 [Carga manual] Chats obtenidos desde store.toJSON(): ${chats.length}`);
-                  } else {
-                    console.log(`⚠️ [Carga manual] store.chats existe pero no tiene métodos disponibles`);
+                    if (chats.length) console.log(`📱 [Carga manual] store.toJSON(): ${chats.length}`);
                   }
                 } catch (storeError) {
-                  console.error(`❌ [Carga manual] Error accediendo al store:`, storeError.message);
+                  if (process.env.VERBOSE_WHATSAPP === '1') console.error(`❌ [Carga manual] store:`, storeError.message);
                 }
               }
               
@@ -377,39 +410,27 @@ export async function startSession(userId) {
             }
             
             if (chats && chats.length > 0) {
-              let processedContacts = 0;
               const totalContacts = chats.length;
-              
+              const progress = { count: 0 };
               const contactPromises = chats.map(chat => limit(async () => {
                 const jid = typeof chat.id === 'string' ? chat.id : (chat.id?.user || chat.id);
-                
-                if (!jid) return;
-                
-                // Excluir grupos y contactos especiales
-                if (jid.includes('@g.us') || jid === 'status@broadcast' || jid.split('@')[0] === '0') {
-                  return;
-                }
-                
+                if (!jid || jid.includes('@g.us') || jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
                 const contactName = chat.name || chat.notify || jid.split('@')[0];
                 let contactPhotoUrl = null;
-                
                 try {
-                  contactPhotoUrl = await sock.profilePictureUrl(jid);
+                  contactPhotoUrl = await withTimeout(sock.profilePictureUrl(jid), PROFILE_PICTURE_TIMEOUT_MS, null);
                 } catch {
                   contactPhotoUrl = null;
                 }
-                
-                console.log(`🔄 [Carga manual] Procesando contacto: userId=${userId}, jid=${jid}, name=${contactName}`);
-                await syncContactWithRetry(sock, userId, jid, contactName, contactPhotoUrl, waUserId);
-                processedContacts++;
-                
-                if (processedContacts % 10 === 0 || processedContacts === totalContacts) {
-                  console.log(`📊 [Carga manual] Progreso para userId=${userId}: ${processedContacts}/${totalContacts} contactos procesados`);
+                await syncContactWithTimeout(sock, userId, jid, contactName, contactPhotoUrl, waUserId);
+                progress.count++;
+                if (progress.count % CONTACT_PROGRESS_EVERY === 0 || progress.count === totalContacts) {
+                  emitToUser(userId, 'contact-progress', { total: totalContacts, processed: progress.count, info: contactName, capitalText: 'Sincronizando contactos', text: `${progress.count}/${totalContacts}` });
+                  if (process.env.VERBOSE_WHATSAPP === '1') console.log(`📊 [Carga manual] ${progress.count}/${totalContacts}`);
                 }
               }));
-              
-              await Promise.all(contactPromises);
-              console.log(`✅ [Carga manual] ${processedContacts} contactos sincronizados desde chats para userId=${userId}`);
+              await Promise.allSettled(contactPromises);
+              console.log(`✅ [Carga manual] ${progress.count} contactos sincronizados para userId=${userId}`);
               emitToUser(userId, 'chats-updated');
             } else {
               console.log(`⚠️ [Carga manual] No se encontraron chats para sincronizar para userId=${userId}`);
@@ -685,115 +706,85 @@ export async function startSession(userId) {
       }
     });
     sock.ev.on('contacts.upsert', async (contacts) => {
-      console.log(`🔍 Debug contacts.upsert: Recibidos ${contacts.length} contactos`);
-      
+      if (process.env.VERBOSE_WHATSAPP === '1') console.log(`🔍 contacts.upsert: ${contacts.length} contactos`);
       if (!sock.user || !sock.user.id) {
         console.error('❌ No se puede obtener wa_user_id: sock.user no está disponible');
         return;
       }
-      
       const waUserId = sock.user.id.split('@')[0].split(':')[0];
-      console.log(`🔍 Debug contacts.upsert: waUserId=${waUserId}, sock.user.id=${sock.user.id}`);
-      
-      let processedContacts = 0;
       const totalContacts = contacts.length;
+      const progress = { count: 0 };
       const contactPromises = contacts.map(contact => limit(async () => {
         const jid = contact.id;
-        const cacheKey = `${userId}:contact:${jid}`;
-        if (jid === 'status@broadcast' || jid.split('@')[0] === '0') {
-          console.log(`Contacto excluido: ${jid}`);
-          return;
-        }
-
-
+        if (jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
         const localPart = jid.split('@')[0];
-        // 🔍 DEBUG: Mostrar todos los datos del contacto para depuración
-        console.log(`🔍 [DEBUG] Contacto ${jid}:`, {
-          notify: contact.notify,
-          name: contact.name,
-          verifiedName: contact.verifiedName,
-          pushname: contact.pushname,
-          allFields: Object.keys(contact)
-        });
-        // Priorizar notify (nombre guardado en agenda) sobre name (nombre de perfil)
         const newName = contact.notify || contact.name || contact.verifiedName || contact.pushname || localPart;
         let newPhotoUrl = null;
         try {
-          newPhotoUrl = await sock.profilePictureUrl(jid);
-        } catch (err) {
+          newPhotoUrl = await withTimeout(sock.profilePictureUrl(jid), PROFILE_PICTURE_TIMEOUT_MS, null);
+        } catch {
           newPhotoUrl = null;
-          console.error(`No se pudo obtener foto de perfil para ${jid}:`, err);
         }
-
-        await syncContactWithRetry(sock, userId, jid, newName, newPhotoUrl, waUserId);
-        processedContacts = processedContacts + 1
-        emitToUser(userId, 'contact-progress', {
-          total: totalContacts,
-          processed: processedContacts,
-          avatarUrl: newPhotoUrl,
-          contactName: newName
-        });
+        await syncContactWithTimeout(sock, userId, jid, newName, newPhotoUrl, waUserId);
+        progress.count++;
+        if (progress.count % CONTACT_PROGRESS_EVERY === 0 || progress.count === totalContacts) {
+          emitToUser(userId, 'contact-progress', {
+            total: totalContacts,
+            processed: progress.count,
+            avatarUrl: newPhotoUrl,
+            info: newName,
+            capitalText: 'Sincronizando contactos',
+            text: `${progress.count}/${totalContacts}`
+          });
+        }
       }));
-
-      await Promise.all(contactPromises);
+      await Promise.allSettled(contactPromises);
       contactsSynced = true;
       emitToUser(userId, 'chats-updated');
     });
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
       emitToUser(userId, 'open-dialog');
-      
-      if (!sock.user || !sock.user.id) {
-        console.error('❌ No se puede obtener wa_user_id en messaging-history.set: sock.user no está disponible');
-        return;
-      }
-      
-      const waUserId = sock.user.id.split('@')[0].split(':')[0];
-      console.log(`🔍 Debug messaging-history.set: waUserId=${waUserId}`);
-      if (contacts && contacts.length) {
-        let processedContacts = 0;
-        const totalContacts = contacts.length;
-        const contactPromises = contacts.map(contact => limit(async () => {
-          const jid = contact.id;
-          if (jid === 'status@broadcast' || jid.split('@')[0] === '0') {
-            console.log(`Contacto excluido: ${jid}`);
-            return;
-          }
-          const cacheKey = `${userId}:contact:${jid}`;
-          const localPart2 = jid.split('@')[0];
-          // 🔍 DEBUG: Mostrar todos los datos del contacto para depuración
-          console.log(`🔍 [DEBUG history] Contacto ${jid}:`, {
-            notify: contact.notify,
-            name: contact.name,
-            verifiedName: contact.verifiedName,
-            pushname: contact.pushname,
-            allFields: Object.keys(contact)
-          });
-          // Priorizar notify (nombre guardado en agenda) sobre name (nombre de perfil)
-          const newName = contact.notify || contact.name || contact.verifiedName || contact.pushname || localPart2;
-          let newPhotoUrl = null;
-          try {
-            newPhotoUrl = await sock.profilePictureUrl(jid);
-          } catch {
-            newPhotoUrl = null;
-          }
-          processedContacts = processedContacts + 1
-          await syncContactWithRetry(sock, userId, jid, newName, newPhotoUrl, waUserId);
-          emitToUser(userId, 'contact-progress', {
-            total: totalContacts,
-            processed: processedContacts,
-            avatarUrl: newPhotoUrl,
-            info: newName,
-            capitalText: "Sincronizando contactos",
-            text: "Procesando contactos..."
-          });
-        }));
-
-        await Promise.all(contactPromises);
-        contactsSynced = true;
-        emitToUser(userId, 'chats-updated');
+      try {
+        if (!sock.user || !sock.user.id) {
+          console.error('❌ messaging-history.set: sock.user no disponible');
+          return;
+        }
+        const waUserId = sock.user.id.split('@')[0].split(':')[0];
+        if (contacts && contacts.length) {
+          const totalContacts = contacts.length;
+          const progress = { count: 0 };
+          const contactPromises = contacts.map(contact => limit(async () => {
+            const jid = contact.id;
+            if (jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
+            const localPart2 = jid.split('@')[0];
+            const newName = contact.notify || contact.name || contact.verifiedName || contact.pushname || localPart2;
+            let newPhotoUrl = null;
+            try {
+              newPhotoUrl = await withTimeout(sock.profilePictureUrl(jid), PROFILE_PICTURE_TIMEOUT_MS, null);
+            } catch {
+              newPhotoUrl = null;
+            }
+            await syncContactWithTimeout(sock, userId, jid, newName, newPhotoUrl, waUserId);
+            progress.count++;
+            if (progress.count % CONTACT_PROGRESS_EVERY === 0 || progress.count === totalContacts) {
+              emitToUser(userId, 'contact-progress', {
+                total: totalContacts,
+                processed: progress.count,
+                avatarUrl: newPhotoUrl,
+                info: newName,
+                capitalText: 'Sincronizando contactos',
+                text: `${progress.count}/${totalContacts}`
+              });
+            }
+          }));
+          await Promise.allSettled(contactPromises);
+          contactsSynced = true;
+          emitToUser(userId, 'chats-updated');
+        } else {
+          if (process.env.VERBOSE_WHATSAPP === '1') console.log('messaging-history.set: sin contactos');
+        }
+      } finally {
         emitToUser(userId, 'close-dialog');
-      } else {
-        console.log("No se recibieron contactos durante la sincronización.");
       }
 
       if (!contactsSynced) {
@@ -873,7 +864,7 @@ export async function startSession(userId) {
         const localPart3 = jid.split('@')[0];
         const newName = contact.notify || contact.name || localPart3;
         if (jid === 'status@broadcast' || jid.split('@')[0] === '0') {
-          console.log(`Contacto excluido: ${jid}`);
+          if (process.env.VERBOSE_WHATSAPP === '1') console.log(`Contacto excluido: ${jid}`);
           return;
         }
         // Solo si WhatsApp nos envía un name explícito, lanzamos el UPDATE
@@ -888,13 +879,13 @@ export async function startSession(userId) {
 
             if (error) {
               console.error(`Error actualizando nombre de contacto ${jid}:`, error);
-            } else if (data && data.length > 0) {
+            } else if (data && data.length > 0 && process.env.VERBOSE_WHATSAPP === '1') {
               console.log(`Contacto ${jid} renombrado a "${newName}"`);
             }
           } catch (dbErr) {
             console.error(`Error actualizando nombre de contacto ${jid}:`, dbErr);
           }
-        } else {
+        } else if (process.env.VERBOSE_WHATSAPP === '1') {
           console.log(`No hay nuevo nombre para ${jid}, no se actualiza.`);
         }
 
@@ -1144,25 +1135,14 @@ export function configureSocket(io) {
   configureIO(io);
   
   io.on('connection', (socket) => {
-    socket.on('join', async ({ token }) => {
-      let uid
-      if (token) {
-        try {
-          const payload = jwt.verify(token, JWT_SECRET)
-          uid = payload.userId || payload.sub
-        } catch (err) {
-          console.error('Error verificando token:', err);
-          socket.emit('error-message', 'Token inválido')
-          return;
-        }
-      }
-      
+    socket.on('join', async ({ token } = {}) => {
+      const authToken = token || socket.handshake?.auth?.token;
+      const uid = getUserIdFromSocketToken(authToken);
       if (!uid) {
-        socket.emit('error-message', 'No se pudo identificar al usuario')
+        socket.emit('error-message', 'No se pudo identificar al usuario');
         return;
       }
-      
-      socket.join(uid)
+      socket.join(uid);
       try {
         console.log(`Starting session for user ${uid}`);
         await startSession(uid)
@@ -1173,10 +1153,12 @@ export function configureSocket(io) {
     })
     
     socket.on('send-message', async ({ token, conversationId, textContent, attachments }) => {
-      let userId;
+      const userId = getUserIdFromSocketToken(token || socket.handshake?.auth?.token);
+      if (!userId) {
+        socket.emit('error', 'Token inválido');
+        return;
+      }
       try {
-        const payload = jwt.verify(token, JWT_SECRET);
-        userId = payload.userId || payload.sub;
         
         // Importar y verificar rate limiting
         const { checkRateLimit } = await import('../utils/rateLimit.js');
@@ -1238,16 +1220,12 @@ export function configureSocket(io) {
 
     // Nuevo evento para envío directo a número
     socket.on('send-to-number', async ({ token, to, text, attachments, defaultCountry }) => {
-      let userId;
+      const userId = getUserIdFromSocketToken(token || socket.handshake?.auth?.token);
+      if (!userId) {
+        socket.emit('error', 'Token inválido o usuario no identificado');
+        return;
+      }
       try {
-        const payload = jwt.verify(token, JWT_SECRET);
-        userId = payload.userId || payload.sub;
-        
-        if (!userId) {
-          socket.emit('error', 'Token inválido o usuario no identificado');
-          return;
-        }
-
         const sock = sessions.get(userId);
         if (!sock) {
           socket.emit('error', 'WhatsApp no está conectado. Por favor, escanea el código QR.');
@@ -1288,16 +1266,12 @@ export function configureSocket(io) {
 
     // Nuevo evento para envío de mensaje generado por IA
     socket.on('send-ai-message', async ({ token, to, prompt, defaultCountry, personalityId }) => {
-      let userId;
+      const userId = getUserIdFromSocketToken(token || socket.handshake?.auth?.token);
+      if (!userId) {
+        socket.emit('error', 'Token inválido o usuario no identificado');
+        return;
+      }
       try {
-        const payload = jwt.verify(token, JWT_SECRET);
-        userId = payload.userId || payload.sub;
-        
-        if (!userId) {
-          socket.emit('error', 'Token inválido o usuario no identificado');
-          return;
-        }
-
         const sock = sessions.get(userId);
         if (!sock || !sock.user) {
           socket.emit('error', 'WhatsApp no está conectado. Por favor, escanea el código QR.');
@@ -1338,20 +1312,19 @@ export function configureSocket(io) {
       }
     });
     
-    socket.on('get-qr', async ({ token }) => {
-      let userId;
+    socket.on('get-qr', async (payload = {}) => {
+      const token = payload?.token || socket.handshake?.auth?.token;
+      const userId = getUserIdFromSocketToken(token);
+      if (!userId) {
+        socket.emit('error', 'Token no proporcionado o inválido');
+        return;
+      }
       try {
-        const payload = jwt.verify(token, JWT_SECRET);
-        userId = payload.userId || payload.sub;
-        
-        // Intentar obtener el QR
         const qr = getCachedQr(userId);
         if (qr) {
           socket.emit('qr-code', qr);
         } else {
-          // Iniciar sesión para generar nuevo QR
           await startSession(userId);
-          // El QR se emitirá automáticamente cuando esté disponible
         }
       } catch (error) {
         console.error('Error obteniendo QR:', error);
@@ -1359,29 +1332,21 @@ export function configureSocket(io) {
       }
     });
 
-    socket.on('get-contacts', async ({ token }) => {
-      let userId;
+    socket.on('get-contacts', async (payload = {}) => {
+      const token = payload?.token || socket.handshake?.auth?.token;
+      const userId = getUserIdFromSocketToken(token);
+      if (!userId) {
+        socket.emit('contacts-loaded', { success: false, message: 'Token no proporcionado o inválido', contacts: [], total: 0 });
+        return;
+      }
+      emitToUser(userId, 'contacts-loading', { started: true });
       try {
-        const payload = jwt.verify(token, JWT_SECRET);
-        userId = payload.userId || payload.sub;
-        
-        // Importar la función getContacts dinámicamente para evitar importación circular
         const { getContacts } = await import('../controllers/whatsappController.js');
         const contacts = await getContacts(userId);
-        
-        socket.emit('contacts-loaded', { 
-          success: true, 
-          contacts,
-          total: contacts.length 
-        });
+        socket.emit('contacts-loaded', { success: true, contacts, total: contacts.length });
       } catch (error) {
         console.error('Error obteniendo contactos:', error);
-        socket.emit('contacts-loaded', { 
-          success: false, 
-          message: error.message,
-          contacts: [],
-          total: 0
-        });
+        socket.emit('contacts-loaded', { success: false, message: error.message, contacts: [], total: 0 });
       }
     });
     
@@ -1407,7 +1372,9 @@ async function syncContactWithRetry(sock, userId, jid, newName, newPhotoUrl, waU
     return;
   }
 
-  console.log(`🔄 Sincronizando contacto: userId=${userId}, jid=${jid}, name=${finalName}, waUserId=${waUserId}`);
+  if (process.env.VERBOSE_WHATSAPP === '1') {
+    console.log(`🔄 Sincronizando contacto: userId=${userId}, jid=${jid}, name=${finalName}, waUserId=${waUserId}`);
+  }
 
   try {
     // Primero verificar si existe el contacto
@@ -1437,7 +1404,7 @@ async function syncContactWithRetry(sock, userId, jid, newName, newPhotoUrl, waU
 
       if (updateError) {
         console.error(`❌ Error actualizando contacto ${jid}:`, updateError);
-      } else {
+      } else if (process.env.VERBOSE_WHATSAPP === '1') {
         console.log(`✅ Contacto ${jid} actualizado: "${existing[0].contact_name}" → "${finalName}"`);
       }
     } else {
@@ -1458,7 +1425,7 @@ async function syncContactWithRetry(sock, userId, jid, newName, newPhotoUrl, waU
       if (insertError) {
         // Si es error de duplicado, intentar actualizar
         if (insertError.code === '23505') {
-          console.log(`⚠️ Contacto ${jid} ya existe, actualizando...`);
+          if (process.env.VERBOSE_WHATSAPP === '1') console.log(`⚠️ Contacto ${jid} ya existe, actualizando...`);
           const { error: updateError } = await supabaseAdmin
             .from('conversations_new')
             .update({
@@ -1470,13 +1437,13 @@ async function syncContactWithRetry(sock, userId, jid, newName, newPhotoUrl, waU
             .eq('external_id', jid)
             .eq('user_id', userId);
           
-          if (!updateError) {
+          if (!updateError && process.env.VERBOSE_WHATSAPP === '1') {
             console.log(`✅ Contacto ${jid} (${finalName}) actualizado después de conflicto`);
           }
         } else {
           console.error(`❌ Error insertando contacto ${jid}:`, insertError);
         }
-      } else {
+      } else if (process.env.VERBOSE_WHATSAPP === '1') {
         console.log(`✅ Contacto ${jid} (${finalName}) creado para userId=${userId}`);
       }
     }

@@ -47,8 +47,23 @@ function getUserIdFromToken(req) {
   }
   
   if (!token) {
+    // En desarrollo, usar x-user-id (frontend envía sesión Supabase en admin/dashboard)
+    const xUserId = (req.headers['x-user-id'] || '').trim();
+    if (process.env.NODE_ENV === 'development' && xUserId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(xUserId)) {
+      return xUserId;
+    }
     console.error('Token no proporcionado ni en Authorization header ni en cookies');
     return null;
+  }
+
+  const forceLogin = process.env.FORCE_LOGIN === 'true';
+
+  // Con FORCE_LOGIN: solo decodificar (sin verificar firma) para evitar throws y stack traces
+  if (forceLogin) {
+    const decoded = jwt.decode(token);
+    if (decoded && (decoded.userId || decoded.sub)) {
+      return decoded.userId || decoded.sub;
+    }
   }
 
   try {
@@ -64,24 +79,12 @@ function getUserIdFromToken(req) {
     }
     return id;
   } catch (err) {
-    console.error('Error al verificar el token:', err);
-    
-    // MODO FORZADO: Si hay token pero falló la verificación, intentar decodificar sin verificar
-    const forceLogin = process.env.FORCE_LOGIN === 'true';
-    if (forceLogin) {
-      try {
-        console.log('⚡ Intentando FORCE LOGIN en getUserIdFromToken...');
-        const decoded = jwt.decode(token);
-        if (decoded && (decoded.userId || decoded.sub)) {
-          const userId = decoded.userId || decoded.sub;
-          console.log('⚡ FORCE LOGIN EXITOSO: Extraído userId:', userId);
-          return userId;
-        }
-      } catch (decodeError) {
-        console.log('❌ Force decode falló en getUserIdFromToken');
-      }
+    console.error('Error al verificar el token:', err.message);
+    // En desarrollo, fallback a x-user-id para admin/dashboard
+    const xUserId = (req.headers['x-user-id'] || '').trim();
+    if (process.env.NODE_ENV === 'development' && xUserId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(xUserId)) {
+      return xUserId;
     }
-    
     return null;
   }
 }
@@ -167,8 +170,7 @@ const inviteUserByEmail = async (req, res) => {
     // Firmar el token
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
 
-    // 🔒 CENTRALIZACIÓN: SIEMPRE usar app.uniclick.io para autenticación
-    const confirmationUrl = 'https://app.uniclick.io/login';
+    const confirmationUrl = (process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL || 'https://www.speedleads.app') + '/login';
     console.log(`📧 Enviando invitación a: ${email} con URL: ${confirmationUrl}`);
     
     // Comentado: URL anterior que usaba FRONTEND_URL
@@ -273,7 +275,7 @@ async function login(req, res) {
       secure: process.env.NODE_ENV === 'production',
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 días
-      domain: process.env.NODE_ENV === 'development' ? undefined : (process.env.COOKIE_DOMAIN || '.uniclick.io'),
+      domain: process.env.NODE_ENV === 'development' ? undefined : (process.env.COOKIE_DOMAIN || '.speedleads.app'),
       path: '/'
     };
 
@@ -293,30 +295,21 @@ async function login(req, res) {
     const currentHost = req.get('host');
     let redirectUrl = null;
     
-    // 🔒 CENTRALIZACIÓN: SIEMPRE redirigir a app.uniclick.io para autenticación
-    if (currentHost !== 'app.uniclick.io') {
-      redirectUrl = 'https://app.uniclick.io/dashboard';
-      console.log(`🔄 CENTRALIZACIÓN: Redirección automática a app.uniclick.io: ${currentHost} -> ${redirectUrl}`);
+    const appHost = process.env.FRONTEND_URL ? new URL(process.env.FRONTEND_URL).host : 'www.speedleads.app';
+    if (currentHost !== appHost) {
+      redirectUrl = (process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL || 'https://www.speedleads.app') + '/dashboard';
     }
-    
-    // Comentado: Lógica anterior de subdominios
     /*
-    if (enableWildcards && userSubdomain && currentHost === 'app.uniclick.io') {
-      // Usuario logueándose desde app.uniclick.io y tiene subdominio -> redirigir
-      redirectUrl = `https://${userSubdomain}.uniclick.io/dashboard`;
-      console.log(`🔄 Redirección automática: ${currentHost} -> ${redirectUrl}`);
-    } else if (enableWildcards && userSubdomain && currentHost.includes('.uniclick.io') && currentHost !== 'app.uniclick.io') {
-      // Usuario logueándose desde un subdominio -> verificar si es el correcto
+    if (enableWildcards && userSubdomain && currentHost === appHost) {
+      redirectUrl = `https://${userSubdomain}.speedleads.io/dashboard`;
+    } else if (enableWildcards && userSubdomain && currentHost.includes('.speedleads.io') && currentHost !== appHost) {
       const currentSubdomain = currentHost.split('.')[0];
       if (currentSubdomain !== userSubdomain) {
-        redirectUrl = `https://${userSubdomain}.uniclick.io/dashboard`;
-        console.log(`🔄 Redirección a subdominio correcto: ${currentHost} -> ${redirectUrl}`);
+        redirectUrl = `https://${userSubdomain}.speedleads.io/dashboard`;
       }
     } else if (!enableWildcards) {
-      console.log('🔒 Wildcards deshabilitados - login redirige a app.uniclick.io/dashboard');
-      // Opcional: forzar redirección a app.uniclick.io si se está logueando desde otro lugar
-      if (currentHost !== 'app.uniclick.io' && currentHost.includes('.uniclick.io')) {
-        redirectUrl = 'https://app.uniclick.io/dashboard';
+      if (currentHost !== appHost && currentHost.includes('.speedleads')) {
+        redirectUrl = (process.env.FRONTEND_URL || 'https://www.speedleads.app') + '/dashboard';
       }
     }
     */
@@ -695,7 +688,7 @@ async function updateProfile(req, res) {
         httpOnly: true,
         secure: process.env.NODE_ENV === "production",
         sameSite: "lax",
-        domain: process.env.NODE_ENV === 'development' ? undefined : (process.env.COOKIE_DOMAIN || '.uniclick.io'),
+        domain: process.env.NODE_ENV === 'development' ? undefined : (process.env.COOKIE_DOMAIN || '.speedleads.app'),
       });
     }
 
@@ -781,7 +774,7 @@ async function googleAuth(req, res) {
       secure: process.env.NODE_ENV === 'production',
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 días
-      domain: process.env.NODE_ENV === 'development' ? undefined : (process.env.COOKIE_DOMAIN || '.uniclick.io'),
+      domain: process.env.NODE_ENV === 'development' ? undefined : (process.env.COOKIE_DOMAIN || '.speedleads.app'),
       path: '/'
     };
 
@@ -823,8 +816,7 @@ async function googleAuth(req, res) {
         avatar_url: user.avatar_url || '',
         full_name: user.full_name || '',
       },
-      // 🔒 CENTRALIZACIÓN: SIEMPRE redirigir a app.uniclick.io
-      redirect: 'https://app.uniclick.io/dashboard'
+      redirect: (process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL || 'https://www.speedleads.app') + '/dashboard'
     });
   } catch (error) {
     console.error('Error /api/google-auth:', error);
@@ -1027,7 +1019,7 @@ async function forceLoginCheck(req, res) {
       secure: process.env.NODE_ENV === 'production',
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 días
-      domain: process.env.NODE_ENV === 'development' ? undefined : (process.env.COOKIE_DOMAIN || '.uniclick.io'),
+      domain: process.env.NODE_ENV === 'development' ? undefined : (process.env.COOKIE_DOMAIN || '.speedleads.app'),
       path: '/'
     };
 
@@ -1050,8 +1042,7 @@ async function forceLoginCheck(req, res) {
       token: newToken,
       tokenWasValid: tokenValid,
       forceLoginUsed: !tokenValid,
-      // 🔒 CENTRALIZACIÓN: SIEMPRE redirigir a app.uniclick.io
-      redirect: 'https://app.uniclick.io/dashboard'
+      redirect: (process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL || 'https://www.speedleads.app') + '/dashboard'
     });
 
   } catch (error) {

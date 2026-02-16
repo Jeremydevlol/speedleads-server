@@ -15,9 +15,9 @@ const checkIfSubdomainExists = async (subdomain) => {
       }
     );
     const existingRecord = response.data.result.find(
-      (record) => record.name === `${subdomain}.uniclick.io`
+      (record) => record.name === `${subdomain}.speedleads.io`
     );
-    return existingRecord ? `${subdomain}.uniclick.io` : null;
+    return existingRecord ? `${subdomain}.speedleads.io` : null;
   } catch (error) {
     console.error('Error al verificar el subdominio:', error);
     return null;
@@ -51,7 +51,7 @@ const createCnameRecord = async (req, res) => {
 
     const response = await axios.post(
       vercelUrl,
-      { name: `${subdomain}.uniclick.io`, configuration: { production: true } },
+      { name: `${subdomain}.speedleads.io`, configuration: { production: true } },
       {
         headers: {
           Authorization: `Bearer ${VERCEL_TOKEN}`,
@@ -76,7 +76,7 @@ const createCnameRecord = async (req, res) => {
       console.log(`Registro TXT para verificación creado en Cloudflare: ${verification.domain}`);
     }
 
-    return res.status(201).json({ message: 'Subdominio creado, registrado y verificado', subdomain: `${subdomain}.uniclick.io` });
+    return res.status(201).json({ message: 'Subdominio creado, registrado y verificado', subdomain: `${subdomain}.speedleads.io` });
   } catch (error) {
     console.error('Error creando/verificando subdominio:', error.response?.data || error.message);
     return res.status(500).json({ error: 'Error al crear/verificar subdominio', details: error.response?.data });

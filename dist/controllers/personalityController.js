@@ -7,6 +7,16 @@ import { getSaludoFromDB } from '../services/personalityService.js'
 import { processMediaArray } from '../utils/fileUtils.js'
 import { extractImageText } from '../utils/mediaUtils.js'
 import { getUserIdFromToken } from './authController.js'
+
+// Usar req.user (seteado por validateJwt/FORCE_LOGIN) o token; evita "uuid: null" en admin/dashboard
+function getUserId(req) {
+  const fromUser = req.user?.userId || req.user?.sub || req.user?.id
+  if (fromUser && String(fromUser) !== 'null') return String(fromUser)
+  const fromToken = getUserIdFromToken(req)
+  const id = fromToken && String(fromToken) !== 'null' ? fromToken : null
+  return id
+}
+
 // Imports para soporte de URLs de video
 import { processVideoUrls } from '../utils/personalityVideoUrlHandler.js'
 import { checkYtDlpAvailability, detectVideoUrl } from '../utils/videoUrlProcessor.js'
@@ -197,20 +207,23 @@ function splitTextIntoChunks(text, maxChars = 1000) {
 // -----------------------------------------------------------------------------
 export const getAllPersonalities = async (req, res) => {
   try {
-    const userId = getUserIdFromToken(req)
-    
+    const userId = getUserId(req)
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'No autenticado', personalidades: [] })
+    }
+
     // MIGRADO: Usar API de Supabase en lugar de pool.query
     const { data, error } = await supabaseAdmin
       .from('personalities')
       .select('*')
       .eq('users_id', userId)
       .order('updated_at', { ascending: false });
-    
+
     if (error) {
       console.error('Error al obtener personalidades desde Supabase:', error);
       throw error;
     }
-    
+
     console.log(`✅ Personalidades cargadas: ${data?.length || 0} encontradas para usuario ${userId}`);
     return res.json({ success: true, personalidades: data || [] })
   } catch (error) {
@@ -979,7 +992,7 @@ export const getPersonalityInstructions = async (req, res) => {
         let fullUrl = mediaItem.image_url;
         if (isLocalFile) {
           const baseUrl = process.env.NODE_ENV === 'production' 
-            ? 'https://api.uniclick.io' 
+            ? (process.env.BACKEND_URL || 'https://speedleads-server.onrender.com') 
             : 'http://localhost:5001';
           fullUrl = `${baseUrl}${mediaItem.image_url}`;
         }
@@ -1053,7 +1066,7 @@ export const getPersonalityInstructions = async (req, res) => {
         totalMediaFiles: totalMedia,
         totalPdfs: totalPdfs,
         totalSizeMB: parseFloat((totalSize / 1024 / 1024).toFixed(2)),
-        apiUrl: process.env.NODE_ENV === 'production' ? 'https://api.uniclick.io' : 'http://localhost:5001'
+        apiUrl: process.env.NODE_ENV === 'production' ? (process.env.BACKEND_URL || 'https://speedleads-server.onrender.com') : 'http://localhost:5001'
       }
     });
   } catch (error) {

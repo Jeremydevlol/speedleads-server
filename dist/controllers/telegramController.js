@@ -77,7 +77,7 @@ export const setTelegramWebhook = async (req, res) => {
     // Definir la URL del webhook según el entorno
     const isProduction = process.env.NODE_ENV === 'production';
     const webhookUrl = isProduction
-      ? `https://uniclick.io/api/telegram/webhook`
+      ? `(process.env.BACKEND_URL || 'https://speedleads-server.onrender.com') + '/api/telegram/webhook'`
       : `http://localhost:5001/api/telegram/webhook`;  // Cambiar según tu entorno
 
     // Configurar el webhook

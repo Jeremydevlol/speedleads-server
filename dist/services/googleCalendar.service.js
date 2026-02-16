@@ -355,10 +355,10 @@ export async function incrementalSync(userId, calendarId = 'primary') {
  */
 async function upsertEventFromGoogle(userId, calendarId, event, skipAntiLoop = false) {
   // Evitar bucles (anti-loop) - solo para eventos que vienen de sincronización, no de creación directa
-  if (!skipAntiLoop && event.extendedProperties?.private?.src === 'uniclick') {
+  if (!skipAntiLoop && event.extendedProperties?.private?.src === 'speedleads') {
     const eventTime = new Date(event.created || event.updated || '').getTime();
     if (Date.now() - eventTime < 30000) { // 30 segundos
-      console.log(`⏭️ Skipping recent uniclick event: ${event.id}`);
+      console.log(`⏭️ Skipping recent speedleads event: ${event.id}`);
       return;
     }
   }
@@ -419,7 +419,7 @@ export async function upsertGoogleEvent(eventData) {
       ...eventDetails,
       extendedProperties: {
         private: {
-          src: 'uniclick'
+          src: 'speedleads'
         }
       }
     };

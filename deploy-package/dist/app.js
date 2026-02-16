@@ -469,10 +469,6 @@ app.post('/api/transcribe-audio', upload.single('audio'), async (req, res) => {
 // ----- AÑADE AQUÍ TUS RUTAS DE userSettingsRoutes -----
 // ------------------------------------------------------
 
-// Rutas de testing para subdominios
-import testRoutes from './routes/testRoutes.js';
-app.use('/api/test', testRoutes);
-
 // Servir estáticos
 app.use(express.static(path.join(__dirname, 'public')));
 

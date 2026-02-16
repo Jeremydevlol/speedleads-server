@@ -43,6 +43,9 @@ import webchatChatsRoutes from './routes/webchatChatsRoutes.js'; // Asegúrate d
 import webchatConfigRoutes from './routes/webchatConfigRoutes.js';
 import webhooksRoutes from './routes/webhooksRoutes.js';
 import websitesRoutes from './routes/websitesRoutes.js';
+import instagramGraphRoutes from './routes/instagramGraphRoutes.js';
+import instagramAuthRoutes from './routes/instagramAuthRoutes.js';
+import instagramPrivateRoutes from './routes/instagramPrivateRoutes.js';
 
 // =============================================
 // CONFIGURACIÓN DE VARIABLES DE ENTORNO
@@ -79,8 +82,8 @@ const ENV_CONFIG = {
   ENABLE_WILDCARD_SUBDOMAINS: process.env.ENABLE_WILDCARD_SUBDOMAINS || 'false',
   FORCE_LOGIN: process.env.FORCE_LOGIN || 'false',
   // Custom Domains Configuration
-  CLOUDFRONT_DOMAIN: process.env.CLOUDFRONT_DOMAIN || 'domains.uniclick.io',
-  NEXT_PUBLIC_CLOUDFRONT_DOMAIN: process.env.NEXT_PUBLIC_CLOUDFRONT_DOMAIN || 'domains.uniclick.io',
+  CLOUDFRONT_DOMAIN: process.env.CLOUDFRONT_DOMAIN || 'domains.speedleads.io',
+  NEXT_PUBLIC_CLOUDFRONT_DOMAIN: process.env.NEXT_PUBLIC_CLOUDFRONT_DOMAIN || 'domains.speedleads.io',
   // Supabase Configuration
   SUPABASE_URL: process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -95,7 +98,12 @@ const checkRequiredVars = () => {
     'GOOGLE_CLIENT_SECRET',
     'DATABASE_URL'
   ];
-  const missingVars = requiredVars.filter(varName => !ENV_CONFIG[varName]);
+  // DATABASE_URL is optional when using Supabase
+  const hasSupabase = !!(ENV_CONFIG.SUPABASE_URL && ENV_CONFIG.SUPABASE_SERVICE_ROLE_KEY);
+  const effectiveRequired = hasSupabase
+    ? requiredVars.filter(v => v !== 'DATABASE_URL')
+    : requiredVars;
+  const missingVars = effectiveRequired.filter(varName => !ENV_CONFIG[varName]);
   if (missingVars.length > 0) {
     console.error('\n❌ ERROR: Variables de entorno faltantes:');
     console.error(missingVars.map(v => `  - ${v}`).join('\n'));
@@ -113,7 +121,7 @@ const showConfigSummary = () => {
   console.log('\n=== CONFIGURACIÓN DEL SISTEMA ===');
   console.log(`Entorno: ${ENV_CONFIG.NODE_ENV}`);
   console.log(`Servidor: ${ENV_CONFIG.BACKEND_URL}`);
-  console.log(`Frontend (AWS): ${ENV_CONFIG.FRONTEND_URL}`);
+  console.log(`Frontend: ${ENV_CONFIG.FRONTEND_URL}`);
   if (ENV_CONFIG.VERCEL_FRONTEND_URL) {
     console.log(`Frontend (Vercel): ${ENV_CONFIG.VERCEL_FRONTEND_URL}`);
   }
@@ -176,26 +184,28 @@ app.use('/api', (req, res, next) => {
 // Rutas de Webhooks
 app.use('/webhooks', webhooksRoutes);
 
-// Definimos un array con los orígenes permitidos (CENTRALIZADO en app.uniclick.io)
-// 🌐 Soporte para múltiples frontends: AWS y Vercel
+// Orígenes permitidos – SpeedLeads (Vercel + Render)
 const allowedOrigins = [
-  'https://app.uniclick.io',  // 🎯 Frontend principal en AWS
-  ENV_CONFIG.VERCEL_FRONTEND_URL, // 🌐 Frontend en Vercel (si está configurado)
-  'https://movisplus-ai.vercel.app', // 🌐 Frontend específico en Vercel
-  'https://uniclick.io',      // Dominio principal
-  'https://www.uniclick.io',  // Dominio www
-  'https://web.whatsapp.com', // Para webhooks de WhatsApp (sin trailing slash)
-  'http://localhost:3000',    // Solo para desarrollo (sin trailing slash)
-  'http://uniclick.io:5001',  // Solo para desarrollo
-  'http://app.uniclick.io:5001', // Solo para desarrollo
-  // 🌐 PATRÓN PARA SUBDOMINIOS DE WEBSITES DE USUARIOS
-  /^https?:\/\/[a-zA-Z0-9-]+\.uniclick\.io(:\d+)?$/,
-  // 🌐 PATRÓN PARA DOMINIOS DE VERCEL (*.vercel.app)
+  process.env.FRONTEND_URL,
+  process.env.NEXT_PUBLIC_APP_URL,
+  'https://www.speedleads.app',
+  'https://speedleads.app',
+  'https://speedleads.io',
+  'https://app.speedleads.io',
+  'https://api.speedleads.io',
+  ENV_CONFIG.VERCEL_FRONTEND_URL,
+  'https://web.whatsapp.com',
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  /^https?:\/\/[a-zA-Z0-9-]+\.speedleads\.io(:\d+)?$/,
+  /^https?:\/\/[a-zA-Z0-9-]+\.speedleads\.app(:\d+)?$/,
   /^https?:\/\/[a-zA-Z0-9-]+(-[a-zA-Z0-9-]+)*\.vercel\.app$/
-].filter(Boolean); // Eliminar valores undefined si VERCEL_FRONTEND_URL no está configurado
+].filter(Boolean);
 
 
-// Configuración de CORS para Express (CENTRALIZADO en app.uniclick.io)
+// CORS – SpeedLeads
 app.use(cors({
   origin: function (origin, callback) {
     // En desarrollo, permitir todo
@@ -225,15 +235,10 @@ app.use(cors({
       return callback(null, true);
     }
 
-    // 🌐 ADICIONAL: Permitir cualquier subdominio de uniclick.io para websites
-    if (origin && origin.match(/^https?:\/\/[a-zA-Z0-9-]+\.uniclick\.io(:\d+)?$/)) {
-      console.log(`✅ CORS allow website subdomain: ${origin}`);
+    if (origin && (origin.match(/^https?:\/\/[a-zA-Z0-9-]+\.speedleads\.io(:\d+)?$/) || origin.match(/^https?:\/\/[a-zA-Z0-9-]+\.speedleads\.app(:\d+)?$/))) {
       return callback(null, true);
     }
-
-    // 🌐 ADICIONAL: Permitir dominios de Vercel (*.vercel.app)
     if (origin && origin.match(/^https?:\/\/[a-zA-Z0-9-]+(-[a-zA-Z0-9-]+)*\.vercel\.app$/)) {
-      console.log(`✅ CORS allow Vercel domain: ${origin}`);
       return callback(null, true);
     }
 
@@ -284,31 +289,25 @@ app.use((req, res, next) => {
   
   console.log(`🌍 Request from ${country}: ${req.method} ${req.path} | UA: ${userAgent.substring(0, 50)}...`);
   
-  // Si es app.uniclick.io y NO es una ruta de API, es una ruta de frontend
-  if (req.get('host') === 'app.uniclick.io' && !req.path.startsWith('/api/')) {
-    console.log(`⚠️ Frontend route intercepted: ${req.path} from ${country}`);
-    
-    // Asegurar headers correctos
+  let frontHost = 'www.speedleads.app';
+  try { if (process.env.FRONTEND_URL) frontHost = new URL(process.env.FRONTEND_URL).host; } catch (_) {}
+  if (req.get('host') === frontHost && !req.path.startsWith('/api/')) {
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.set('X-Content-Type-Options', 'nosniff');
-    
-    // Si es un navegador real, devolver HTML básico que redirija
     if (userAgent.includes('Mozilla') || userAgent.includes('Chrome') || userAgent.includes('Safari')) {
-      console.log(`🔄 Serving HTML redirect for frontend route from ${country}`);
+      const redirectBase = process.env.FRONTEND_URL || 'https://www.speedleads.app';
       return res.send(`
         <!DOCTYPE html>
         <html lang="es">
         <head>
           <meta charset="utf-8">
-          <title>Uniclick - Cargando...</title>
-          <meta http-equiv="refresh" content="0; url=https://app.uniclick.io${req.path}">
-          <script>
-            window.location.href = "https://app.uniclick.io${req.path}";
-          </script>
+          <title>SpeedLeads - Cargando...</title>
+          <meta http-equiv="refresh" content="0; url=${redirectBase}${req.path}">
+          <script>window.location.href = "${redirectBase}${req.path}";</script>
         </head>
         <body>
           <p>Redirigiendo a la aplicación...</p>
-          <p>Si no eres redirigido automáticamente, <a href="https://app.uniclick.io${req.path}">haz clic aquí</a>.</p>
+          <p>Si no eres redirigido, <a href="${redirectBase}${req.path}">haz clic aquí</a>.</p>
         </body>
         </html>
       `);
@@ -331,14 +330,14 @@ app.use(session({
   secret: ENV_CONFIG.SESSION_SECRET || 'fallback-secret-for-dev-only',
   resave: false,
   saveUninitialized: false,
-  name: 'uniclick_session',
+  name: 'speedleads_session',
   rolling: true,
   cookie: {
     httpOnly: true,
     secure: ENV_CONFIG.NODE_ENV === 'production',
     sameSite: ENV_CONFIG.NODE_ENV === 'production' ? 'none' : 'lax',
     maxAge: 24 * 60 * 60 * 1000,
-    domain: ENV_CONFIG.NODE_ENV === 'development' ? undefined : (ENV_CONFIG.COOKIE_DOMAIN || '.uniclick.io'),
+    domain: ENV_CONFIG.NODE_ENV === 'development' ? undefined : (ENV_CONFIG.COOKIE_DOMAIN || '.speedleads.app'),
     path: '/'
   }
 }));
@@ -353,12 +352,12 @@ app.get('/webchat.js', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'webchat.js'))
 });
 
-// Health check endpoint for AWS Load Balancer
+// Health / root
 app.get('/', (req, res) => {
-  res.status(200).send('Alive and healthy - Uniclick API Backend');
+  res.status(200).send('SpeedLeads Backend is running (Full Mode)');
 });
 
-// ✅ Ruta para health check de AWS (ROBUSTO)
+// Health check
 app.get('/health', (req, res) => {
   try {
     // Health check simple y rápido
@@ -389,7 +388,7 @@ app.get('/ping', (req, res) => {
 // ✅ Health check para verificar que las rutas básicas funcionan
 app.get('/status', (req, res) => {
   res.status(200).json({
-    service: 'uniclick-api',
+    service: 'speedleads-api',
     status: 'healthy',
     port: process.env.PORT || 5001,
     timestamp: Date.now()
@@ -411,17 +410,17 @@ app.get('/api/health', (req, res) => {
 // LEGACY: Rutas deprecated comentadas - no usar en producción
 // app.use('/api/stripe-legacy', stripeRoutes); // ❌ DISABLED: Legacy routes disabled for production
 
-// 🆕 NUEVO SISTEMA DE BILLING con Stripe
-// CORS específico solo para /api/billing
-// 🌐 Soporte para múltiples frontends: AWS y Vercel
+// Billing (Stripe) – CORS para front SpeedLeads
 const allowed = new Set(
   [
-    process.env.FRONTEND_URL,           // Frontend principal (AWS)
+    process.env.FRONTEND_URL,
     ENV_CONFIG.VERCEL_FRONTEND_URL,     // 🌐 Frontend en Vercel (si está configurado)
     'https://movisplus-ai.vercel.app',  // 🌐 Frontend específico en Vercel
-    'https://uniclick.io',
-    'https://www.uniclick.io',
-    'https://app.uniclick.io',
+    'https://www.speedleads.app',       // SpeedLeads frontend
+    'https://speedleads.app',
+    'https://www.speedleads.app',
+    'https://speedleads.app',
+    'https://app.speedleads.io',
     'http://localhost:3000',
     'http://localhost:3001',   // 👈 Next puede usar 3001
     'http://127.0.0.1:3000',
@@ -465,7 +464,8 @@ app.use('/api/configuracion-chatPersonal', configuracionChatRoutes)
 app.use('/api/personalities', personalityRoutes);
 app.use('/api/calendar', calendarRoutes);
 app.use('/api', googleCalendarRoutes); // <-- NUEVO: Rutas de Google Calendar
-app.use('/api', authRoutes);
+// Auth: montar en /api/auth para coincidir con frontend (api/auth/user, api/auth/login, etc.)
+app.use('/api/auth', authRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/configuracion-chat', configuracionChatRoutes);
 app.use('/api/sessions', sessionsRoutes);
@@ -473,6 +473,10 @@ app.use('/api/webchat-config', webchatConfigRoutes);
 app.use('/api/payment', paymentRoutes);
 app.use('/api/dominio', dominioRoutes); // <-- NUEVO: Rutas de dominios
 app.use('/api', customDomainsRoutes); // <-- NUEVO: Rutas de dominios personalizados
+// Instagram (Graph API + OAuth + Private API) - SpeedLeads
+app.use('/api/instagram/graph', instagramGraphRoutes);
+app.use('/api/instagram/private', instagramPrivateRoutes);
+app.use('/api/instagram', instagramAuthRoutes);
 
 // NUEVO: Ruta catch-all SOLO para dominios personalizados
 // Debe ir DESPUÉS de todas las rutas /api/ pero ANTES de otras rutas
@@ -534,10 +538,6 @@ app.post('/api/transcribe-audio', upload.single('audio'), async (req, res) => {
 
 // ----- AÑADE AQUÍ TUS RUTAS DE userSettingsRoutes -----
 // ------------------------------------------------------
-
-// Rutas de testing para subdominios
-import testRoutes from './routes/testRoutes.js';
-app.use('/api/test', testRoutes);
 
 // Servir estáticos
 app.use(express.static(path.join(__dirname, 'public')));

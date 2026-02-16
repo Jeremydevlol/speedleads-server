@@ -91,7 +91,7 @@ export async function getWebsiteById(req, res) {
     }
     
     // Construir URL de publicación
-    const publishUrl = ownerUsername ? `https://${ownerUsername}.uniclick.io/web/${website.slug}` : null;
+    const publishUrl = ownerUsername ? `https://${ownerUsername}.speedleads.io/web/${website.slug}` : null;
 
     console.log('✅ Website found successfully:', { 
       id: website.id, 
@@ -571,7 +571,7 @@ export async function createWebsite(req, res) {
     }
     
     // Construir URL de publicación
-    const publishUrl = ownerUsername ? `https://${ownerUsername}.uniclick.io/web/${website.slug}` : null;
+    const publishUrl = ownerUsername ? `https://${ownerUsername}.speedleads.io/web/${website.slug}` : null;
 
     console.log('✅ Website created successfully:', { 
       id: website.id, 
@@ -812,7 +812,7 @@ export async function publishWebsite(req, res) {
     }
 
     // Construir la URL de publicación
-    const publishUrl = `https://${ownerUsername}.uniclick.io/web/${slug}`;
+    const publishUrl = `https://${ownerUsername}.speedleads.io/web/${slug}`;
     
     console.log('✅ Website published successfully:', { 
       id, 

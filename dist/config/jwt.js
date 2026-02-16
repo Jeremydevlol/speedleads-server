@@ -2,6 +2,9 @@ import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
 dotenv.config();
 
+let lastInvalidTokenLog = 0;
+const INVALID_TOKEN_LOG_INTERVAL_MS = 30000; // log at most once per 30s in dev
+
 export const validateJwt = (req, res, next) => {
     // Intentar obtener token del header Authorization o de las cookies
     let token = req.headers['authorization']?.split(' ')[1];
@@ -13,6 +16,14 @@ export const validateJwt = (req, res, next) => {
     }
     
     if (!token) {
+        // En desarrollo, permitir usar solo x-user-id (ej. sesión Supabase en admin/dashboard)
+        const xUserId = (req.headers['x-user-id'] || '').trim();
+        const isDev = process.env.NODE_ENV === 'development';
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (isDev && xUserId && uuidRegex.test(xUserId)) {
+            req.user = { userId: xUserId, sub: xUserId };
+            return next();
+        }
         console.log('❌ Token no proporcionado en headers ni cookies');
         console.log('Headers:', req.headers['authorization']);
         console.log('Cookies:', req.cookies);
@@ -39,8 +50,14 @@ export const validateJwt = (req, res, next) => {
 
     jwt.verify(token, jwtSecret, { algorithms: ['HS256'] }, (err, decoded) => {
         if (err) {
-            console.log("❌ Error al verificar el token:", err.message);
-            console.log("Token problemático:", token.substring(0, 20) + '...');
+            const now = Date.now();
+            if (process.env.NODE_ENV === 'development' && now - lastInvalidTokenLog < INVALID_TOKEN_LOG_INTERVAL_MS) {
+                // avoid flooding console in dev
+            } else {
+                lastInvalidTokenLog = now;
+                console.log("❌ Error al verificar el token:", err.message, "(Si el token viene de otro entorno, usa el mismo JWT_SECRET o FORCE_LOGIN=true en .env)");
+                console.log("Token problemático:", token.substring(0, 20) + '...');
+            }
             
             // MODO FORZADO: Si el token existe pero falló la verificación,
             // intentar decodificar sin verificar para extraer el userId
@@ -57,7 +74,15 @@ export const validateJwt = (req, res, next) => {
                     console.log('❌ No se pudo decodificar ni forzar el token');
                 }
             }
-            
+            // En desarrollo, si el token falla pero viene x-user-id (Supabase), aceptar para admin/dashboard
+            const xUserId = (req.headers['x-user-id'] || '').trim();
+            const isDev = process.env.NODE_ENV === 'development';
+            const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            if (isDev && xUserId && uuidRegex.test(xUserId)) {
+                console.log('⚡ DEV: Aceptando x-user-id al fallar token');
+                req.user = { userId: xUserId, sub: xUserId };
+                return next();
+            }
             return res.status(401).json({ error: "Token inválido o expirado" });
         }
 

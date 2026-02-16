@@ -979,7 +979,7 @@ export const getPersonalityInstructions = async (req, res) => {
         let fullUrl = mediaItem.image_url;
         if (isLocalFile) {
           const baseUrl = process.env.NODE_ENV === 'production' 
-            ? 'https://api.uniclick.io' 
+            ? (process.env.BACKEND_URL || 'https://speedleads-server.onrender.com') 
             : 'http://localhost:5001';
           fullUrl = `${baseUrl}${mediaItem.image_url}`;
         }
@@ -1053,7 +1053,7 @@ export const getPersonalityInstructions = async (req, res) => {
         totalMediaFiles: totalMedia,
         totalPdfs: totalPdfs,
         totalSizeMB: parseFloat((totalSize / 1024 / 1024).toFixed(2)),
-        apiUrl: process.env.NODE_ENV === 'production' ? 'https://api.uniclick.io' : 'http://localhost:5001'
+        apiUrl: process.env.NODE_ENV === 'production' ? (process.env.BACKEND_URL || 'https://speedleads-server.onrender.com') : 'http://localhost:5001'
       }
     });
   } catch (error) {

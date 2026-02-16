@@ -63,7 +63,7 @@ export const configureDomain = async (req, res) => {
     }
 
     // Get CloudFront domain from environment
-    const cloudfrontDomain = process.env.CLOUDFRONT_DOMAIN || 'domains.uniclick.io';
+    const cloudfrontDomain = process.env.CLOUDFRONT_DOMAIN || 'domains.speedleads.io';
 
     // Generate DNS records
     const dnsRecords = {
@@ -319,7 +319,7 @@ export const generateSSL = async (req, res) => {
           Tags: [
             {
               Key: 'Project',
-              Value: 'Uniclick'
+              Value: 'SpeedLeads'
             },
             {
               Key: 'Domain',
@@ -339,9 +339,9 @@ export const generateSSL = async (req, res) => {
       */
       
       // For now, simulate success in production too
-      // Your wildcard *.uniclick.io certificate will handle SSL
+      // Wildcard *.speedleads.io certificate for SSL
       sslStatus = 'active';
-      sslCertificateId = 'wildcard-uniclick-io';
+      sslCertificateId = 'wildcard-speedleads-io';
       domainStatus = 'active';
     }
 

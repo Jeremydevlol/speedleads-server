@@ -363,7 +363,7 @@
   inputBar.innerHTML = inputHtml;
   chatContainer.appendChild(inputBar);
 
-  // Footer (Powered by Uniclick)
+  // Footer (Powered by SpeedLeads)
   const footer = document.createElement('div');
   footer.className = 'webchat-footer';
   Object.assign(footer.style, {
@@ -382,16 +382,16 @@
   });
   footer.innerHTML = `
     <span>Powered by </span>
-    <a href="https://uniclick.io" target="_blank" 
+    <a href="https://www.speedleads.app" target="_blank" 
        style="color:${cfg.theme_color || '#4f46e5'};text-decoration:none;font-weight:500;">
-       uniclick.io
+       speedleads.app
     </a>
   `;
   chatContainer.appendChild(footer);
 
   // Evento para cerrar el chat
   closeButton.addEventListener('click', () => {
-    window.UniclickWebchat.close();
+    window.SpeedLeadsWebchat.close();
     toggleButton.style.display = 'block';
   });
 
@@ -633,7 +633,7 @@
   }
 
   // API pública para abrir/cerrar el chat
-  window.UniclickWebchat = {
+  window.SpeedLeadsWebchat = {
     open: () => {
       chatContainer.style.display = 'flex';
       messagesDiv.scrollTop = messagesDiv.scrollHeight;
@@ -662,9 +662,9 @@
   // Eventos del botón toggle
   toggleButton.addEventListener('click', () => {
     if (chatContainer.style.display === 'none' || !chatContainer.style.display) {
-      window.UniclickWebchat.open();
+      window.SpeedLeadsWebchat.open();
     } else {
-      window.UniclickWebchat.close();
+      window.SpeedLeadsWebchat.close();
     }
   });
 

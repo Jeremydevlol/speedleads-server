@@ -78,7 +78,7 @@ router.get('/pdfs/:filename', (req, res) => {
       'Last-Modified': stats.mtime.toUTCString(),
       // CORS headers para desarrollo
       'Access-Control-Allow-Origin': process.env.NODE_ENV === 'production' 
-        ? 'https://uniclick.io' 
+        ? (process.env.FRONTEND_URL || 'https://www.speedleads.app') 
         : '*',
       'Access-Control-Allow-Methods': 'GET',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization'
@@ -180,7 +180,7 @@ router.get('/:filename', (req, res) => {
       'ETag': `"${stats.mtime.getTime()}-${stats.size}"`,
       'Last-Modified': stats.mtime.toUTCString(),
       'Access-Control-Allow-Origin': process.env.NODE_ENV === 'production' 
-        ? 'https://uniclick.io' 
+        ? (process.env.FRONTEND_URL || 'https://www.speedleads.app') 
         : '*',
       'Access-Control-Allow-Methods': 'GET',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization'

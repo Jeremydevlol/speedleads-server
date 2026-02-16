@@ -34,8 +34,8 @@ export const sendFeedback = async (req, res) => {
     }
 
     const msg = {
-      to: 'support@uniclick.io',   // Email de destino
-      from: 'support@uniclick.io', // Remitente
+      to: process.env.SUPPORT_EMAIL || 'support@speedleads.app',
+      from: process.env.SENDGRID_FROM_EMAIL || 'support@speedleads.app',
       subject: `Feedback: ${title}`,  // Asunto del correo
       text: description,              // Descripción en texto
       html: `<p>${description}</p>`,   // Descripción en HTML

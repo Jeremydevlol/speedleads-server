@@ -9,24 +9,21 @@ export const domainSecurityMiddleware = (req, res, next) => {
 
   const host = req.get('host');
   
-  // Lista de dominios permitidos del sistema
   const allowedSystemDomains = [
-    'uniclick.io',
-    'app.uniclick.io',
-    'api.uniclick.io',
-    'auth.uniclick.io',
+    'speedleads.io',
+    'app.speedleads.io',
+    'api.speedleads.io',
+    'auth.speedleads.io',
+    'speedleads.app',
+    'www.speedleads.app',
     'localhost:5001'
   ];
-  
-  // Verificar si es un subdominio de cliente
-  if (host && host.includes('.uniclick.io') && !allowedSystemDomains.includes(host)) {
-    // Es un subdominio de cliente
+
+  if (host && host.includes('.speedleads.io') && !allowedSystemDomains.includes(host)) {
     req.isClientSubdomain = true;
     req.clientDomain = host.split('.')[0];
-    
     console.log(`🏢 Cliente detectado: ${req.clientDomain} (${host})`);
-  } else if (host && (host.includes('uniclick.io') || host.includes('localhost'))) {
-    // Es un dominio del sistema
+  } else if (host && (host.includes('speedleads.io') || host.includes('speedleads.app') || host.includes('localhost'))) {
     req.isSystemDomain = true;
     console.log(`🔧 Dominio del sistema: ${host}`);
   }
@@ -49,6 +46,8 @@ export const authMiddleware = async (req, res, next) => {
   const PUBLIC_GET_PATHS = new Set([
     '/api/billing/plans',   // <-- NECESARIO para que el front pinte los planes
     '/api/health', '/health', '/status', '/ping',
+    '/api/instagram/auth/callback',   // OAuth callback Facebook/Meta
+    '/api/instagram/graph/callback', // OAuth callback Graph API
   ]);
 
   // Rutas públicas con patrones (regex)
@@ -89,59 +88,31 @@ export const authMiddleware = async (req, res, next) => {
   return next();
 };
 
-// NUEVO: Middleware para redirección automática a app.uniclick.io
+// Redirección automática a app SpeedLeads (www.speedleads.app / app.speedleads.io)
+const APP_REDIRECT_BASE = process.env.FRONTEND_URL || process.env.NEXT_PUBLIC_APP_URL || 'https://www.speedleads.app';
+
 export const centralizeAuthMiddleware = async (req, res, next) => {
-  // BYPASS webhook de Stripe
   const p = req.path || req.originalUrl || '';
-  if (p === '/api/stripe/webhook' || p.startsWith('/api/stripe/webhook')) {
-    return next();
-  }
+  if (p === '/api/stripe/webhook' || p.startsWith('/api/stripe/webhook')) return next();
 
   const host = req.get('host');
   const path = req.path;
-  
-  // Solo actuar en subdominios que no sean del sistema
-  if (!host || !host.includes('.uniclick.io') || host === 'app.uniclick.io' || host === 'api.uniclick.io' || host === 'auth.uniclick.io') {
+
+  if (!host || (!host.includes('.speedleads.io') && !host.includes('.speedleads.app')) || host === 'app.speedleads.io' || host === 'api.speedleads.io' || host === 'auth.speedleads.io' || host === 'www.speedleads.app' || host === 'speedleads.app') {
     return next();
   }
-  
-  // Rutas sensibles que SIEMPRE deben ir a app.uniclick.io
-  const sensitiveRoutes = [
-    '/login', 
-    '/dashboard', 
-    '/account', 
-    '/settings', 
-    '/conversations', 
-    '/personalities',
-    '/profile',
-    '/admin',
-    '/billing',
-    '/subscription'
-  ];
-  
-  const isSensitiveRoute = sensitiveRoutes.some(route => path.startsWith(route));
-  
-  if (isSensitiveRoute) {
-    const redirectUrl = `https://app.uniclick.io${path}`;
-    console.log(`🔄 Redirección automática a app.uniclick.io: ${host}${path} -> ${redirectUrl}`);
+
+  const sensitiveRoutes = ['/login', '/dashboard', '/account', '/settings', '/conversations', '/personalities', '/profile', '/admin', '/billing', '/subscription'];
+  if (sensitiveRoutes.some(route => path.startsWith(route))) {
+    const redirectUrl = `${APP_REDIRECT_BASE}${path}`;
     return res.redirect(302, redirectUrl);
   }
-  
-  // Para rutas de API, permitir que continúen (pueden ser necesarias para webchats, etc.)
-  if (path.startsWith('/api/')) {
-    return next();
-  }
-  
-  // Para otras rutas, verificar si es una ruta de website (no de autenticación)
-  // Si no es una ruta de website, redirigir a app.uniclick.io
+  if (path.startsWith('/api/')) return next();
+
   const isWebsiteRoute = path === '/' || path.startsWith('/website') || path.startsWith('/page');
-  
   if (!isWebsiteRoute) {
-    const redirectUrl = `https://app.uniclick.io${path}`;
-    console.log(`🔄 Redirección de ruta no reconocida a app.uniclick.io: ${host}${path} -> ${redirectUrl}`);
-    return res.redirect(302, redirectUrl);
+    return res.redirect(302, `${APP_REDIRECT_BASE}${path}`);
   }
-  
   next();
 };
 
@@ -208,29 +179,15 @@ export const customDomainRoutingMiddleware = async (req, res, next) => {
   try {
     const host = req.get('host');
     
-    // ✅ SOLO procesar si viene de domains.uniclick.io (evita ruido en desarrollo)
-    if (host !== 'domains.uniclick.io') {
+    if (host !== 'domains.speedleads.io') {
       return next();
     }
-    
+
     const forwardedHost = req.get('x-forwarded-host');
     const originalHost = req.get('x-original-host');
-    const cloudflareHost = req.get('cf-connecting-ip');
-    
-    // Logging detallado SOLO cuando es relevante
-    console.log(`🔍 Custom Domain Debug:
-      Host: ${host}
-      X-Forwarded-Host: ${forwardedHost}
-      X-Original-Host: ${originalHost}
-      CF-Connecting-IP: ${cloudflareHost}
-      User-Agent: ${req.get('user-agent')?.substring(0, 50)}...`);
-    
-    // Determinar el dominio original
     const targetHost = originalHost || forwardedHost || host;
-    
-    // Si es el mismo que domains.uniclick.io, no es un dominio personalizado
-    if (targetHost === 'domains.uniclick.io') {
-      console.log('🔄 Petición directa a domains.uniclick.io - no es dominio personalizado');
+
+    if (targetHost === 'domains.speedleads.io') {
       return next();
     }
     
