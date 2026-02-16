@@ -1,0 +1,160 @@
+# .dockerignore
+# Archivos y directorios a excluir del contexto de construcción Docker
+
+# Dependencias
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Archivos de desarrollo
+.git/
+.gitignore
+README.md
+.env.local
+.env.development
+.env.test
+
+# Archivos de Next.js
+.next/
+out/
+
+# Archivos de build y cache
+# dist/  <- COMENTADO: necesitamos dist/ en la imagen de producción
+build/
+.cache/
+*.tsbuildinfo
+
+# Archivos temporales
+temp/
+uploads/
+*.tmp
+*.temp
+
+# Logs
+logs/
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory usado por tools como istanbul
+coverage/
+*.lcov
+
+# nyc test coverage
+.nyc_output/
+
+# Dependency directories
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variable files
+.env.backup*
+.env.bak
+.env.old
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Archivos de test (todos los formatos)
+test-*.js
+test-*.sh
+test_*.js
+debug-*.js
+debug-*.sh
+check-*.js
+check-*.sh
+diagnostico-*.sh
+*-test.js
+*-test.sh
+
+# Scripts de deploy y utilidades (no necesarios en producción)
+deploy-*.sh
+setup-*.sh
+install-*.sh
+quick-check.sh
+verify-*.js
+verify-*.sh
+
+# Documentación y guías
+docs/
+*.md
+*.MD
+
+# Archivos de configuración local
+.env.safari
+.env.production.local
+.env.*.local
+
+# Archivos de WhatsApp session (se crean en runtime)
+.wwebjs_auth/
+.wwebjs_cache/
+whatsapp-sessions/
+
+# Archivos de audio temporales
+audio_*.json
+audio_*.srt
+audio_*.tsv
+audio_*.vtt
+
+# Archivos comprimidos grandes (backups, etc.)
+*.tar.gz
+*.zip
+*.tar
+
+# Archivos SQL de migración (se ejecutan fuera del contenedor)
+*.sql
+!db/migrations/*.sql  # Mantener solo migraciones necesarias si se usan
+
+# Directorios temporales y de prueba
+temp_downloads/
+debug_sql_files/
+deploy-package/  # Ya se usa dist/ directamente
+
+# Archivos de configuración específicos de desarrollo
+*.json.example
+*.env.example
+# tsconfig.json se mantiene si TypeScript se compila en runtime (ajustar según necesidad)
+
+# Archivos de prueba y ejemplo
+*-example.js
+*-demo.js
+*-snippet.*
+*-patch.*
+OptimizedVideoComponent.jsx
+
+# GitHub workflows (no necesarios en imagen)
+.github/
+
+# Archivos de credenciales de desarrollo
+# NOTA: brave-cistern-441722-a9-8aa519ef966f.json se necesita, no excluir
+# Excluir solo otros JSON de prueba
+*_test.json
+*_example.json
+
+# Archivos de log y diagnóstico
+*.log
+diagnostic-*.js
+monitor-*.js

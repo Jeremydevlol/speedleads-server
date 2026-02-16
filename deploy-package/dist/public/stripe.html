@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="/public/assets/icons/page_icon/stripe.png" type="image/x-icon">
+    <script src="/public/dependencies/bootstrap/js/bootstrap.min.js"></script>
+    <link rel="stylesheet" href="/public/dependencies/bootstrap/css/bootstrap.min.css">
+    <script src="/public/dependencies/jquery/jquery-3.7.1.min.js"></script>
+    <link rel="stylesheet" href="/public/assets/css/templates/colors.css">
+    <link rel="stylesheet" href="/public/assets/css/templates/fonts.css">
+    <script src="https://js.stripe.com/v3/"></script>
+    <title>Pago con Stripe</title>
+</head>
+<body>
+    <div class="container text-center mt-5">
+        <h1>Pago con Stripe</h1>
+        <button id="checkout-button" class="btn btn-primary mt-3">Pagar</button>
+    </div>
+
+    <script>
+        // Reemplaza con tu clave pública de Stripe
+        var stripe = Stripe("pk_test_51RGyjIBHjx6AydYgUNgsAH9ifmnZ5El00w1z9FzAoyTLSFG6CAi4ipujsf4b1g9CMc7t5BAcFLXNMcXptu1L6x8100HTo3AER7");
+
+        // Al hacer clic en el botón de pago
+        document.getElementById("checkout-button").addEventListener("click", function () {
+  // Realiza la solicitud POST al backend para crear la sesión de checkout
+  fetch("http://localhost:5001/api/stripe/create-checkout-session", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      authUid: "b7b5f101-5ffc-4beb-87fe-531c7b880ddb" // Sustituye por el authUid real
+    })
+  })
+  .then(response => response.json())
+  .then(session => {
+    // Redirige a Stripe con el sessionId
+    return stripe.redirectToCheckout({ sessionId: session.id });  // Aquí usas el sessionId recibido
+  })
+  .then(result => {
+    if (result.error) {
+      alert(result.error.message);
+    }
+  })
+  .catch(error => {
+    console.log("Error en la solicitud:", error);
+  });
+});
+    </script>
+</body>
+</html>

@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  leads-api:
+    build: .
+    container_name: leads-whatsapp-api
+    ports:
+      - "5001:5001"
+      - "3000:3000"
+    environment:
+      # Base de datos
+      - DATABASE_URL=${DATABASE_URL}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      
+      # Autenticación
+      - JWT_SECRET=${JWT_SECRET}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
+      
+      # WhatsApp
+      - WHATSAPP_SESSION_PATH=/app/whatsapp-sessions
+      
+      # OpenAI (para IA)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      
+      # Google Cloud (para Vision API)
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/brave-cistern-441722-a9-8aa519ef966f.json
+      
+      # Configuración de producción
+      - NODE_ENV=production
+      - NEXT_TELEMETRY_DISABLED=1
+      
+      # Configuración de red
+      - PORT=5001
+      - HOST=0.0.0.0
+    
+    volumes:
+      # Persistir sesiones de WhatsApp
+      - whatsapp_sessions:/app/whatsapp-sessions
+      # Persistir archivos temporales
+      - temp_files:/app/temp
+      - uploaded_files:/app/uploads
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    networks:
+      - leads-network
+
+volumes:
+  whatsapp_sessions:
+    driver: local
+  temp_files:
+    driver: local
+  uploaded_files:
+    driver: local
+
+networks:
+  leads-network:
+    driver: bridge

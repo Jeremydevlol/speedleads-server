@@ -1,0 +1,239 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches:
+      - main  
+
+env:
+  AWS_REGION: eu-west-1
+  AWS_ACCOUNT_ID: '880780901703'
+  ECR_REPOSITORY: uniclick-be-backend
+  ECS_CLUSTER: uniclick-cluster
+  CF_DISTRIBUTION_ID: E1K074YQD62Q2W
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image to ECR
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Clean up disk space (pre-checkout)
+        run: |
+          echo "🧹 LIMPIEZA AGRESIVA DE ESPACIO EN DISCO..."
+          echo "⚠️ Esto es necesario porque GitHub Actions runners tienen espacio limitado"
+          
+          # Verificar espacio inicial
+          echo "📊 Espacio disponible ANTES de limpiar:"
+          df -h
+          
+          # ELIMINAR TODOS LOS LOGS del runner (esto es lo que causa el error)
+          echo "🗑️ Eliminando logs del runner..."
+          sudo find /home/runner/actions-runner -name "*.log" -type f -delete 2>/dev/null || true
+          sudo find /home/runner/actions-runner/_diag -name "*.log" -type f -delete 2>/dev/null || true
+          sudo find /home/runner/actions-runner/cached/_diag -name "*.log" -type f -delete 2>/dev/null || true
+          sudo rm -rf /home/runner/actions-runner/_diag 2>/dev/null || true
+          sudo rm -rf /home/runner/actions-runner/cached/_diag 2>/dev/null || true
+          sudo mkdir -p /home/runner/actions-runner/_diag 2>/dev/null || true
+          sudo mkdir -p /home/runner/actions-runner/cached/_diag 2>/dev/null || true
+          sudo chmod 777 /home/runner/actions-runner/_diag 2>/dev/null || true
+          sudo chmod 777 /home/runner/actions-runner/cached/_diag 2>/dev/null || true
+          
+          # Limpiar Docker COMPLETAMENTE
+          if command -v docker &> /dev/null; then
+            echo "🐳 Limpiando Docker..."
+            docker system prune -af --volumes 2>/dev/null || true
+            docker builder prune -af 2>/dev/null || true
+          fi
+          
+          # Limpiar caché de apt
+          echo "📦 Limpiando caché de apt..."
+          sudo apt-get clean 2>/dev/null || true
+          sudo rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+          
+          # Limpiar caché de pip y npm
+          echo "🐍 Limpiando caché de pip y npm..."
+          sudo rm -rf ~/.cache/pip/* 2>/dev/null || true
+          sudo rm -rf ~/.npm/* 2>/dev/null || true
+          
+          # Limpiar archivos temporales
+          echo "🗂️ Limpiando archivos temporales..."
+          sudo find /tmp -type f -delete 2>/dev/null || true
+          sudo find /var/tmp -type f -delete 2>/dev/null || true
+          
+          # Limpiar caché de GitHub Actions
+          echo "🔄 Limpiando caché de GitHub Actions..."
+          sudo rm -rf /home/runner/.cache 2>/dev/null || true
+          
+          # Verificar espacio después de limpiar
+          echo "📊 Espacio disponible DESPUÉS de limpiar:"
+          df -h
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Debug values
+        run: |
+          echo "ECR_REGISTRY=$ECR_REGISTRY"
+          echo "ECR_REPOSITORY=$ECR_REPOSITORY"
+          echo "IMAGE_TAG=$IMAGE_TAG"
+
+      - name: Clean up disk space (pre-build)
+        run: |
+          echo "🧹 Limpiando espacio en disco ANTES del build..."
+          df -h
+          
+          # Limpiar logs del runner nuevamente
+          sudo find /home/runner/actions-runner/_diag -name "*.log" -type f -size +10M -delete 2>/dev/null || true
+          sudo find /home/runner/actions-runner/cached/_diag -name "*.log" -type f -size +10M -delete 2>/dev/null || true
+          
+          # Limpiar caché de Docker antes del build
+          if command -v docker &> /dev/null; then
+            docker system prune -af --volumes 2>/dev/null || true
+          fi
+          
+          # Limpiar node_modules si existe (se reinstalará)
+          find . -name "node_modules" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          
+          # Verificar espacio
+          echo "📊 Espacio disponible antes del build:"
+          df -h
+
+      # - name: Build Docker image
+      #   run: |
+      #     docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+      #     docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      #     docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      # - name: Push Docker image to ECR
+      #   run: |
+      #     docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      #     docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+      #     echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Verify disk space before build
+        run: |
+          echo "📊 Verificando espacio disponible antes del build..."
+          df -h
+          AVAILABLE=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//' || echo "0")
+          echo "Espacio disponible: ${AVAILABLE}GB"
+          if [ "$AVAILABLE" -lt 5 ]; then
+            echo "⚠️ ADVERTENCIA: Menos de 5GB disponibles. Limpiando más agresivamente..."
+            sudo find /home/runner/actions-runner -name "*.log" -type f -delete 2>/dev/null || true
+            docker system prune -af --volumes 2>/dev/null || true
+            df -h
+          else
+            echo "✅ Espacio suficiente disponible"
+          fi
+
+      - name: Build and push Docker image (optimized for Enterprise)
+        id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Sin caché para minimizar uso de espacio
+          no-cache: true
+          # Construir directamente en ECR sin guardar localmente
+          load: false
+          # Usar compresión para reducir transferencia
+          platforms: linux/amd64
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }},${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          # Reducir logs para minimizar espacio de logs
+          secrets: |
+            # Sin secrets necesarios por ahora
+
+      - name: Clean up after build
+        if: always()
+        run: |
+          echo "🧹 Limpiando después del build..."
+          
+          # Limpiar Docker completamente
+          docker system prune -af --volumes 2>/dev/null || true
+          
+          # Limpiar logs del runner después del build
+          sudo find /home/runner/actions-runner/_diag -name "*.log" -type f -size +1M -delete 2>/dev/null || true
+          sudo find /home/runner/actions-runner/cached/_diag -name "*.log" -type f -size +1M -delete 2>/dev/null || true
+          
+          # Verificar espacio final
+          echo "📊 Espacio disponible después del build:"
+          df -h
+
+  deploy-api-eu-west-1:
+    name: Deploy Api to ECS
+    runs-on: ubuntu-latest
+    needs: build-and-push 
+    env:
+      # set this to your Amazon ECS service name
+      ECS_SERVICE: uniclick-be-api-eu-west-1
+      # set this to the path to your Amazon ECS task definition
+      ECS_TASK_DEFINITION: uniclick-be-api-task-definition
+      # set this to the container definition to your Amazon ECS task definition
+      CONTAINER_NAME: uniclick-be-api-container
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition ${{ env.ECS_TASK_DEFINITION }} --query taskDefinition > task-definition.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@97587c9d45a4930bf0e3da8dd2feb2a463cf4a3a
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  invalidate-cf-cache:
+    runs-on: ubuntu-latest
+    needs: [deploy-api-eu-west-1]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Request Invalidation to AWS Cloudfront
+        uses: oneyedev/aws-cloudfront-invalidation@v1
+        with:
+          distribution-id: ${{ env.CF_DISTRIBUTION_ID }}
+          paths: |
+            /*

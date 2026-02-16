@@ -1,0 +1,26 @@
+node_modules/
+uploads/
+.wwebjs_auth*/
+.wwebjs_cache*/
+baileys_auth*/
+
+# Directorios temporales
+temp/
+tmp/
+
+# Archivos temporales de audio
+*.ogg
+*.wav
+*.mp3
+*.m4a
+*.txt
+
+# Archivos de transcripción
+*_transcription.txt
+*_transcript.txt
+
+# Secretos y credenciales (nunca subir)
+.env
+.env.*
+**/credentials/*.json
+*-????????-????-????-????-????????????.json
