@@ -27,3 +27,6 @@ tmp/
 # Google Cloud service account keys (nunca subir)
 *-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9].json
 brave-cistern-441722-a9-8aa519ef966f.json
+
+# Archivos temporales de editor (pueden contener copias de .env)
+Untitled
