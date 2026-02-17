@@ -46,6 +46,7 @@ import websitesRoutes from './routes/websitesRoutes.js';
 import instagramGraphRoutes from './routes/instagramGraphRoutes.js';
 import instagramAuthRoutes from './routes/instagramAuthRoutes.js';
 import instagramPrivateRoutes from './routes/instagramPrivateRoutes.js';
+import metaWebhookRoutes from './routes/metaWebhookRoutes.js';
 
 // =============================================
 // CONFIGURACIÓN DE VARIABLES DE ENTORNO
@@ -263,6 +264,9 @@ app.use(cookieParser());
 // ⚡ 1) WEBHOOK DE STRIPE — RAW BODY — PRIMERO DE TODO
 app.post('/api/stripe/webhook', ...stripeWebhookRaw);
 
+// ⚡ 1b) WEBHOOK META (Messenger/Instagram) — RAW BODY para X-Hub-Signature-256
+app.use('/webhook', metaWebhookRoutes);
+
 // ⚡ 2) BODY PARSERS — DESPUÉS del webhook (y ANTES del resto)
 app.use(express.json({ limit: '1gb' }));
 app.use(express.urlencoded({ extended: true, limit: '1gb' }));
@@ -357,27 +361,9 @@ app.get('/', (req, res) => {
   res.status(200).send('SpeedLeads Backend is running (Full Mode)');
 });
 
-// Health check
+// Health check (200 + body "ok" para Render y load balancers)
 app.get('/health', (req, res) => {
-  try {
-    // Health check simple y rápido
-    const healthData = {
-      status: 'OK',
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
-      memory: process.memoryUsage(),
-      pid: process.pid
-    };
-    
-    res.status(200).json(healthData);
-  } catch (error) {
-    console.error('Health check error:', error);
-    res.status(500).json({ 
-      status: 'ERROR',
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
+  res.status(200).send('ok');
 });
 
 // ✅ Health check adicional súper simple
@@ -615,9 +601,9 @@ async function testConnection() {
 }
 
 // =============================================
-// INICIAR SERVIDOR
+// INICIAR SERVIDOR (Render: process.env.PORT; siempre 0.0.0.0)
 // =============================================
-server.listen(Number(ENV_CONFIG.PORT), '0.0.0.0', async () => {
+server.listen(Number(ENV_CONFIG.PORT) || 5001, '0.0.0.0', async () => {
   console.clear();
 
   console.log('\x1b[36m%s\x1b[0m', `

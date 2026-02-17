@@ -4,49 +4,63 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 
-// Intentar cargar .env manualmente
-console.log('CWD:', process.cwd());
-try {
-  const envPath = path.resolve(process.cwd(), '.env');
-  if (fs.existsSync(envPath)) {
-    console.log('Found .env at:', envPath);
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    envContent.split('\n').forEach(line => {
-      const parts = line.split('=');
-      if (parts.length >= 2) {
-        const key = parts[0].trim();
-        const val = parts.slice(1).join('=').trim();
-        if (key && val && !process.env[key]) {
-             process.env[key] = val.replace(/^["']|["']$/g, ''); // Remove quotes
-        }
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(__dirname, '..', '..');
+
+function loadEnvFile(envPath) {
+  if (!fs.existsSync(envPath)) return false;
+  const envContent = fs.readFileSync(envPath, 'utf8');
+  envContent.split('\n').forEach(line => {
+    const parts = line.split('=');
+    if (parts.length >= 2) {
+      const key = parts[0].trim();
+      const val = parts.slice(1).join('=').trim();
+      if (key && val && !process.env[key]) {
+        process.env[key] = val.replace(/^["']|["']$/g, '');
       }
-    });
-  } else {
-    console.warn('.env file not found at CWD');
-  }
-} catch (e) {
-  console.error('Error loading .env manually:', e.message);
+    }
+  });
+  return true;
 }
 
-// También intentar dotenv standard
-dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+const envPaths = [
+  path.resolve(projectRoot, '.env'),
+  path.resolve(process.cwd(), '.env'),
+];
+let loaded = false;
+for (const envPath of envPaths) {
+  if (loadEnvFile(envPath)) {
+    console.log('Loaded .env from:', envPath);
+    loaded = true;
+    break;
+  }
+}
+if (!loaded) console.warn('.env not found. Tried:', envPaths.join(', '));
+dotenv.config({ path: envPaths[0] });
+dotenv.config({ path: envPaths[1] });
 
 import { createClient } from '@supabase/supabase-js';
 import pg from 'pg';
 const { Pool } = pg;
 
-// Debug environment variables
-console.log('Supabase URL:', process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL);
-console.log('Service Role Key present?', !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.error('\n❌ Faltan variables de Supabase. Crea un archivo .env en la raíz del proyecto con:\n');
+  console.error('   SUPABASE_URL=https://tu-proyecto.supabase.co');
+  console.error('   SUPABASE_SERVICE_ROLE_KEY=eyJ... (desde Supabase → Project Settings → API)\n');
+  console.error('   Puedes copiar: cp .env.example .env  y luego editar .env con tus valores.\n');
+  process.exit(1);
+}
 
 // ----------------------------------------------------------------------------
 //  CLIENTE ADMIN DE SUPABASE (para Auth y operaciones protegidas)
 // ----------------------------------------------------------------------------
 
-// 1) Cliente admin de Supabase (solo para Auth)
 export const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  supabaseUrl,
+  supabaseServiceKey,
   { auth: { autoRefreshToken: true, persistSession: false, detectSessionInUrl: false } }
 );
 
