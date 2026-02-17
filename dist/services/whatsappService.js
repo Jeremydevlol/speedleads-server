@@ -11,6 +11,7 @@ import { fileURLToPath } from 'url';
 // Removemos la importación circular de io
 // import { io as ioSocket } from '../app.js';
 import pool, { supabaseAdmin } from '../config/db.js';
+import { getSingleAgentForUser } from '../controllers/personalityController.js';
 import { saveIncomingMessage } from '../controllers/whatsappController.js';
 import { analyzeImageBufferWithVision, analyzePdfBufferWithVision } from '../services/googleVisionService.js';
 
@@ -448,7 +449,7 @@ export async function startSession(userId) {
         const { data: userSettings, error: settingsError } = await supabaseAdmin
           .from('user_settings')
           .select('id')
-          .eq('users_id', userId)
+          .eq('user_id', userId)
           .single();
 
         if (settingsError && settingsError.code === 'PGRST116') {
@@ -458,11 +459,9 @@ export async function startSession(userId) {
           const { error: insertError } = await supabaseAdmin
             .from('user_settings')
             .insert({
-              users_id: userId,
-              default_personality_id: 1,
-              ai_global_active: true, // ✅ ACTIVADO POR DEFECTO para responder automáticamente
-              updated_at: new Date().toISOString(),
-              tenant: ''
+              user_id: userId,
+              global_personality_id: '1',
+              updated_at: new Date().toISOString()
             });
           
           if (insertError) {
@@ -594,19 +593,22 @@ export async function startSession(userId) {
               console.log(`⚠️ No se pudo obtener información del contacto ${from}, usando nombre por defecto`);
             }
             
-            // Crear la conversación en la base de datos
+            // Modelo agente único: obtener agente del usuario para asignar a la nueva conversación
+            const agent = await getSingleAgentForUser(userId);
+            const insertData = {
+              user_id: userId,
+              external_id: from,
+              contact_name: contactName,
+              contact_photo_url: contactPhotoUrl,
+              wa_user_id: waUserId,
+              started_at: new Date().toISOString(),
+              ai_active: true,
+              tenant: 'whatsapp'
+            };
+            if (agent?.id) insertData.personality_id = agent.id;
             const { data: newConv, error: createError } = await supabaseAdmin
               .from('conversations_new')
-              .insert({
-                user_id: userId,
-                external_id: from,
-                contact_name: contactName,
-                contact_photo_url: contactPhotoUrl,
-                wa_user_id: waUserId,
-                started_at: new Date().toISOString(),
-                ai_active: true, // ✅ ACTIVADO POR DEFECTO para responder automáticamente
-                tenant: 'whatsapp'
-              })
+              .insert(insertData)
               .select('id')
               .single();
             

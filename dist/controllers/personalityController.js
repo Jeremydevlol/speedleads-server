@@ -17,6 +17,24 @@ function getUserId(req) {
   return id
 }
 
+/**
+ * Obtiene el agente único del usuario (modelo 1 agente por usuario).
+ * @param {string} userId - ID del usuario
+ * @returns {Promise<object|null>} El agente o null si no existe
+ */
+export async function getSingleAgentForUser(userId) {
+  if (!userId) return null;
+  const { data, error } = await supabaseAdmin
+    .from('personalities')
+    .select('*')
+    .eq('users_id', userId)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error || !data) return null;
+  return data;
+}
+
 // Imports para soporte de URLs de video
 import { processVideoUrls } from '../utils/personalityVideoUrlHandler.js'
 import { checkYtDlpAvailability, detectVideoUrl } from '../utils/videoUrlProcessor.js'
@@ -128,6 +146,25 @@ function formatPersonalityData(personalidad, lang = 'es') {
     ? personalidad.context
     : useDef.context?.[lang] || 'Contexto no especificado';  // Si no hay contexto, asignamos 'Contexto no especificado'
 
+  // Campos mejorados (tone, language, response_style, industry, etc.)
+  const tone = personalidad.tone || 'professional';
+  const language = personalidad.language || 'es';
+  const response_style = personalidad.response_style || personalidad.responseStyle || 'medium';
+  const industry = personalidad.industry || null;
+  const fallback_message = personalidad.fallback_message || personalidad.fallbackMessage || null;
+  const no_answer_message = personalidad.no_answer_message || personalidad.noAnswerMessage || null;
+  const max_response_words = personalidad.max_response_words != null
+    ? parseInt(personalidad.max_response_words, 10)
+    : (personalidad.maxResponseWords != null ? parseInt(personalidad.maxResponseWords, 10) : null);
+  const system_prompt_extra = personalidad.system_prompt_extra || personalidad.systemPromptExtra || null;
+  const forbidden_topics = personalidad.forbidden_topics != null
+    ? (Array.isArray(personalidad.forbidden_topics) ? JSON.stringify(personalidad.forbidden_topics) : personalidad.forbidden_topics)
+    : (personalidad.forbiddenTopics != null ? (Array.isArray(personalidad.forbiddenTopics) ? JSON.stringify(personalidad.forbiddenTopics) : personalidad.forbiddenTopics) : null);
+  const keywords = personalidad.keywords != null
+    ? (Array.isArray(personalidad.keywords) ? JSON.stringify(personalidad.keywords) : personalidad.keywords)
+    : null;
+  const allow_off_topic = personalidad.allow_off_topic !== false && personalidad.allowOffTopic !== false;
+
   return {
     nombre,
     empresa: personalidad.empresa || useDef.empresa || 'Sin empresa',  // Asignamos valor predeterminado
@@ -137,7 +174,18 @@ function formatPersonalityData(personalidad, lang = 'es') {
     saludo,
     category: cat,
     context,
-    timeResponse: personalidad.timeResponse
+    timeResponse: personalidad.timeResponse,
+    tone,
+    language,
+    response_style,
+    industry,
+    fallback_message,
+    no_answer_message,
+    max_response_words,
+    system_prompt_extra,
+    forbidden_topics,
+    keywords,
+    allow_off_topic
   };
 }
 
@@ -202,30 +250,37 @@ function splitTextIntoChunks(text, maxChars = 1000) {
 }
 
 // -----------------------------------------------------------------------------
-// Obtener todas las personalidades del usuario
+// Obtener el agente único del usuario (modelo 1 agente por usuario)
 // GET /api/personalities/all
+// Devuelve 0 o 1 agente. Compatible con frontend que espera array.
 // -----------------------------------------------------------------------------
 export const getAllPersonalities = async (req, res) => {
   try {
     const userId = getUserId(req)
     if (!userId) {
-      return res.status(401).json({ success: false, message: 'No autenticado', personalidades: [] })
+      return res.status(401).json({ success: false, message: 'No autenticado', personalidades: [], data: [] })
     }
 
-    // MIGRADO: Usar API de Supabase en lugar de pool.query
+    // Modelo agente único: devolver máximo 1 agente por usuario
     const { data, error } = await supabaseAdmin
       .from('personalities')
       .select('*')
       .eq('users_id', userId)
-      .order('updated_at', { ascending: false });
+      .order('updated_at', { ascending: false })
+      .limit(1);
 
     if (error) {
-      console.error('Error al obtener personalidades desde Supabase:', error);
+      console.error('Error al obtener agente desde Supabase:', error);
       throw error;
     }
 
-    console.log(`✅ Personalidades cargadas: ${data?.length || 0} encontradas para usuario ${userId}`);
-    return res.json({ success: true, personalidades: data || [] })
+    const agentes = data || [];
+    console.log(`✅ Agente cargado: ${agentes.length} encontrado(s) para usuario ${userId}`);
+    return res.json({
+      success: true,
+      personalidades: agentes,
+      data: agentes
+    })
   } catch (error) {
     if (error instanceof Error) {
       console.error('Error al obtener personalidades:', error.message)
@@ -238,9 +293,10 @@ export const getAllPersonalities = async (req, res) => {
 }
 
 // -----------------------------------------------------------------------------
-// Crear una nueva personalidad
+// Crear o actualizar el agente único (modelo 1 agente por usuario)
 // POST /api/personalities/create_personality
 // Body: { personalidad: { nombre, instrucciones, category, ... } }
+// Si ya existe un agente, se actualiza en lugar de crear uno nuevo.
 // -----------------------------------------------------------------------------
 export const createPersonality = async (req, res) => {
   try {
@@ -265,12 +321,18 @@ export const createPersonality = async (req, res) => {
     }
 
     const formattedData = formatPersonalityData(personalidad, lang);
-
-    // Extrae 'context' si existe, separa los datos para la base de datos
-    const { context, ...dbData } = formattedData;
+    const dbData = formattedData;
 
     const avatar_url = personalidad.avatar_url ?? null;
     const time_response = personalidad.timeResponse ? parseInt(personalidad.timeResponse, 10) : null;
+
+    // Modelo agente único: si ya existe un agente para el usuario, actualizarlo
+    const existingAgent = await getSingleAgentForUser(userId);
+    if (existingAgent) {
+      console.log(`🔄 Usuario ya tiene agente (ID: ${existingAgent.id}), actualizando en lugar de crear...`);
+      req.body.personalidad = { ...personalidad, id: existingAgent.id };
+      return editPersonality(req, res);
+    }
 
     // Debug: verificar los datos que se van a insertar
     console.log('🔍 DEBUG datos a insertar:', {
@@ -291,6 +353,21 @@ export const createPersonality = async (req, res) => {
 
     // MIGRADO: Usar función SQL directa para evitar trigger problemático, con fallback
     console.log('🛠️ Intentando función SQL create_personality_safe...');
+    const enhancedFields = {
+      tone: dbData.tone,
+      language: dbData.language,
+      response_style: dbData.response_style,
+      industry: dbData.industry,
+      context: dbData.context,
+      fallback_message: dbData.fallback_message,
+      no_answer_message: dbData.no_answer_message,
+      max_response_words: dbData.max_response_words,
+      system_prompt_extra: dbData.system_prompt_extra,
+      forbidden_topics: dbData.forbidden_topics,
+      keywords: dbData.keywords,
+      allow_off_topic: dbData.allow_off_topic
+    };
+
     let { data, error } = await supabaseAdmin.rpc('create_personality_safe', {
       p_users_id: userId,
       p_nombre: dbData.nombre,
@@ -321,6 +398,7 @@ export const createPersonality = async (req, res) => {
           category: dbData.category,
           avatar_url: avatar_url,
           time_response: time_response,
+          ...enhancedFields,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         })
@@ -360,8 +438,20 @@ export const createPersonality = async (req, res) => {
     }
 
     // La función SQL retorna JSON, el INSERT directo retorna objeto
-    const newP = typeof data === 'string' ? JSON.parse(data) : data;
-    console.log(`✅ Personalidad creada exitosamente: ${newP.nombre} (ID: ${newP.id})`);
+    let newP = typeof data === 'string' ? JSON.parse(data) : data;
+
+    // Si se usó RPC, la función no incluye campos mejorados: actualizar en un segundo paso
+    if (error === null && !data?.tone) {
+      const { data: updatedData } = await supabaseAdmin
+        .from('personalities')
+        .update({ ...enhancedFields, updated_at: new Date().toISOString() })
+        .eq('id', newP.id)
+        .select()
+        .single();
+      if (updatedData) newP = updatedData;
+    }
+
+    console.log(`✅ Agente creado exitosamente: ${newP.nombre} (ID: ${newP.id})`);
     console.log(`🔍 DEBUG sitio_web guardado en BD:`, {
       sitio_web_en_bd: newP.sitio_web,
       sitio_web_enviado: dbData.sitio_web,
@@ -371,6 +461,16 @@ export const createPersonality = async (req, res) => {
     if (!userId) {
       return res.status(401).json({ success: false, message: 'Usuario no autenticado' });
     }
+
+    // Modelo agente único: actualizar user_settings.global_personality_id al nuevo agente
+    await supabaseAdmin
+      .from('user_settings')
+      .upsert({
+        user_id: userId,
+        global_personality_id: String(newP.id),
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id' })
+      .then(() => {}).catch(err => console.warn('⚠️ No se pudo actualizar user_settings:', err.message));
 
     // 🌐 Scrapear sitio web automáticamente si existe
     if (dbData.sitio_web && dbData.sitio_web.trim() !== '') {
@@ -475,8 +575,23 @@ export const editPersonality = async (req, res) => {
 
     const formattedData = formatPersonalityData(personalidad, lang);
     const avatar_url = personalidad.avatar_url ?? null;
+    const dbData = formattedData;
+    const timeResponse = personalidad.timeResponse ? parseInt(personalidad.timeResponse, 10) : null;
 
-    const { context, timeResponse, ...dbData } = formattedData;
+    const enhancedFields = {
+      tone: dbData.tone,
+      language: dbData.language,
+      response_style: dbData.response_style,
+      industry: dbData.industry,
+      context: dbData.context,
+      fallback_message: dbData.fallback_message,
+      no_answer_message: dbData.no_answer_message,
+      max_response_words: dbData.max_response_words,
+      system_prompt_extra: dbData.system_prompt_extra,
+      forbidden_topics: dbData.forbidden_topics,
+      keywords: dbData.keywords,
+      allow_off_topic: dbData.allow_off_topic
+    };
 
     // MIGRADO: Usar API de Supabase en lugar de pool.query
     const { data, error } = await supabaseAdmin
@@ -491,6 +606,7 @@ export const editPersonality = async (req, res) => {
         category: dbData.category,
         avatar_url: avatar_url,
         time_response: timeResponse,
+        ...enhancedFields,
         updated_at: new Date().toISOString()
       })
       .eq('id', personalidad.id)
@@ -504,7 +620,18 @@ export const editPersonality = async (req, res) => {
     }
 
     const updatedP = data;
-    console.log(`✅ Personalidad actualizada: ${updatedP.nombre} (ID: ${updatedP.id})`);
+    console.log(`✅ Agente actualizado: ${updatedP.nombre} (ID: ${updatedP.id})`);
+
+    // Modelo agente único: asegurar que user_settings apunte a este agente
+    await supabaseAdmin
+      .from('user_settings')
+      .upsert({
+        user_id: userId,
+        global_personality_id: String(updatedP.id),
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id' })
+      .then(() => {}).catch(err => console.warn('⚠️ No se pudo actualizar user_settings:', err.message));
+
     console.log(`🔍 DEBUG sitio_web guardado en BD (edit):`, {
       sitio_web_en_bd: updatedP.sitio_web,
       sitio_web_enviado: dbData.sitio_web,
@@ -2180,18 +2307,29 @@ export const getSaludoById = async (req, res) => {
 }
 
 // -----------------------------------------------------------------------------
-// Asignar personalidad a la conversación
+// Asignar agente a la conversación (modelo agente único)
 // POST /api/personalities/set_conversation_personality
+// Siempre usa el agente único del usuario. personalityId en body se ignora por compatibilidad.
 // -----------------------------------------------------------------------------
 export const setConversationPersonality = async (req, res) => {
   try {
     const userId = getUserIdFromToken(req)
     const { conversationId, personalityId } = req.body
 
-    if (!conversationId || !personalityId) {
+    if (!conversationId) {
       return res.status(400).json({
         success: false,
-        message: 'Faltan datos (conversationId y personalityId)',
+        message: 'Falta conversationId',
+      })
+    }
+
+    // Modelo agente único: usar siempre el agente del usuario
+    const agent = await getSingleAgentForUser(userId)
+    const agentId = agent?.id ?? personalityId
+    if (!agentId) {
+      return res.status(400).json({
+        success: false,
+        message: 'No tienes un agente configurado. Crea uno primero.',
       })
     }
 
@@ -2200,12 +2338,12 @@ export const setConversationPersonality = async (req, res) => {
          SET personality_id = $1
        WHERE external_id = $2
          AND user_id    = $3`,
-      [personalityId, conversationId, userId]
+      [agentId, conversationId, userId]
     )
 
     io.to(userId).emit('conversation-personality-set', {
       conversationId,
-      personalityId,
+      personalityId: agentId,
     })
 
     return res.json({ success: true })
@@ -2231,10 +2369,10 @@ export async function setGlobalPersonality(req, res) {
     // Actualizar la configuración
     await pool.query(
       `
-      INSERT INTO user_settings (user_id, default_personality_id, ai_global_active, updated_at)
-      VALUES ($1, $2, $3, NOW())
+      INSERT INTO user_settings (user_id, global_personality_id, ai_global_active, updated_at)
+      VALUES ($1, $2::text, $3, NOW())
       ON CONFLICT (user_id) DO UPDATE
-        SET default_personality_id = EXCLUDED.default_personality_id,
+        SET global_personality_id = EXCLUDED.global_personality_id,
             ai_global_active       = EXCLUDED.ai_global_active,
             updated_at             = NOW()
     `,
@@ -2244,7 +2382,7 @@ export async function setGlobalPersonality(req, res) {
     // Obtener los datos actualizados para devolverlos al frontend
     const { rows } = await pool.query(
       `
-      SELECT default_personality_id AS "personalityId",
+      SELECT global_personality_id AS "personalityId",
              ai_global_active       AS "aiActive",
              updated_at             AS "updatedAt"
         FROM user_settings
@@ -2281,7 +2419,7 @@ export async function getGlobalPersonality(req, res) {
   try {
     const { rows } = await pool.query(
       `
-      SELECT default_personality_id AS "personalityId",
+      SELECT global_personality_id AS "personalityId",
              ai_global_active       AS "aiActive"
         FROM user_settings
        WHERE user_id = $1
@@ -2374,7 +2512,7 @@ export const debugUserIdType = async (req, res) => {
       const { data, error } = await supabaseAdmin
         .from('user_settings')
         .select('*')
-        .eq('users_id', userId)
+        .eq('user_id', userId)
         .limit(1);
       
       if (error) {

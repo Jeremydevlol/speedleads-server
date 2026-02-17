@@ -24,8 +24,8 @@ export const getUserSettings = async (req, res) => {
     // Leer la fila
     const { rows } = await pool.query(`
       SELECT
-        default_personality_id AS "defaultPersonalityId",
-        ai_global_active       AS "aiGlobalActive"
+        global_personality_id AS "defaultPersonalityId",
+        ai_global_active      AS "aiGlobalActive"
       FROM user_settings
       WHERE user_id = $1
       LIMIT 1
@@ -100,10 +100,10 @@ export const setDefaultPersonality = async (req, res) => {
 
     await pool.query(`
       UPDATE user_settings
-         SET default_personality_id = $1,
-             updated_at            = NOW()
+         SET global_personality_id = $1,
+             updated_at           = NOW()
        WHERE user_id = $2
-    `, [personalityId, userId])
+    `, [personalityId != null ? String(personalityId) : null, userId])
 
     return res.json({ success: true, defaultPersonalityId: personalityId })
   } catch (err) {

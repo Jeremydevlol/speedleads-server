@@ -6,6 +6,7 @@ import pdfParse from 'pdf-parse-debugging-disabled'
 import qrcode from 'qrcode'
 import { promisify } from 'util'
 import pool, { supabaseAdmin } from '../config/db.js'
+import { getSingleAgentForUser } from './personalityController.js'
 import { generateBotResponse } from '../services/openaiService.js'
 import { emitToUser, getCachedQr, isSessionConnected, sessions, startSession } from '../services/whatsappService.js'
 import { extractImageText, extractPdfText } from '../utils/mediaUtils.js'
@@ -977,8 +978,8 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
 
   const { data: settingsData, error: settingsError } = await supabaseAdmin
     .from('user_settings')
-    .select('ai_global_active, default_personality_id')
-    .eq('users_id', userId)
+    .select('global_personality_id, ai_global_active')
+    .eq('user_id', userId)
     .single();
 
   let ai_global_active = true; // ✅ ACTIVADO POR DEFECTO
@@ -994,8 +995,8 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
       console.log('🔧 No hay configuración de usuario, usando valores por defecto (IA activa)');
     }
   } else {
-    ai_global_active = settingsData.ai_global_active !== false; // Si es null/undefined, usar true
-    default_personality_id = settingsData.default_personality_id || 1;
+    ai_global_active = (settingsData?.ai_global_active !== false); // Si es null/undefined, usar true
+    default_personality_id = settingsData?.global_personality_id || 1;
   }
 
   // ✅ SIEMPRE intentar responder si hay una personalidad disponible
@@ -1005,60 +1006,33 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
     return { success: true, aiReply: null };
   }
 
-  // Obtener personalidad
+  // Modelo agente único: obtener agente del usuario
+  // Orden: personality_id de conversación -> global_personality_id -> único agente del usuario
   let personalityData = null;
   if (ai_active && personality_id) {
-    const { data: personalityFromAI, error: personalityError } = await supabaseAdmin
+    const { data: pFromConv, error: errConv } = await supabaseAdmin
       .from('personalities')
       .select('*')
       .eq('id', personality_id)
+      .eq('users_id', userId)
       .single();
-
-    if (personalityError) {
-      if (personalityError.code !== 'PGRST116') {
-        console.error('Error al obtener personalidad específica:', personalityError);
-        // Continuar para intentar con la personalidad global
-      } else {
-        // No hay personalidad específica, usar la global
-      }
-    } else {
-      personalityData = personalityFromAI;
-    }
+    if (!errConv && pFromConv) personalityData = pFromConv;
   }
-  
-  // Si no hay personalidad específica o no está activa la IA en la conversación, usar la global
   if (!personalityData && default_personality_id) {
-    const { data: personalityFromGlobal, error: personalityError } = await supabaseAdmin
+    const { data: pFromGlobal, error: errGlobal } = await supabaseAdmin
       .from('personalities')
       .select('*')
       .eq('id', default_personality_id)
+      .eq('users_id', userId)
       .single();
-
-    if (personalityError) {
-      if (personalityError.code !== 'PGRST116') {
-        console.error('Error al obtener personalidad global:', personalityError);
-      }
-    } else {
-      personalityData = personalityFromGlobal;
-    }
+    if (!errGlobal && pFromGlobal) personalityData = pFromGlobal;
   }
-
-  // ✅ Si aún no hay personalidad, intentar obtener la personalidad ID 1 como último recurso
   if (!personalityData) {
-    console.log('⚠️ No se encontró personalidad configurada, intentando con ID 1...');
-    const { data: fallbackPersonality, error: fallbackError } = await supabaseAdmin
-      .from('personalities')
-      .select('*')
-      .eq('id', 1)
-      .single();
-    
-    if (!fallbackError && fallbackPersonality) {
-      personalityData = fallbackPersonality;
-      console.log('✅ Usando personalidad de respaldo (ID 1)');
-    } else {
-      console.log('❌ No se encontró ninguna personalidad disponible para la IA.');
+    personalityData = await getSingleAgentForUser(userId);
+  }
+  if (!personalityData) {
+    console.log('❌ No se encontró agente configurado para el usuario.');
     return { success: true, aiReply: null };
-    }
   }
 
   console.log(`🤖 Usando personalidad: ${personalityData.nombre} (ID: ${personalityData.id})`);
@@ -2306,6 +2280,11 @@ export const getConversations = async (req, res) => {
     const uniqueConvs = Array.from(uniqueConvsMap.values());
     console.log(`✅ Debug getConversations: Después de filtro de duplicados: ${uniqueConvs.length} conversaciones únicas`);
 
+    // Modelo agente único: obtener el agente del usuario para enriquecer conversaciones sin personality_id
+    const userAgent = await getSingleAgentForUser(users_id);
+    const agentId = userAgent?.id ?? null;
+    const agentName = userAgent?.nombre ?? null;
+
     // Enriquecer conversaciones con nombres reales desde WhatsApp si el nombre es solo un número
     // Solo intentar si hay sesión activa con socket
     const enrichedConvs = await Promise.all(
@@ -2333,14 +2312,19 @@ export const getConversations = async (req, res) => {
             console.log(`⚠️ No se pudo obtener nombre real para ${conv.id}:`, nameError.message);
           }
         }
+        // Modelo agente único: si la conversación tiene IA activa pero sin personality_id, usar el agente del usuario
+        if ((conv.aiActive || conv.ai_active) && !conv.personalityId && agentId) {
+          conv.personalityId = agentId;
+          conv.personalityName = agentName;
+        }
         return conv;
       })
     );
 
     const { data: settingsData, error: settingsError } = await supabaseAdmin
       .from('user_settings')
-      .select('ai_global_active, default_personality_id')
-      .eq('users_id', users_id)
+      .select('global_personality_id, ai_global_active')
+      .eq('user_id', users_id)
       .single();
 
     let settings = {};
@@ -2361,8 +2345,8 @@ export const getConversations = async (req, res) => {
       connected: isConnected, // ✅ Estado de conexión explícito
       conversations: enrichedConvs,
       globalSettings: {
-        aiGlobalActive: settings.ai_global_active ?? true, // ✅ Por defecto ACTIVADA
-        globalPersonalityId: settings.default_personality_id || null
+        aiGlobalActive: settings?.ai_global_active ?? true, // ✅ Por defecto ACTIVADA
+        globalPersonalityId: settings.global_personality_id || null
       }
     })
 
@@ -2820,15 +2804,15 @@ export async function sendAIMessage(userId, phoneNumber, prompt, defaultCountry 
     if (!personalityData) {
       const { data: userSettings } = await supabaseAdmin
         .from('user_settings')
-        .select('default_personality_id')
-        .eq('users_id', userId)
+        .select('global_personality_id')
+        .eq('user_id', userId)
         .single();
         
-      if (userSettings?.default_personality_id) {
+      if (userSettings?.global_personality_id) {
         const { data: defaultPersonality } = await supabaseAdmin
           .from('personalities')
           .select('*')
-          .eq('id', userSettings.default_personality_id)
+          .eq('id', userSettings.global_personality_id)
           .eq('users_id', userId)
           .single();
           
@@ -2972,33 +2956,43 @@ async function processMediaArray(media, conversationId, messageId, type, userId)
 }
 
 /**
- * 12) ASIGNAR PERSONALIDAD A UNA CONVERS
+ * 12) ASIGNAR AGENTE A UNA CONVERSACIÓN (modelo agente único)
+ * Siempre usa el agente único del usuario. personalityId en body opcional (compatibilidad).
  */
 export const setConversationPersonality = async (req, res) => {
   try {
     const users_id = getUserIdFromToken(req)
     const { conversationId, personalityId } = req.body
 
-    // Verificación de parámetros
-    if (!conversationId || !personalityId) {
+    if (!conversationId) {
       return res.status(400).json({
         success: false,
-        message: 'Faltan parámetros (conversationId, personalityId)'
+        message: 'Falta conversationId'
       })
     }
 
-    // Actualizar la personalidad y activar la IA para la conversación
+    // Modelo agente único: usar el agente del usuario
+    const agent = await getSingleAgentForUser(users_id)
+    const agentId = agent?.id ?? personalityId
+    if (!agentId) {
+      return res.status(400).json({
+        success: false,
+        message: 'No tienes un agente configurado. Crea uno primero.'
+      })
+    }
+
+    // Actualizar la conversación con el agente y activar IA
     await pool.query(`
       UPDATE conversations_new
          SET personality_id = $1,
              ai_active = TRUE 
        WHERE external_id = $2
          AND user_id = $3
-    `, [personalityId, conversationId, users_id])
+    `, [agentId, conversationId, users_id])
 
     return res.status(200).json({
       success: true,
-      message: 'Personalidad asignada a la conversación y IA activada'
+      message: 'Agente asignado a la conversación y IA activada'
     })
   } catch (error) {
     console.error('Error setConversationPersonality:', error)
@@ -3370,26 +3364,32 @@ export const getAiMessagesCount = async (req, res) => {
 }
 
 /**
- * 18) Personalidad por defecto (global)
+ * 18) Agente por defecto (modelo agente único)
+ * Si no se envía personalityId, se usa el agente único del usuario.
  */
 export const setDefaultPersonality = async (req, res) => {
   try {
     const users_id = getUserIdFromToken(req)
-    const { personalityId } = req.body
+    let { personalityId } = req.body
 
+    // Modelo agente único: si no viene personalityId, usar el agente del usuario
     if (!personalityId) {
-      return res.status(400).json({ success: false, message: 'No enviaste personalityId' })
+      const agent = await getSingleAgentForUser(users_id)
+      personalityId = agent?.id
+    }
+    if (!personalityId) {
+      return res.status(400).json({ success: false, message: 'No hay agente configurado ni se envió personalityId' })
     }
 
-    // Insert o Update en user_settings - MIGRADO: Usar API de Supabase
+    // Insert o Update en user_settings
     const { error } = await supabaseAdmin
       .from('user_settings')
       .upsert({
-        users_id: users_id,
-        default_personality_id: personalityId,
+        user_id: users_id,
+        global_personality_id: personalityId != null ? String(personalityId) : null,
         updated_at: new Date().toISOString()
       }, {
-        onConflict: 'users_id'
+        onConflict: 'user_id'
       });
 
     if (error) {
@@ -3415,12 +3415,10 @@ export const activateGlobalAIAll = async (req, res) => {
     const { error } = await supabaseAdmin
       .from('user_settings')
       .upsert({
-        users_id: users_id,
+        user_id: users_id,
         ai_global_active: aiGlobalActive,
         updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'users_id'
-      });
+      }, { onConflict: 'user_id' });
 
     if (error) {
       console.error('Error al actualizar IA global:', error);
@@ -3445,11 +3443,11 @@ export const activateGlobalPersonality = async (req, res) => {
     const { error } = await supabaseAdmin
       .from('user_settings')
       .upsert({
-        users_id: users_id,
-        default_personality_id: personalityId,
+        user_id: users_id,
+        global_personality_id: personalityId != null ? String(personalityId) : null,
         updated_at: new Date().toISOString()
       }, {
-        onConflict: 'users_id'
+        onConflict: 'user_id'
       });
 
     if (error) {

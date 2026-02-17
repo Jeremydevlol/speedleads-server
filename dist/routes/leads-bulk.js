@@ -2,6 +2,7 @@ import { Router } from "express";
 import pool, { supabaseAdmin } from "../config/db.js";
 import { validateJwt } from "../config/jwt.js";
 import { getUserIdFromToken } from "../controllers/authController.js";
+import { getSingleAgentForUser } from "../controllers/personalityController.js";
 
 // Reutiliza tus utilidades
 import { sendMessage } from "../controllers/whatsappController.js";
@@ -44,12 +45,13 @@ async function fetchConversationHistory(userId, jid, limit = 15) {
 }
 
 async function resolvePersonality(userId, explicitPersonalityId, jid) {
-  // Prioridades:
-  // 1) explicitPersonalityId del request
-  // 2) personalidad de la conversación (conversations_new.personality_id)
-  // 3) user_settings.default_personality_id
+  // Modelo agente único. Prioridades:
+  // 1) explicitPersonalityId del request (validar que sea del usuario)
+  // 2) personalidad de la conversación
+  // 3) user_settings.global_personality_id
+  // 4) agente único del usuario
   if (explicitPersonalityId) {
-    const p = await supabaseAdmin.from("personalities").select("*").eq("id", explicitPersonalityId).maybeSingle();
+    const p = await supabaseAdmin.from("personalities").select("*").eq("id", explicitPersonalityId).eq("users_id", userId).maybeSingle();
     return p?.data || null;
   }
 
@@ -61,22 +63,22 @@ async function resolvePersonality(userId, explicitPersonalityId, jid) {
     .maybeSingle();
 
   if (convP?.data?.personality_id) {
-    const p = await supabaseAdmin.from("personalities").select("*").eq("id", convP.data.personality_id).maybeSingle();
+    const p = await supabaseAdmin.from("personalities").select("*").eq("id", convP.data.personality_id).eq("users_id", userId).maybeSingle();
     return p?.data || null;
   }
 
   const settings = await supabaseAdmin
     .from("user_settings")
-    .select("default_personality_id")
-    .eq("users_id", userId)
+    .select("global_personality_id")
+    .eq("user_id", userId)
     .maybeSingle();
 
-  if (settings?.data?.default_personality_id) {
-    const p = await supabaseAdmin.from("personalities").select("*").eq("id", settings.data.default_personality_id).maybeSingle();
+  if (settings?.data?.global_personality_id) {
+    const p = await supabaseAdmin.from("personalities").select("*").eq("id", settings.data.global_personality_id).eq("users_id", userId).maybeSingle();
     return p?.data || null;
   }
 
-  return null;
+  return getSingleAgentForUser(userId);
 }
 
 /**

@@ -10,8 +10,8 @@ export async function getUserSettings(userId) {
   try {
     const { data, error } = await supabaseAdmin
       .from('user_settings')
-      .select('*')
-      .eq('users_id', userId)
+      .select('global_personality_id, ai_global_active, updated_at')
+      .eq('user_id', userId)
       .single();
 
     if (error) {
@@ -19,8 +19,8 @@ export async function getUserSettings(userId) {
         // No se encontró configuración, retornar valores por defecto
         // ✅ Por defecto la IA global está ACTIVADA
         return {
-          ai_global_active: true,
-          default_personality_id: null,
+          ai_global_active: true, // por defecto
+          global_personality_id: null,
           updated_at: null
         };
       }
@@ -28,7 +28,7 @@ export async function getUserSettings(userId) {
       throw error;
     }
 
-    return data;
+    return { ...data, ai_global_active: data.ai_global_active ?? true };
   } catch (error) {
     console.error('Error getUserSettings:', error);
     throw error;
@@ -45,12 +45,12 @@ export async function activateGlobalAI(userId, personalityId = null) {
     const { error } = await supabaseAdmin
       .from('user_settings')
       .upsert({
-        users_id: userId,
-        default_personality_id: personalityId,
+        user_id: userId,
+        global_personality_id: personalityId != null ? String(personalityId) : null,
         ai_global_active: true,
         updated_at: new Date().toISOString()
       }, {
-        onConflict: 'users_id'
+        onConflict: 'user_id'
       });
 
     if (error) {
@@ -72,11 +72,11 @@ export async function deactivateGlobalAI(userId) {
     const { error } = await supabaseAdmin
       .from('user_settings')
       .upsert({
-        users_id: userId,
+        user_id: userId,
         ai_global_active: false,
         updated_at: new Date().toISOString()
       }, {
-        onConflict: 'users_id'
+        onConflict: 'user_id'
       });
 
     if (error) {
@@ -91,31 +91,20 @@ export async function deactivateGlobalAI(userId) {
 
 /**
  * Cambia la personalidad predeterminada (default_personality_id) de un usuario,
- * sin tocar ai_global_active.
+ * sin tocar ai_global_active. La columna real es global_personality_id.
  * @param {string} userId - ID del usuario
  * @param {string|null} personalityId - ID de personalidad (o null si quieres limpiar)
  */
 export async function setDefaultPersonality(userId, personalityId) {
   try {
-    // Primero obtener el estado actual de ai_global_active para no resetearlo
-    const { data: currentSettings } = await supabaseAdmin
-      .from('user_settings')
-      .select('ai_global_active')
-      .eq('users_id', userId)
-      .single();
-    
-    // Mantener el estado actual de ai_global_active, o true si no existe
-    const currentAiGlobalActive = currentSettings?.ai_global_active ?? true;
-
     const { error } = await supabaseAdmin
       .from('user_settings')
       .upsert({
-        users_id: userId,
-        default_personality_id: personalityId,
-        ai_global_active: currentAiGlobalActive, // ✅ MANTENER el estado actual, NO resetear
+        user_id: userId,
+        global_personality_id: personalityId != null ? String(personalityId) : null,
         updated_at: new Date().toISOString()
       }, {
-        onConflict: 'users_id'
+        onConflict: 'user_id'
       });
 
     if (error) {
