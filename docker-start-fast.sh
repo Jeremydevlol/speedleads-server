@@ -7,9 +7,9 @@ set -e
 
 echo "⚡ INICIO RÁPIDO PARA ECS - Evitando Circuit Breaker"
 
-# Configurar variables críticas INMEDIATAMENTE
+# Configurar variables críticas (Render proporciona PORT dinámicamente)
 export NODE_ENV=production
-export PORT=5001
+export PORT=${PORT:-5001}
 export HOST=0.0.0.0
 
 echo "🚀 Configuración:"

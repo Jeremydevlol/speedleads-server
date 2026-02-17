@@ -54,17 +54,15 @@ import metaWebhookRoutes from './routes/metaWebhookRoutes.js';
 const __filename = fileURLToPath(import.meta.url);
 export const __dirname = path.dirname(__filename);
 
+// Cargar .env si existe (opcional en Render/Producción donde las vars vienen del entorno)
 const envPath = path.resolve(__dirname, '../.env');
-try {
-  const envConfig = dotenv.config({ path: envPath });
-  if (envConfig.error) {
-    throw new Error(`Error al cargar .env: ${envConfig.error.message}`);
-  }
+const envConfig = dotenv.config({ path: envPath });
+if (envConfig.parsed) {
   console.log(`✅ Archivo .env cargado desde: ${envPath}`);
-} catch (error) {
-  process.exit(1);
+} else if (envConfig.error?.code !== 'ENOENT') {
+  console.warn('⚠️ Error cargando .env:', envConfig.error?.message);
 }
-dotenv.config();
+dotenv.config(); // Fallback a process.cwd()
 // Variables obligatorias
 const ENV_CONFIG = {
   NODE_ENV: process.env.NODE_ENV || 'development',
