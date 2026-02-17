@@ -23,9 +23,6 @@ services:
       # OpenAI (para IA)
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       
-      # Google Cloud (para Vision API)
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/brave-cistern-441722-a9-8aa519ef966f.json
-      
       # Configuración de producción
       - NODE_ENV=production
       - NEXT_TELEMETRY_DISABLED=1

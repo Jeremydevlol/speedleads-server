@@ -1,6 +1,4 @@
 // Diagnóstico completo para producción
-import { existsSync } from 'fs';
-import { join } from 'path';
 
 export async function runProductionDiagnostics() {
   console.log('\n🔍 === DIAGNÓSTICO DE PRODUCCIÓN ===\n');
@@ -13,9 +11,6 @@ export async function runProductionDiagnostics() {
   const requiredEnvVars = {
     'OPENAI_API_KEY': process.env.OPENAI_API_KEY,
     'DEEPSEEK_API_KEY': process.env.DEEPSEEK_API_KEY,
-    'GOOGLE_APPLICATION_CREDENTIALS': process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    'GOOGLE_PRIVATE_KEY': process.env.GOOGLE_PRIVATE_KEY,
-    'GOOGLE_CLIENT_EMAIL': process.env.GOOGLE_CLIENT_EMAIL,
     'NODE_ENV': process.env.NODE_ENV
   };
   
@@ -24,7 +19,7 @@ export async function runProductionDiagnostics() {
       console.log(`   ✅ ${key}: Configurada`);
     } else {
       console.log(`   ❌ ${key}: NO CONFIGURADA`);
-      if (['OPENAI_API_KEY', 'GOOGLE_PRIVATE_KEY', 'GOOGLE_CLIENT_EMAIL'].includes(key)) {
+      if (key === 'OPENAI_API_KEY') {
         issues.push(`Variable crítica faltante: ${key}`);
       } else {
         warnings.push(`Variable opcional faltante: ${key}`);
@@ -32,31 +27,8 @@ export async function runProductionDiagnostics() {
     }
   }
   
-  // 2. Verificar archivos de credenciales
-  console.log('\n2. 📁 Verificando archivos de credenciales...');
-  const credentialPaths = [
-    'dist/credentials/arched-router.json',
-    'dist/credentials/brave-cistern-441722-a9-8aa519ef966f.json',
-    'arched-router.json',
-    'brave-cistern-441722-a9-8aa519ef966f.json'
-  ];
-  
-  let credentialsFound = false;
-  for (const path of credentialPaths) {
-    if (existsSync(path)) {
-      console.log(`   ✅ Encontrado: ${path}`);
-      credentialsFound = true;
-    } else {
-      console.log(`   ❌ No encontrado: ${path}`);
-    }
-  }
-  
-  if (!credentialsFound && !process.env.GOOGLE_PRIVATE_KEY) {
-    issues.push('No se encontraron credenciales de Google Vision');
-  }
-  
-  // 3. Verificar conectividad a APIs
-  console.log('\n3. 🌐 Verificando conectividad a APIs...');
+  // 2. Verificar conectividad a APIs
+  console.log('\n2. 🌐 Verificando conectividad a APIs...');
   
   // Test OpenAI
   if (process.env.OPENAI_API_KEY) {
@@ -98,23 +70,14 @@ export async function runProductionDiagnostics() {
     }
   }
   
-  // Test Google Vision
-  try {
-    const { default: visionClient } = await import('../config/vision.js');
-    console.log('   ✅ Google Vision: Cliente inicializado');
-  } catch (error) {
-    console.log(`   ❌ Google Vision: ${error.message}`);
-    issues.push(`Google Vision: ${error.message}`);
-  }
-  
-  // 4. Verificar configuración del entorno
-  console.log('\n4. ⚙️ Verificando configuración del entorno...');
+  // 3. Verificar configuración del entorno
+  console.log('\n3. ⚙️ Verificando configuración del entorno...');
   console.log(`   NODE_ENV: ${process.env.NODE_ENV || 'no definido'}`);
   console.log(`   Platform: ${process.platform}`);
   console.log(`   Node.js: ${process.version}`);
   console.log(`   Working Directory: ${process.cwd()}`);
   
-  // 5. Resumen
+  // 4. Resumen
   console.log('\n📊 === RESUMEN DEL DIAGNÓSTICO ===');
   
   if (issues.length === 0) {

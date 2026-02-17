@@ -34,14 +34,12 @@ SUPABASE_URL=${SUPABASE_URL}
 SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
 SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
 OPENAI_API_KEY=${OPENAI_API_KEY}
-GOOGLE_APPLICATION_CREDENTIALS=/app/brave-cistern-441722-a9-8aa519ef966f.json
 EOF
 
 echo "📋 Archivos listos para despliegue:"
 echo "   - Código compilado: dist/"
 echo "   - Configuración: .env.production"
 echo "   - Scripts: docker-start-*.sh"
-echo "   - Credenciales: brave-cistern-441722-a9-8aa519ef966f.json"
 
 echo ""
 echo "🎯 Para desplegar en ECS:"
@@ -49,7 +47,6 @@ echo "   1. Sube estos archivos a tu servidor ECS:"
 echo "      - dist/ (directorio completo)"
 echo "      - package.json"
 echo "      - .env.production"
-echo "      - brave-cistern-441722-a9-8aa519ef966f.json"
 echo "      - docker-start-fast.sh"
 echo ""
 echo "   2. En el servidor ECS, ejecuta:"

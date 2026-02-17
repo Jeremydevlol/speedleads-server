@@ -3,7 +3,6 @@ FROM node:20-slim
 
 # Instala librerías del sistema necesarias para:
 # - Puppeteer/Chrome Headless (whatsapp-web.js)
-# - Google Cloud Vision
 # - FFmpeg para procesamiento de audio
 # - Otras dependencias comunes
 # Instala librerías del sistema, Python3 y Whisper CLI

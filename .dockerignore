@@ -149,7 +149,6 @@ OptimizedVideoComponent.jsx
 .github/
 
 # Archivos de credenciales de desarrollo
-# NOTA: brave-cistern-441722-a9-8aa519ef966f.json se necesita, no excluir
 # Excluir solo otros JSON de prueba
 *_test.json
 *_example.json

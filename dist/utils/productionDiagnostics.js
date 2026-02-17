@@ -1,6 +1,4 @@
 // Diagnóstico completo para producción
-import { existsSync } from 'fs';
-import { join } from 'path';
 
 export async function runProductionDiagnostics() {
   console.log('\n🔍 === DIAGNÓSTICO DE PRODUCCIÓN ===\n');
@@ -13,78 +11,24 @@ export async function runProductionDiagnostics() {
   const requiredEnvVars = {
     'OPENAI_API_KEY': process.env.OPENAI_API_KEY,
     'DEEPSEEK_API_KEY': process.env.DEEPSEEK_API_KEY,
-    'GOOGLE_APPLICATION_CREDENTIALS': process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    'GOOGLE_PRIVATE_KEY': process.env.GOOGLE_PRIVATE_KEY,
-    'GOOGLE_CLIENT_EMAIL': process.env.GOOGLE_CLIENT_EMAIL,
     'NODE_ENV': process.env.NODE_ENV
   };
-  
-  // Verificar archivos de credenciales primero para saber si GOOGLE_PRIVATE_KEY es realmente necesario
-  const credentialPaths = [
-    'dist/credentials/arched-router.json',
-    'dist/credentials/brave-cistern-441722-a9-8aa519ef966f.json',
-    'arched-router.json',
-    'brave-cistern-441722-a9-8aa519ef966f.json'
-  ];
-  
-  let credentialsFound = false;
-  for (const path of credentialPaths) {
-    if (existsSync(path)) {
-      credentialsFound = true;
-      break;
-    }
-  }
-  
-  // Verificar si hay alguna forma de autenticación de Google Vision disponible
-  const hasGoogleAuth = 
-    process.env.GOOGLE_APPLICATION_CREDENTIALS || 
-    credentialsFound || 
-    (process.env.GOOGLE_PRIVATE_KEY && process.env.GOOGLE_CLIENT_EMAIL);
   
   for (const [key, value] of Object.entries(requiredEnvVars)) {
     if (value) {
       console.log(`   ✅ ${key}: Configurada`);
     } else {
       console.log(`   ❌ ${key}: NO CONFIGURADA`);
-      
-      // OPENAI_API_KEY siempre es crítico
       if (key === 'OPENAI_API_KEY') {
         issues.push(`Variable crítica faltante: ${key}`);
-      }
-      // GOOGLE_PRIVATE_KEY y GOOGLE_CLIENT_EMAIL solo son críticas si no hay otras formas de autenticación
-      else if (key === 'GOOGLE_PRIVATE_KEY' || key === 'GOOGLE_CLIENT_EMAIL') {
-        if (!hasGoogleAuth && process.env.NODE_ENV === 'production') {
-          issues.push(`Variable crítica faltante: ${key} (y no hay otras credenciales de Google Vision)`);
-        } else if (!hasGoogleAuth) {
-          warnings.push(`Variable opcional faltante: ${key} (en desarrollo se usará cliente mock)`);
-        } else {
-          console.log(`   ℹ️ ${key}: No necesaria (hay otras credenciales de Google Vision disponibles)`);
-        }
       } else {
         warnings.push(`Variable opcional faltante: ${key}`);
       }
     }
   }
   
-  // 2. Verificar archivos de credenciales
-  console.log('\n2. 📁 Verificando archivos de credenciales...');
-  for (const path of credentialPaths) {
-    if (existsSync(path)) {
-      console.log(`   ✅ Encontrado: ${path}`);
-    } else {
-      console.log(`   ❌ No encontrado: ${path}`);
-    }
-  }
-  
-  // Solo marcar como crítico si no hay ninguna forma de autenticación y estamos en producción
-  if (!hasGoogleAuth && process.env.NODE_ENV === 'production') {
-    issues.push('No se encontraron credenciales de Google Vision (requeridas en producción)');
-  } else if (!hasGoogleAuth) {
-    warnings.push('No se encontraron credenciales de Google Vision (en desarrollo se usará cliente mock)');
-  }
-  
-  // 3. Verificar conectividad a APIs
-  console.log('\n3. 🌐 Verificando conectividad a APIs...');
+  // 2. Verificar conectividad a APIs
+  console.log('\n2. 🌐 Verificando conectividad a APIs...');
   
   // Test OpenAI
   if (process.env.OPENAI_API_KEY) {
@@ -126,23 +70,14 @@ export async function runProductionDiagnostics() {
     }
   }
   
-  // Test Google Vision
-  try {
-    const { default: visionClient } = await import('../config/vision.js');
-    console.log('   ✅ Google Vision: Cliente inicializado');
-  } catch (error) {
-    console.log(`   ❌ Google Vision: ${error.message}`);
-    issues.push(`Google Vision: ${error.message}`);
-  }
-  
-  // 4. Verificar configuración del entorno
-  console.log('\n4. ⚙️ Verificando configuración del entorno...');
+  // 3. Verificar configuración del entorno
+  console.log('\n3. ⚙️ Verificando configuración del entorno...');
   console.log(`   NODE_ENV: ${process.env.NODE_ENV || 'no definido'}`);
   console.log(`   Platform: ${process.platform}`);
   console.log(`   Node.js: ${process.version}`);
   console.log(`   Working Directory: ${process.cwd()}`);
   
-  // 5. Resumen
+  // 4. Resumen
   console.log('\n📊 === RESUMEN DEL DIAGNÓSTICO ===');
   
   if (issues.length === 0) {
