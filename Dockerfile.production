@@ -62,9 +62,6 @@ COPY . .
 # Compila el código TypeScript
 RUN npm run build
 
-# Copia el archivo de credenciales de Google Vision
-COPY brave-cistern-441722-a9-8aa519ef966f.json /app/
-
 # Crea directorios necesarios
 RUN mkdir -p /app/temp /app/uploads /app/.next && \
     chmod 777 /app/temp /app/uploads /app/.next

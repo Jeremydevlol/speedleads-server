@@ -21,7 +21,6 @@ RUN npm ci --production --silent
 
 # Copiar código compilado
 COPY dist/ ./dist/
-COPY brave-cistern-441722-a9-8aa519ef966f.json ./
 
 # Crear directorios necesarios
 RUN mkdir -p /app/temp /app/uploads /app/whatsapp-sessions

@@ -63,10 +63,6 @@ RUN npm install
 # Copia todo tu código al contenedor
 COPY . .
 
-# Copia el archivo de credenciales de Google Vision a /app
-# Asegúrate de que el JSON exista en la raíz de tu repo
-COPY brave-cistern-441722-a9-8aa519ef966f.json /app/
-
 # Crea directorio temporal para archivos de audio y uploads
 RUN mkdir -p /app/temp && chmod 777 /app/temp
 RUN mkdir -p /app/uploads && chmod 777 /app/uploads
