@@ -93,8 +93,6 @@ const checkRequiredVars = () => {
     'SESSION_SECRET',
     'JWT_SECRET',
     'OPENAI_API_KEY',
-    'GOOGLE_CLIENT_ID',
-    'GOOGLE_CLIENT_SECRET',
     'DATABASE_URL'
   ];
   // DATABASE_URL is optional when using Supabase
@@ -102,6 +100,7 @@ const checkRequiredVars = () => {
   const effectiveRequired = hasSupabase
     ? requiredVars.filter(v => v !== 'DATABASE_URL')
     : requiredVars;
+  // GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET son opcionales: login con Google y Calendar no funcionarán sin ellas
   const missingVars = effectiveRequired.filter(varName => !ENV_CONFIG[varName]);
   if (missingVars.length > 0) {
     console.error('\n❌ ERROR: Variables de entorno faltantes:');

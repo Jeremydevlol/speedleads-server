@@ -88,8 +88,6 @@ const checkRequiredVars = () => {
     'SESSION_SECRET',
     'JWT_SECRET',
     'OPENAI_API_KEY',
-    'GOOGLE_CLIENT_ID',
-    'GOOGLE_CLIENT_SECRET',
     'DATABASE_URL'
   ];
   const missingVars = requiredVars.filter(varName => !ENV_CONFIG[varName]);
