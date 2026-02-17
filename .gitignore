@@ -24,8 +24,6 @@ tmp/
 .env.*
 **/credentials/*.json
 *-????????-????-????-????-????????????.json
-# Google Cloud service account keys (nunca subir)
-*-[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9].json
 
 # Archivos temporales de editor (pueden contener copias de .env)
 Untitled
