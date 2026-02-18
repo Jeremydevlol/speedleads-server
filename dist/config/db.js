@@ -1,8 +1,8 @@
 // config/db.js
 import dotenv from 'dotenv';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..', '..');
@@ -146,13 +146,18 @@ const pool = {
             return { rows: [], rowCount: 0 };
           }
           
-          console.log(`   → 🔥 OBTENIENDO CONVERSACIONES para userId: ${userId}`);
+          // Extraer limit y offset de los params (posiciones $3 y $4 en la query SQL)
+          const queryLimit = (params && params[2] && typeof params[2] === 'number') ? params[2] : 25;
+          const queryOffset = (params && params[3] && typeof params[3] === 'number') ? params[3] : 0;
+          
+          console.log(`   → 🔥 OBTENIENDO CONVERSACIONES para userId: ${userId} (limit=${queryLimit}, offset=${queryOffset})`);
           console.log(`   → 🔒 FILTRANDO SOLO conversaciones de este usuario`);
           
           // Usar la API real de Supabase para obtener conversaciones (con reintentos por fallos de red)
-          const { data, error } = await withRetry(() => supabaseAdmin
+          let query = supabaseAdmin
             .from('conversations_new')
             .select(`
+              id,
               user_id,
               external_id,
               contact_name,
@@ -162,38 +167,58 @@ const pool = {
               last_read_at,
               wa_user_id,
               ai_active,
+              personality_id,
+              no_ac_ai,
               last_msg_id,
-              last_msg_time
+              last_msg_time,
+              chat_type
             `)
             .eq('user_id', userId) // 🔒 FILTRO CRÍTICO: Solo este usuario
-            .order('updated_at', { ascending: false }));
+            .not('external_id', 'is', null)
+            .not('external_id', 'eq', 'status@broadcast')
+            .not('external_id', 'like', '%@newsletter')
+            .order('updated_at', { ascending: false })
+            .range(queryOffset, queryOffset + queryLimit - 1);
+          
+          const { data, error } = await withRetry(() => query);
           
           if (error) {
             console.log('   → ❌ Error en API Supabase:', error.message);
             return { rows: [], rowCount: 0 };
           }
           
-          // Verificar que solo se obtuvieron conversaciones del usuario correcto
-          const userConversations = data.filter(conv => conv.user_id === userId);
-          if (userConversations.length !== data.length) {
-            console.log(`   → ⚠️ ADVERTENCIA: Se obtuvieron ${data.length} conversaciones pero solo ${userConversations.length} son del usuario ${userId}`);
+          // Deduplicar por external_id (mantener el más reciente)
+          const seen = new Map();
+          for (const conv of data) {
+            if (!seen.has(conv.external_id)) {
+              seen.set(conv.external_id, conv);
+            }
           }
+          const uniqueConvs = Array.from(seen.values());
           
           // Transformar datos para que coincidan con el formato esperado por el frontend
-          const transformedData = userConversations.map(conv => ({
-            id: conv.external_id,
-            name: conv.contact_name || 'Sin nombre',
-            photo: conv.contact_photo_url,
-            last_message: conv.last_msg_id ? `Mensaje: ${conv.last_msg_id}` : 'Conversación activa',
-            updated_at: conv.updated_at || conv.started_at,
-            created_at: conv.started_at,
-            unread_count: 0,
-            wa_user_id: conv.wa_user_id,
-            ai_active: conv.ai_active,
-            last_read_at: conv.last_read_at
-          }));
+          const transformedData = uniqueConvs.map(conv => {
+            const isGroup = (conv.external_id || '').endsWith('@g.us');
+            return {
+              id: conv.external_id,
+              name: conv.contact_name || 'Sin nombre',
+              photo: conv.contact_photo_url,
+              last_message: conv.last_msg_id ? `Mensaje: ${conv.last_msg_id}` : 'Conversación activa',
+              updated_at: conv.updated_at || conv.started_at,
+              created_at: conv.started_at,
+              unread_count: 0,
+              wa_user_id: conv.wa_user_id,
+              ai_active: conv.ai_active,
+              last_read_at: conv.last_read_at,
+              personalityId: conv.personality_id,
+              no_ac_ai: conv.no_ac_ai,
+              conversation_id: conv.id,
+              is_group: isGroup,
+              chat_type: conv.chat_type || (isGroup ? 'group' : 'individual'),
+            };
+          });
           
-          console.log(`   → ✅ API Supabase: ${transformedData.length} conversaciones del usuario ${userId} encontradas y transformadas`);
+          console.log(`   → ✅ API Supabase: ${transformedData.length} conversaciones (de ${data.length} rows, limit=${queryLimit}) del usuario ${userId}`);
           console.log(`   → 📱 Primeros 3 contactos: ${transformedData.slice(0, 3).map(c => c.name).join(', ')}`);
           console.log(`   → 🔒 FILTRO APLICADO: Solo conversaciones del usuario ${userId}`);
           

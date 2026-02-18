@@ -493,7 +493,7 @@ export async function startSession(userId) {
                 const progress = { count: 0 };
                 const contactPromises = chats.map(chat => limit(async () => {
                   const jid = typeof chat.id === 'string' ? chat.id : (chat.id?.user || chat.id);
-                  if (!jid || jid.includes('@g.us') || jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
+                  if (!jid || jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
                   const contactName = chat.name || chat.notify || jid.split('@')[0];
                   let contactPhotoUrl = null;
                   try {

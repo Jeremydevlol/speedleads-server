@@ -18,6 +18,47 @@ const execAsync = promisify(exec)
 // Set para rastrear mensajes enviados desde el backend
 const sentMessageIds = new Set();
 
+/**
+ * Sube un archivo a Supabase Storage y retorna la URL pública
+ * @param {Buffer} buffer - Contenido del archivo
+ * @param {string} mimeType - Tipo MIME
+ * @param {string} filename - Nombre del archivo
+ * @param {string} userId - ID del usuario (para organizar carpetas)
+ * @returns {Promise<string|null>} URL pública o null si falla
+ */
+async function uploadFileToStorage(buffer, mimeType, filename, userId) {
+  try {
+    const timestamp = Date.now();
+    // Limpiar nombre de archivo para evitar caracteres problemáticos
+    const cleanFilename = (filename || 'file').replace(/[^a-zA-Z0-9.-]/g, '_');
+    const path = `${userId}/${timestamp}_${cleanFilename}`;
+
+    const { data, error } = await supabaseAdmin
+      .storage
+      .from('attachments')
+      .upload(path, buffer, {
+        contentType: mimeType,
+        upsert: false
+      });
+
+    if (error) {
+      console.error('❌ Error subiendo archivo a Storage:', error);
+      return null;
+    }
+
+    const { data: { publicUrl } } = supabaseAdmin
+      .storage
+      .from('attachments')
+      .getPublicUrl(path);
+
+    console.log(`✅ Archivo subido exitosamente a: ${publicUrl}`);
+    return publicUrl;
+  } catch (err) {
+    console.error('❌ Excepción subiendo archivo a Storage:', err);
+    return null;
+  }
+}
+
 
 
 /**
@@ -82,7 +123,9 @@ async function getConversationHistory(conversationId, userId, limit = 50) { // A
         sender_type,
         whatsapp_created_at,
         created_at,
-        message_type
+        message_type,
+        media_url,
+        media_type
       `)
       .eq('conversation_id', conversationId)
       .eq('user_id', userId)
@@ -733,19 +776,16 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
       userMessageId = insertedMessage.id;
       console.log(`💾 Mensaje principal guardado con ID: ${userMessageId}`);
       
-      // ✅ Actualizar last_message_at para que la conversación aparezca primero en la lista
+      // Actualizar updated_at para que la conversación aparezca primero en la lista
       const { error: updateConvError } = await supabaseAdmin
         .from('conversations_new')
-        .update({ 
-          last_message_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        })
+        .update({ updated_at: new Date().toISOString() })
         .eq('id', convId);
-      
+
       if (updateConvError) {
-        console.error(`⚠️ Error actualizando last_message_at: ${updateConvError.message}`);
+        console.error(`⚠️ Error actualizando conversación: ${updateConvError.message}`);
       } else {
-        console.log(`✅ Conversación ${convId} actualizada: last_message_at = NOW()`);
+        console.log(`✅ Conversación ${convId} actualizada`);
       }
     }
   } catch (error) {
@@ -801,8 +841,8 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
             console.log(`📝 Contenido extraído de ${mediaItem.type}:`, mediaItem.extractedText.substring(0, 100) + '...');
             extractedTexts.push(mediaItem.extractedText);
           }
-          // Guardar URL de imagen si está disponible
-          if (mediaItem.type === 'image' && mediaItem.url) {
+          // Guardar URL del media si está disponible (cualquier tipo: imagen, audio, doc, sticker)
+          if (mediaItem.url) {
             imageUrlFromProcess = mediaItem.url;
           }
         }
@@ -921,14 +961,12 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
       try {
         const { data: msgData } = await supabaseAdmin
           .from('messages_new')
-          .select('media_url, media_filename, media_size')
+          .select('media_url')
           .eq('id', userMessageId)
           .single();
-        
+
         if (msgData) {
           mediaUrl = msgData.media_url;
-          mediaFilename = msgData.media_filename;
-          mediaSize = msgData.media_size;
         }
       } catch (error) {
         console.log(`⚠️ Error obteniendo URL de media para evento: ${error.message}`);
@@ -938,13 +976,12 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
       try {
         const { data: msgData } = await supabaseAdmin
           .from('messages_new')
-          .select('media_filename, media_size')
+          .select('media_url')
           .eq('id', userMessageId)
           .single();
-        
+
         if (msgData) {
-          mediaFilename = msgData.media_filename;
-          mediaSize = msgData.media_size;
+          mediaUrl = mediaUrl || msgData.media_url;
         }
       } catch (error) {
         // No crítico, continuar sin filename/size
@@ -1571,6 +1608,8 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
     
     if (!mediaContent) continue;
 
+    let publicMediaUrl = null;
+
     try {
       console.log(`📥 Procesando ${type} - Tamaño: ${mediaContent.fileLength || 'desconocido'} bytes`);
 
@@ -1612,10 +1651,19 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
                 audioFilename,
                 mediaContent.mimetype || 'audio/ogg',
                 userId,
-                'whatsapp' // Especificar bucket 'whatsapp' para audio de WhatsApp
+                'attachments' // ✅ Usar bucket 'attachments'
               );
               audioUrl = uploadResult.publicUrl;
-              console.log(`✅ Audio subido a Supabase Storage (bucket: whatsapp): ${audioUrl}`);
+              publicMediaUrl = audioUrl; // ✅ Guardar para el retorno
+              console.log(`✅ Audio subido a Supabase Storage (bucket: attachments): ${audioUrl}`);
+              
+              // ✅ Actualizar BD con URL del audio
+              if (audioUrl && userMessageId) {
+                  await supabaseAdmin.from('messages_new').update({ 
+                      media_url: audioUrl,
+                      media_type: 'audio',
+                  }).eq('id', userMessageId);
+              }
             } catch (uploadError) {
               console.error('❌ Error subiendo audio a Supabase Storage:', uploadError);
               // Continuar sin URL, pero registrar el error
@@ -1670,8 +1718,6 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
                 .update({
                   media_url: audioUrl,
                   media_type: 'audio',
-                  media_filename: audioFilename,
-                  media_size: buffer.length
                 })
                 .eq('id', userMessageId);
               
@@ -1723,10 +1769,11 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
                 imageFilename,
                 mediaContent.mimetype || 'image/jpeg',
                 userId,
-                'whatsapp' // Especificar bucket 'whatsapp' para imágenes de WhatsApp
+                'attachments' // ✅ Usar bucket 'attachments'
               );
               imageUrl = uploadResult.publicUrl;
-              console.log(`✅ Imagen subida a Supabase Storage (bucket: whatsapp): ${imageUrl}`);
+              publicMediaUrl = imageUrl; // ✅ Guardar para el retorno
+              console.log(`✅ Imagen subida a Supabase Storage (bucket: attachments): ${imageUrl}`);
             } catch (uploadError) {
               console.error('❌ Error subiendo imagen a Supabase Storage:', uploadError);
               // Continuar sin URL, pero registrar el error
@@ -1754,8 +1801,6 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
                 .update({
                   media_url: imageUrl,
                   media_type: 'image',
-                  media_filename: imageFilename,
-                  media_size: buffer.length
                 })
                 .eq('id', userMessageId);
               
@@ -1784,10 +1829,11 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
               documentFilename,
               mediaContent.mimetype || 'application/pdf',
               userId,
-              'whatsapp' // Especificar bucket 'whatsapp' para documentos de WhatsApp
+              'attachments' // ✅ Usar bucket 'attachments'
             );
             documentUrl = uploadResult.publicUrl;
-            console.log(`✅ Documento subido a Supabase Storage (bucket: whatsapp): ${documentUrl}`);
+            publicMediaUrl = documentUrl; // ✅ Guardar para el retorno
+            console.log(`✅ Documento subido a Supabase Storage (bucket: attachments): ${documentUrl}`);
           } catch (uploadError) {
             console.error('❌ Error subiendo documento a Supabase Storage:', uploadError);
             // Continuar sin URL, pero registrar el error
@@ -1879,8 +1925,6 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
               .update({
                 media_url: documentUrl,
                 media_type: 'document',
-                media_filename: documentFilename,
-                media_size: buffer.length
               })
               .eq('id', userMessageId);
             
@@ -1983,10 +2027,11 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
                 stickerFilename,
                 finalMimeType, // ✅ MIME type correcto (image/webp o image/png con alpha)
                 userId,
-                'whatsapp' // Especificar bucket 'whatsapp' para stickers de WhatsApp
+                'attachments' // ✅ Usar bucket 'attachments'
               );
               stickerUrl = uploadResult.publicUrl;
-              console.log(`✅ Sticker subido a Supabase Storage (bucket: whatsapp): ${stickerUrl}`);
+              publicMediaUrl = stickerUrl; // ✅ Guardar para el retorno
+              console.log(`✅ Sticker subido a Supabase Storage (bucket: attachments): ${stickerUrl}`);
               console.log(`✅ Formato: ${finalMimeType} - Halo blanco eliminado - Fondo 100% transparente`);
             } catch (uploadError) {
               console.error('❌ Error subiendo sticker a Supabase Storage:', uploadError);
@@ -2022,9 +2067,7 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
                 .from('messages_new')
                 .update({
                   media_url: stickerUrl,
-                  media_type: 'sticker',
-                  media_filename: stickerFilename,
-                  media_size: buffer.length
+                  media_type: 'sticker'
                 })
                 .eq('id', userMessageId);
               
@@ -2078,7 +2121,7 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
         extractedText,
         filename: mediaContent.fileName || `${type}-${Date.now()}`,
         size: buffer.length,
-        url: type === 'image' ? (imageUrl || null) : null // Incluir URL de imagen si está disponible
+        url: publicMediaUrl // ✅ URL pública del archivo en Supabase
       });
 
     } catch (error) {
@@ -2113,10 +2156,24 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
  */
 async function checkIfShouldRespondInGroup(textContent, msg, sock, userId, convId) {
   try {
-    // Si no hay texto, no responder (para media sin caption en grupos)
-    if (!textContent || textContent.trim().length === 0) {
-      console.log(`🤫 [Grupo] Sin texto, no responder`);
+    const hasText = textContent && textContent.trim().length > 0;
+    const hasMedia = !!(
+      msg?.message?.audioMessage ||
+      msg?.message?.imageMessage ||
+      msg?.message?.documentMessage ||
+      msg?.message?.stickerMessage ||
+      msg?.message?.videoMessage
+    );
+    if (!hasText && !hasMedia) {
+      console.log(`🤫 [Grupo] Sin texto ni media, no responder`);
       return false;
+    }
+
+    // Por defecto responder a todo en grupos: texto, audios, imágenes, stickers, documentos, videos.
+    // Si RESPOND_IN_GROUP_WHEN_MENTIONED_ONLY=true, solo responder cuando mencionan/citan al bot.
+    if (process.env.RESPOND_IN_GROUP_WHEN_MENTIONED_ONLY !== 'true' && process.env.RESPOND_IN_GROUP_WHEN_MENTIONED_ONLY !== '1') {
+      console.log(`💬 [Grupo] Respondiendo: ${hasText ? 'mensaje con texto' : 'media (audio/imagen/sticker/documento/video)'} en grupo`);
+      return true;
     }
 
     // 1. Verificar si el mensaje es una respuesta a un mensaje del bot
@@ -2387,6 +2444,10 @@ export const getConversations = async (req, res) => {
     // Usar una subconsulta para asegurar que solo se devuelva una conversación por external_id
     // NOTA: Si no hay phoneNumber (sesión desconectada), usamos string vacío para evitar fallos
     const phoneParam = phoneNumber || '';
+    // Paginación: solo cargar los contactos más recientes (evita saturar con 790+)
+    const queryLimit = Math.min(parseInt(req.query.limit) || 25, 100);
+    const queryOffset = parseInt(req.query.offset) || 0;
+
     const { rows: convs } = await pool.query(`
       WITH ranked_conversations AS (
         SELECT 
@@ -2399,7 +2460,6 @@ export const getConversations = async (req, res) => {
           (p.category = 'global') AS is_global_personality,
           c.no_ac_ai,
           COALESCE(m_last.whatsapp_created_at, c.started_at) AS last_message_date,
-          -- Limpiar el texto del último mensaje para no mostrar contenido OCR
           CASE
             WHEN m_last.message_type IN ('media', 'sticker') THEN
               CASE
@@ -2424,13 +2484,11 @@ export const getConversations = async (req, res) => {
           COALESCE(unread.unread_count, 0) AS unread_count,
           c.last_read_at,
           c.id AS conversation_id,
-          -- Prioridad: 0 = wa_user_id coincidente, 1 = NULL, 2 = otros
           (CASE 
             WHEN c.wa_user_id = $2 THEN 0 
             WHEN c.wa_user_id IS NULL THEN 1 
             ELSE 2 
           END) AS priority,
-          -- Ordenar por fecha de último mensaje (más reciente primero)
           ROW_NUMBER() OVER (
             PARTITION BY c.external_id 
             ORDER BY 
@@ -2477,8 +2535,9 @@ export const getConversations = async (req, res) => {
       WHERE rn = 1
       ORDER BY 
         last_message_date DESC NULLS LAST,
-        external_id;
-    `, [users_id, phoneParam]);
+        external_id
+      LIMIT $3 OFFSET $4;
+    `, [users_id, phoneParam, queryLimit, queryOffset]);
 
     console.log(`✅ Debug getConversations: Encontradas ${convs.length} conversaciones para ${phoneNumber}`);
 
@@ -2573,11 +2632,14 @@ export const getConversations = async (req, res) => {
 
     return res.json({
       success: true,
-      needsQr: !isConnected, // ✅ Indicar si se necesita QR basado en estado real de conexión
-      connected: isConnected, // ✅ Estado de conexión explícito
+      needsQr: !isConnected,
+      connected: isConnected,
       conversations: enrichedConvs,
+      hasMore: enrichedConvs.length >= queryLimit,
+      limit: queryLimit,
+      offset: queryOffset,
       globalSettings: {
-        aiGlobalActive: settings?.ai_global_active === true, // Solo true si el usuario la activó
+        aiGlobalActive: settings?.ai_global_active === true,
         globalPersonalityId: settings.global_personality_id || null
       }
     })
@@ -2719,6 +2781,10 @@ export async function sendMessage(userId, conversationId, textContent, attachmen
 
   if ((senderType === 'you' || senderType === 'ia') && sock) {
     let msgInfo;
+    let mediaUrl = null;
+    let mediaType = null;
+    let mediaContent = null; // Usaremos esto para el nombre del archivo o contenido extraído
+
     if (attachments.length) {
       // NOTA: Actualmente solo se envía el primer adjunto
       // Para enviar múltiples, sería necesario un bucle con delays
@@ -2733,11 +2799,26 @@ export async function sendMessage(userId, conversationId, textContent, attachmen
       
       const buffer = Buffer.from(m.data, 'base64');
       const key = mediaKeyFromMime(m.mimeType);
+      
+      // Preparar payload para WhatsApp
       const payload = { [key]: buffer, mimetype: m.mimeType };
-      if (m.filename || m.fileName) payload.fileName = m.filename || m.fileName;
+      const filename = m.filename || m.fileName || `file_${Date.now()}`;
+      if (filename) payload.fileName = filename;
       if (textContent) payload.caption = textContent;
       
+      // Enviar a WhatsApp
+      console.log(`📤 Enviando adjunto a WhatsApp (${m.mimeType})...`);
       msgInfo = await sock.sendMessage(conversationId, payload);
+
+      // Subir a Supabase Storage (NUEVO)
+      console.log(`☁️ Subiendo adjunto a Storage (${filename})...`);
+      mediaUrl = await uploadFileToStorage(buffer, m.mimeType, filename, userId);
+      mediaType = m.mimeType;
+      mediaContent = filename; // Guardamos nombre como contenido de media por defecto
+
+      if (mediaUrl) {
+          console.log(`✅ Adjunto disponible en: ${mediaUrl}`);
+      }
     } else {
       if (!textContent || textContent.trim() === '') {
         throw new Error('Se requiere textContent o adjuntos');
@@ -2753,20 +2834,23 @@ export async function sendMessage(userId, conversationId, textContent, attachmen
     const sentId = msgInfo?.key?.id || null;
     
     // Guardar mensaje usando Supabase API directamente
-    console.log(`💾 [sendMessage] Guardando mensaje enviado: conversation_id=${convId}, sender_type=${senderType}, text_content="${textContent}", last_msg_id=${sentId}`);
+    console.log(`💾 [sendMessage] Guardando mensaje enviado: conversation_id=${convId}, sender_type=${senderType}, text_content="${textContent}", last_msg_id=${sentId}, media_url=${mediaUrl}`);
     
     const { data: insertedMessage, error: insertError } = await supabaseAdmin
       .from('messages_new')
       .insert({
         conversation_id: convId,
         sender_type: senderType,
-        message_type: attachments.length ? 'media' : 'text',
+        message_type: attachments.length ? (mediaType?.includes('sticker') ? 'sticker' : 'media') : 'text', // Detectar sticker
         text_content: textContent,
         created_at: new Date().toISOString(),
         user_id: userId,
         whatsapp_created_at: new Date().toISOString(),
         last_msg_id: sentId,
-        tenant: 'whatsapp'
+        tenant: 'whatsapp',
+        media_url: mediaUrl,       // NUEVO
+        media_type: mediaType,     // NUEVO
+        media_content: mediaContent // NUEVO
       })
       .select('id')
       .single();
@@ -2784,7 +2868,8 @@ export async function sendMessage(userId, conversationId, textContent, attachmen
       .update({
         updated_at: new Date().toISOString(),
         last_msg_id: sentId,
-        last_msg_time: new Date().toISOString()
+        last_msg_time: new Date().toISOString(),
+        last_message: textContent || (attachments.length ? '📷 Archivo adjunto' : 'Mensaje')
       })
       .eq('external_id', conversationId)
       .eq('user_id', userId);
@@ -2812,20 +2897,33 @@ export async function sendMessage(userId, conversationId, textContent, attachmen
       created_at: new Date().toISOString(),
       whatsapp_created_at: new Date().toISOString(),
       isAI: senderType === 'ia',
-      isSticker: false,
-      media: attachments || [],
+      isSticker: mediaType?.includes('sticker') || false,
+      media_url: mediaUrl,       // URL del adjunto
+      media_type: mediaType,     // Tipo MIME
+      media_filename: mediaContent, // Nombre del archivo
+      media: mediaUrl ? [{       // Array para compatibilidad con formato frontend nuevo
+          url: mediaUrl,
+          mimeType: mediaType,
+          filename: mediaContent,
+          isSticker: mediaType?.includes('sticker')
+      }] : [],
+      attachments: mediaUrl ? [{ // Array alternativo para compatibilidad
+          url: mediaUrl,
+          mimeType: mediaType,
+          filename: mediaContent,
+          isSticker: mediaType?.includes('sticker')
+      }] : [],
       message_type: attachments.length ? 'media' : 'text',
       last_msg_id: sentId
     };
     
-    console.log(`📡 [sendMessage] Emitiendo evento new-message con datos completos:`, JSON.stringify(messageData).substring(0, 200));
+    console.log(`📡 [sendMessage] Emitiendo evento new-message con datos completos:`, JSON.stringify(messageData).substring(0, 300));
     emitToUser(userId, 'new-message', messageData);
     
     emitToUser(userId, 'chats-updated');
 
-    return { success: true };
+    return { success: true, messageId: insertedMessage.id, key: msgInfo?.key };
   }
-
   if (senderType === 'user') {
     await pool.query(`
       INSERT INTO messages_new
@@ -3312,49 +3410,41 @@ export const getMessages = async (req, res) => {
 
     const convId = convRes.rows[0].id;
 
-    // Traer todos los mensajes existentes ordenados correctamente
-    // IMPORTANTE: Incluir COALESCE para manejar mensajes sin whatsapp_created_at
-    // IMPORTANTE: Para mensajes con media, NO devolver el texto extraído del OCR en body
-    const { rows } = await pool.query(`
-      SELECT id,
-             sender_type,
-             message_type,
-             -- Si es mensaje con media o sticker, devolver null o texto del usuario (sin OCR)
-             -- Si contiene "[Contenido de imagen", "[Audio transcrito", "[Contenido de PDF", etc., limpiarlo
-             CASE 
-               WHEN message_type = 'media' OR message_type = 'sticker' THEN 
-                 CASE 
-                   WHEN text_content IS NULL OR text_content = '' THEN NULL
-                   WHEN text_content LIKE '%[Contenido de imagen%' OR 
-                        text_content LIKE '%[Audio transcrito%' OR 
-                        text_content LIKE '%[Contenido de PDF%' OR
-                        text_content LIKE '%[Contenido de documento Word%' OR
-                        text_content LIKE '%Final de la imagen%' OR
-                        text_content LIKE '%Final del audio%' OR
-                        text_content LIKE '%Final del PDF%' OR
-                        text_content LIKE '%Final del documento Word%' OR
-                        text_content LIKE '%Quiero que seas conciso%'
-                   THEN NULL  -- No devolver texto del OCR para mensajes con media
-                   ELSE text_content  -- Devolver solo si es texto del usuario (sin OCR)
-                 END
-               ELSE text_content  -- Para mensajes de texto normal, devolver todo
-             END AS body,
-             COALESCE(
-               EXTRACT(EPOCH FROM whatsapp_created_at)::BIGINT,
-               EXTRACT(EPOCH FROM created_at)::BIGINT
-             ) AS timestamp,
-             created_at,
-             whatsapp_created_at,
-             media_type,
-             media_url,
-             media_content,  -- Incluir media_content pero NO se usará en body
-             media_filename,
-             media_size
-      FROM messages_new
-      WHERE conversation_id = $1
-        AND user_id = $2
-      ORDER BY COALESCE(whatsapp_created_at, created_at) ASC
-    `, [convId, users_id]);
+    // Traer mensajes con Supabase API (evitar pool que devuelve genérico limit 10)
+    const { data: messagesRows, error: messagesError } = await supabaseAdmin
+      .from('messages_new')
+      .select('id, sender_type, message_type, text_content, created_at, whatsapp_created_at, media_type, media_url, media_content')
+      .eq('conversation_id', convId)
+      .eq('user_id', users_id)
+      .order('whatsapp_created_at', { ascending: true });
+
+    if (messagesError) {
+      console.error('❌ [getMessages] Error Supabase:', messagesError.message);
+      return res.status(500).json({ success: false, message: 'Error al obtener mensajes' });
+    }
+
+    const rows = (messagesRows || []).map((m) => {
+      const isMediaOrSticker = m.message_type === 'media' || m.message_type === 'sticker';
+      let body = m.text_content;
+      if (isMediaOrSticker && body) {
+        const ocrMarkers = ['[Contenido de imagen', '[Audio transcrito', '[Contenido de PDF', '[Contenido de documento Word', 'Final de la imagen', 'Final del audio', 'Final del PDF', 'Final del documento Word', 'Quiero que seas conciso'];
+        if (ocrMarkers.some((mk) => body.includes(mk))) body = null;
+      }
+      const ts = m.whatsapp_created_at || m.created_at;
+      const timestamp = ts ? (typeof ts === 'string' ? new Date(ts).getTime() / 1000 : ts) : 0;
+      return {
+        id: m.id,
+        sender_type: m.sender_type,
+        message_type: m.message_type,
+        body,
+        timestamp,
+        created_at: m.created_at,
+        whatsapp_created_at: m.whatsapp_created_at,
+        media_type: m.media_type,
+        media_url: m.media_url,
+        media_content: m.media_content
+      };
+    });
 
     // Limpiar mensajes: remover body si contiene texto del OCR para mensajes con media
     // Y agregar información de media (isSticker, media array) para el frontend
@@ -3402,26 +3492,21 @@ export const getMessages = async (req, res) => {
         const mediaArray = [];
         if (row.media_url) {
           if (isSticker) {
-            let stickerMimeType = 'image/webp';
-            if (row.media_filename) {
-              if (row.media_filename.toLowerCase().endsWith('.png')) {
-                stickerMimeType = 'image/png';
-              } else if (row.media_filename.toLowerCase().endsWith('.webp')) {
-                stickerMimeType = 'image/webp';
-              }
-            }
+            const stickerMimeType = (row.media_type === 'sticker' || row.message_type === 'sticker') ? 'image/webp' : 'image/webp';
             mediaArray.push({
               type: 'sticker',
               url: row.media_url,
-              filename: row.media_filename || null,
+              filename: null,
               mimeType: stickerMimeType,
-              hasTransparentBackground: true
+              hasTransparentBackground: true,
+              isSticker: true,
+              sticker: true
             });
           } else if (row.media_type === 'image') {
             mediaArray.push({
               type: 'image',
               url: row.media_url,
-              filename: row.media_filename || null,
+              filename: null,
               mimeType: 'image/jpeg',
               shouldShowBorder: false,
               hideContainer: true
@@ -3430,24 +3515,24 @@ export const getMessages = async (req, res) => {
             mediaArray.push({
               type: 'audio',
               url: row.media_url,
-              filename: row.media_filename || null,
+              filename: null,
               mimeType: 'audio/ogg',
-              size: row.media_size || null,
+              size: null,
               simplePlayer: true
             });
           } else if (row.media_type === 'video') {
             mediaArray.push({
               type: 'video',
               url: row.media_url,
-              filename: row.media_filename || null,
-              mimeType: row.media_filename?.toLowerCase().endsWith('.mp4') ? 'video/mp4' : 'video/mp4',
-              size: row.media_size || null
+              filename: null,
+              mimeType: 'video/mp4',
+              size: null
             });
           } else if (row.media_type === 'document') {
             mediaArray.push({
               type: 'document',
               url: row.media_url,
-              filename: row.media_filename || null,
+              filename: null,
               mimeType: 'application/pdf'
             });
           }
@@ -3495,8 +3580,6 @@ export const getMessages = async (req, res) => {
       delete cleanedRow.media_content;
       delete cleanedRow.media_type;
       delete cleanedRow.media_url;
-      delete cleanedRow.media_filename;
-      delete cleanedRow.media_size;
       
       return cleanedRow;
     });
