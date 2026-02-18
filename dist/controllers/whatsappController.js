@@ -2610,13 +2610,17 @@ export const markConversationRead = async (req, res) => {
 
     console.log(`📖 [markConversationRead] Marcando conversación como leída: conversationId=${conversationId}, userId=${user_id}`);
 
-    // Determinar si conversationId es un ID numérico o un external_id (JID)
-    const isNumericId = /^\d+$/.test(String(conversationId));
-    
+    // Si es solo dígitos (ej. Instagram sender_id), no es UUID ni JID de WhatsApp → no-op 200 OK para no romper UI Instagram
+    const isOnlyDigits = /^\d+$/.test(String(conversationId));
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(conversationId));
+    if (isOnlyDigits && !isUuid) {
+      console.log(`📖 [markConversationRead] conversationId numérico (canal Instagram): no-op OK`);
+      return res.json({ success: true, message: 'Conversación marcada como leída', conversationId, externalId: conversationId });
+    }
+
     let rows;
-    if (isNumericId) {
-      // Si es numérico, buscar por ID
-      console.log(`🔍 [markConversationRead] Buscando conversación por ID: ${conversationId}`);
+    if (isUuid) {
+      console.log(`🔍 [markConversationRead] Buscando conversación por ID (UUID): ${conversationId}`);
       const result = await pool.query(`
         SELECT id, external_id, last_msg_time
         FROM conversations_new
@@ -2626,8 +2630,7 @@ export const markConversationRead = async (req, res) => {
       `, [conversationId, user_id]);
       rows = result.rows;
     } else {
-      // Si no es numérico, buscar por external_id (JID)
-      console.log(`🔍 [markConversationRead] Buscando conversación por external_id: ${conversationId}`);
+      console.log(`🔍 [markConversationRead] Buscando conversación por external_id (JID): ${conversationId}`);
       const result = await pool.query(`
         SELECT id, external_id, last_msg_time
         FROM conversations_new
