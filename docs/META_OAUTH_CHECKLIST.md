@@ -51,9 +51,10 @@ Meta muestra ese mensaje cuando la app está en **modo Development** y el usuari
    - Producto **Facebook Login** (y/o **Instagram**) añadido a la app.
    - Permisos solicitados en la URL (p. ej. `pages_show_list`, `pages_read_engagement`, `instagram_basic`, `instagram_manage_messages`) deben estar habilitados para la app (sin errores de revisión si está en Live).
 
-6. **Cuenta Facebook/Instagram**
-   - La cuenta que hace login debe tener una **Página de Facebook** conectada a una **Cuenta de Instagram Professional/Business**.
-   - En la app no debe aparecer la app deshabilitada o revocada para esa cuenta.
+6. **Cuenta Facebook/Instagram (importante para "Conectar Instagram")**
+   - La cuenta de Facebook con la que inicies sesión debe tener **al menos una Página de Facebook** (crear en [facebook.com/pages](https://www.facebook.com/pages)).
+   - Esa **Página** debe tener **conectada una cuenta de Instagram en modo Professional o Creator** (en Configuración de la Página → Instagram, o en Meta Business Suite). Si no, verás el error `no_instagram_business` o `no_pages` al volver del callback.
+   - En la app de Meta no debe aparecer la app deshabilitada o revocada para esa cuenta.
 
 ---
 
@@ -151,6 +152,17 @@ Si en los logs del backend aparece **`[metaConnectionsRepo] getConnectionByTenan
 2. Reiniciar el backend y volver a probar el flujo de conexión Meta.
 
 Sin esta tabla/columna, el callback de OAuth puede guardar el token pero las rutas que leen la conexión (p. ej. `/api/meta/connection`) fallan y la app no puede "loguear" / usar la conexión Meta.
+
+---
+
+## Errores del callback: `no_pages` y `no_instagram_business`
+
+Si al volver de Facebook el frontend recibe `error=no_pages` o `error=no_instagram_business`:
+
+- **`no_pages`**: La cuenta de Facebook no tiene ninguna **Página**. Crear una en [facebook.com/pages](https://www.facebook.com/pages) y volver a intentar "Conectar Instagram".
+- **`no_instagram_business`**: La cuenta tiene Páginas pero **ninguna tiene una cuenta de Instagram Professional/Creator vinculada**. En [Meta Business Suite](https://business.facebook.com) o en Configuración de la Página → Instagram, vincular la cuenta de Instagram a la Página y repetir el flujo.
+
+La cuenta que uses (por ejemplo losdety o un probador) debe ser la que tenga la Página y el Instagram conectados.
 
 ---
 

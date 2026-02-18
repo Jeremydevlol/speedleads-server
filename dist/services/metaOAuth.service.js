@@ -8,7 +8,7 @@ const META_APP_ID = process.env.META_APP_ID || '';
 const META_APP_SECRET = process.env.META_APP_SECRET || '';
 const META_REDIRECT_URI = process.env.META_REDIRECT_URI || '';
 const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || 'v19.0';
-const META_OAUTH_SCOPES = process.env.META_OAUTH_SCOPES || 'pages_show_list,instagram_basic';
+const META_OAUTH_SCOPES = process.env.META_OAUTH_SCOPES || 'pages_show_list,pages_read_engagement,pages_manage_metadata,business_management,instagram_basic,instagram_manage_messages';
 const BASE = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
 
 const STATE_SECRET = process.env.META_STATE_SECRET || process.env.META_APP_SECRET || 'dev-secret';
@@ -73,21 +73,27 @@ export async function getLongLivedUserToken(shortLivedToken) {
 }
 
 /**
- * Obtiene páginas del usuario y el primer Instagram Business Account conectado.
- * @returns {Promise<{ ig_business_id: string, page_access_token: string } | null>}
+ * Returns { ig_business_id, page_access_token } or { error: 'no_pages' | 'no_instagram_linked' }.
  */
 export async function getIgBusinessIdAndPageToken(userAccessToken) {
+  console.warn('[metaOAuth] App ID usado:', META_APP_ID || '(vacío)');
   const url = `${BASE}/me/accounts?fields=id,name,access_token,instagram_business_account{id}&access_token=${encodeURIComponent(userAccessToken)}`;
   const res = await fetch(url);
   const data = await res.json().catch(() => ({}));
   if (data.error) {
     const msg = data.error.message || data.error.error_user_msg || 'Failed to get pages';
-    console.error('[metaOAuth] me/accounts:', msg);
+    console.error('[metaOAuth] me/accounts error:', msg, '| code:', data.error.code);
     throw new Error(msg);
   }
   const pages = data.data;
   if (!Array.isArray(pages) || pages.length === 0) {
-    return null;
+    console.warn('[metaOAuth] No Facebook Pages found for this account. Create a Page at facebook.com/pages and try again.');
+    return { error: 'no_pages' };
+  }
+  console.warn('[metaOAuth] Páginas devueltas:', pages.length, '| nombres:', pages.map((p) => p.name || p.id).join(', '));
+  for (const p of pages) {
+    const hasIg = !!(p.instagram_business_account && p.instagram_business_account.id);
+    console.warn('[metaOAuth] Page:', p.name || p.id, '| instagram_business_account:', hasIg ? p.instagram_business_account.id : 'no');
   }
   for (const page of pages) {
     const ig = page.instagram_business_account;
@@ -98,7 +104,8 @@ export async function getIgBusinessIdAndPageToken(userAccessToken) {
       };
     }
   }
-  return null;
+  console.warn('[metaOAuth] Facebook Pages found but none have instagram_business_account. Ensure Instagram is linked in Page settings (Professional/Creator) and app has pages_read_engagement permission.');
+  return { error: 'no_instagram_linked' };
 }
 
 export function getOAuthStartUrl(state) {

@@ -87,7 +87,10 @@ router.get('/callback', async (req, res) => {
   try {
     const longLived = await getLongLivedUserToken(accessToken);
     const igData = await getIgBusinessIdAndPageToken(longLived);
-    if (!igData) return redirectFail('no_instagram_business', 'no_instagram_business');
+    if (igData.error) {
+      return redirectFail(igData.error === 'no_pages' ? 'no_pages' : 'no_instagram_business', igData.error);
+    }
+    if (!igData.ig_business_id || !igData.page_access_token) return redirectFail('no_instagram_business', 'no_instagram_business');
     await upsertConnection({
       tenant_id: tenantId,
       ig_business_id: igData.ig_business_id,
