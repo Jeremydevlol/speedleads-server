@@ -194,6 +194,19 @@ router.post("/import_contacts", validateJwt, async (req, res) => {
 
     console.log(`Import completed for user ${userId}:`, results.stats);
 
+    if (results.stats.leads_created > 0) {
+      try {
+        const { emitToUser } = await import("../services/whatsappService.js");
+        emitToUser(userId, "lead-created", {
+          imported: true,
+          count: results.stats.leads_created,
+          total: results.stats.processed,
+        });
+      } catch (e) {
+        // No fallar la respuesta si el socket no está disponible
+      }
+    }
+
     return res.json({ 
       success: true, 
       results,

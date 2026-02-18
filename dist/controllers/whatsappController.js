@@ -6,12 +6,12 @@ import pdfParse from 'pdf-parse-debugging-disabled'
 import qrcode from 'qrcode'
 import { promisify } from 'util'
 import pool, { supabaseAdmin } from '../config/db.js'
-import { getSingleAgentForUser } from './personalityController.js'
 import { generateBotResponse } from '../services/openaiService.js'
 import { emitToUser, getCachedQr, isSessionConnected, sessions, startSession } from '../services/whatsappService.js'
 import { extractImageText, extractPdfText } from '../utils/mediaUtils.js'
 import { checkRateLimit } from '../utils/rateLimit.js'
 import { getUserIdFromToken } from './authController.js'
+import { getSingleAgentForUser } from './personalityController.js'
 const { downloadContentFromMessage, getMediaKeys, generateThumbnail } = pkg
 const execAsync = promisify(exec)
 
@@ -260,6 +260,7 @@ export async function getContactById(userId, contactId) {
 
 /**
  * 4) OBTENER CONTACTOS DEL USUARIO
+ * Incluye: chats individuales, grupos, comunidades, canales (newsletters)
  */
 export async function getContacts(userId) {
   try {
@@ -271,28 +272,23 @@ export async function getContacts(userId) {
     
     console.log(`🔍 [getContacts] isSessionConnected(${userId}) = ${isConnected}`);
     
-    if (!isConnected) {
-      console.log(`⚠️ [getContacts] No hay sesión activa de WhatsApp para userId=${userId}, retornando array vacío`);
-      return [];
-    }
-    
-    // Intentar obtener el wa_user_id de la sesión activa
     const sock = sessions.get(userId);
-    console.log(`🔍 [getContacts] Socket obtenido: ${sock ? 'existe' : 'no existe'}, tiene user: ${sock?.user ? 'sí' : 'no'}`);
-    
     let waUserId = null;
     
-    if (sock && sock.user?.id) {
+    if (isConnected && sock?.user?.id) {
       waUserId = sock.user.id.split('@')[0].split(':')[0];
       console.log(`✅ [getContacts] Sesión activa encontrada, waUserId=${waUserId}`);
     } else {
-      console.log(`⚠️ [getContacts] Sesión no válida aunque isSessionConnected retornó true - sock: ${!!sock}, user: ${!!sock?.user}`);
-      return [];
+      // Sin sesión activa: usar wa_user_id guardado en DB para cargar la misma lista (como WhatsApp Web)
+      const { rows: r } = await pool.query(
+        'SELECT wa_user_id FROM conversations_new WHERE user_id = $1 AND wa_user_id IS NOT NULL LIMIT 1',
+        [userId]
+      );
+      if (r && r[0]?.wa_user_id) waUserId = r[0].wa_user_id;
+      console.log(`📋 [getContacts] Sin sesión activa; usando wa_user_id desde DB: ${waUserId || 'null'}`);
     }
 
-    // Obtener contactos desde la base de datos
-    // Solo se ejecuta si hay sesión activa (ya verificado arriba)
-    // Usar subconsulta con DISTINCT ON para evitar duplicados, luego ordenar por más recientes
+    // Obtener TODOS los contactos desde la base de datos (individuales + grupos + canales)
     const query = `
       SELECT * FROM (
         SELECT DISTINCT ON (c.external_id)
@@ -303,6 +299,7 @@ export async function getContacts(userId) {
           c.unread_count,
           c.last_message_at,
           c.wa_user_id,
+          c.chat_type,
           COALESCE(
             (SELECT m.text_content 
              FROM messages_new m 
@@ -313,10 +310,8 @@ export async function getContacts(userId) {
           ) as last_message
         FROM conversations_new c
         WHERE c.user_id = $1 
-          AND c.external_id NOT LIKE '%@g.us%'  -- Excluir grupos
         ORDER BY 
           c.external_id,
-          -- Priorizar contactos con wa_user_id coincidente
           (CASE 
             WHEN c.wa_user_id = $2 THEN 0 
             WHEN c.wa_user_id IS NULL THEN 1 
@@ -325,18 +320,35 @@ export async function getContacts(userId) {
           c.last_message_at DESC NULLS LAST
       ) AS unique_contacts
       ORDER BY 
-        -- Ordenar por fecha más reciente primero
         COALESCE(last_message_at, started_at) DESC NULLS LAST
     `;
     const params = [userId, waUserId];
     
-    const { rows: contacts } = await pool.query(query, params);
+    const { rows: rawContacts } = await pool.query(query, params);
+    // Normalizar filas: la capa Supabase en db.js devuelve { id, name, photo } en lugar de { external_id, contact_name, contact_photo_url }
+    const contacts = rawContacts.map(c => ({
+      external_id: c.external_id ?? c.id,
+      contact_name: c.contact_name ?? c.name,
+      contact_photo_url: c.contact_photo_url ?? c.photo,
+      started_at: c.started_at ?? c.created_at,
+      unread_count: c.unread_count ?? 0,
+      last_message_at: c.last_message_at ?? c.updated_at,
+      wa_user_id: c.wa_user_id,
+      chat_type: c.chat_type ?? (() => {
+        const e = (c.external_id ?? c.id) || '';
+        if (e.endsWith('@g.us')) return 'group';
+        if (e.endsWith('@newsletter')) return 'channel';
+        return 'individual';
+      })(),
+      last_message: c.last_message
+    }));
     console.log(`✅ [getContacts] Contactos encontrados en DB para userId=${userId}: ${contacts.length}`);
     if (contacts.length > 0) {
       console.log(`📋 [getContacts] Primeros contactos:`, contacts.slice(0, 3).map(c => ({
         external_id: c.external_id,
         contact_name: c.contact_name,
-        wa_user_id: c.wa_user_id
+        wa_user_id: c.wa_user_id,
+        chat_type: c.chat_type
       })));
     }
 
@@ -358,27 +370,35 @@ export async function getContacts(userId) {
       }
     }
 
-    // Enriquecer con información de WhatsApp si está disponible
-    // Procesar contactos de forma más eficiente, sin bloquear la respuesta
+    // Enriquecer con información de WhatsApp y detectar tipo de chat
     const enrichedContacts = contacts
-      .filter(contact => contact.external_id) // Filtrar contactos sin external_id
+      .filter(contact => contact.external_id)
       .map((contact) => {
         try {
           const externalId = contact.external_id || '';
           const phoneNumber = externalId.split('@')[0] || '';
           let contactName = contact.contact_name || phoneNumber;
           
-          // Retornar contacto básico inmediatamente (sin procesamiento asíncrono pesado)
-          // El enriquecimiento de nombres y fotos se puede hacer en segundo plano
+          // Detectar tipo de chat basado en el JID
+          let chatType = contact.chat_type || 'individual';
+          if (externalId.endsWith('@g.us')) {
+            chatType = 'group';
+          } else if (externalId.endsWith('@newsletter')) {
+            chatType = 'channel';
+          } else if (externalId.endsWith('@s.whatsapp.net')) {
+            chatType = 'individual';
+          }
+          
           return {
             id: externalId,
             name: contactName,
             phone: phoneNumber,
-            photo: contact.contact_photo_url || null, // Usar foto existente, no intentar obtener nueva
+            photo: contact.contact_photo_url || null,
             lastMessage: contact.last_message,
             unreadCount: contact.unread_count || 0,
             lastMessageAt: contact.last_message_at,
-            startedAt: contact.started_at
+            startedAt: contact.started_at,
+            chatType: chatType // 'individual', 'group', 'channel'
           };
         } catch (error) {
           console.error(`Error procesando contacto:`, error);
@@ -392,21 +412,20 @@ export async function getContacts(userId) {
             lastMessage: contact.last_message,
             unreadCount: contact.unread_count || 0,
             lastMessageAt: contact.last_message_at,
-            startedAt: contact.started_at
+            startedAt: contact.started_at,
+            chatType: externalId.endsWith('@g.us') ? 'group' : 'individual'
           };
         }
       });
 
-    // Procesar actualizaciones de nombres en segundo plano (no bloquear respuesta)
+    // Procesar actualizaciones de nombres en segundo plano (solo para individuales con nombre numérico)
     if (sock && sock.user) {
-      // Procesar solo los primeros 50 contactos para no sobrecargar
       const contactsToEnrich = enrichedContacts.slice(0, 50).filter(c => {
         const nameIsNumber = /^\d+$/.test(c.name?.trim() || '');
-        return nameIsNumber && c.id && !c.id.endsWith('@g.us');
+        return nameIsNumber && c.id && c.chatType === 'individual';
       });
       
       if (contactsToEnrich.length > 0) {
-        // Procesar en segundo plano sin esperar
         Promise.all(
           contactsToEnrich.map(async (contact) => {
             try {
@@ -414,7 +433,6 @@ export async function getContacts(userId) {
               if (contactData && (contactData.notify || contactData.name)) {
                 const realName = contactData.notify || contactData.name;
                 if (realName && realName.trim() !== '' && !/^\d+$/.test(realName.trim())) {
-                  // Actualizar en la base de datos en segundo plano
                   await pool.query(`
                     UPDATE conversations_new
                     SET contact_name = $1, updated_at = NOW()
@@ -426,7 +444,7 @@ export async function getContacts(userId) {
               // Silenciar errores en segundo plano
             }
           })
-        ).catch(() => {}); // No bloquear si hay errores
+        ).catch(() => {});
       }
     }
 
@@ -463,82 +481,106 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
 
   let conv = null;
   
-  // Verificar si el chat ya existe - primero buscar con wa_user_id, luego sin él para evitar duplicados
+  // Verificar si el chat ya existe - buscar por external_id + user_id SIN filtrar wa_user_id
+  // para evitar crear duplicados cuando wa_user_id no coincide
   let { rows } = await pool.query(`
     SELECT id, wa_user_id, ai_active, personality_id, no_ac_ai, contact_name
     FROM conversations_new
     WHERE external_id = $1 
       AND user_id = $2 
-      AND wa_user_id = $3
+    ORDER BY 
+      CASE WHEN wa_user_id = $3 THEN 0 WHEN wa_user_id IS NOT NULL THEN 1 ELSE 2 END,
+      updated_at DESC NULLS LAST
     LIMIT 1
   `, [conversationId, userId, phoneNumber]);
 
-  // Si no se encuentra con wa_user_id, buscar sin él (para chats antiguos)
-  if (rows.length === 0) {
-    const { rows: rowsWithoutWa } = await pool.query(`
-      SELECT id, wa_user_id, ai_active, personality_id, no_ac_ai, contact_name
-      FROM conversations_new
-      WHERE external_id = $1 
-        AND user_id = $2 
-        AND (wa_user_id IS NULL OR wa_user_id != $3)
-      ORDER BY created_at DESC
-      LIMIT 1
-    `, [conversationId, userId, phoneNumber]);
-    
-    if (rowsWithoutWa.length > 0) {
-      // Actualizar el wa_user_id del chat existente para evitar duplicados
-      await pool.query(`
-        UPDATE conversations_new
-        SET wa_user_id = $1, updated_at = NOW()
-        WHERE id = $2
-      `, [phoneNumber, rowsWithoutWa[0].id]);
-      
-      rows = rowsWithoutWa;
-      console.log(`🔄 Chat existente actualizado con wa_user_id: ${phoneNumber}`);
-    }
+  // Si encontramos una conversación pero sin wa_user_id o con uno diferente, actualizarlo
+  if (rows.length > 0 && rows[0].wa_user_id !== phoneNumber) {
+    await pool.query(`
+      UPDATE conversations_new
+      SET wa_user_id = $1, updated_at = NOW()
+      WHERE id = $2
+    `, [phoneNumber, rows[0].id]);
+    console.log(`🔄 Chat existente actualizado con wa_user_id: ${phoneNumber}`);
   }
 
   if (rows.length > 0) {
     conv = rows[0];
     console.log(`✅ Conversación existente encontrada con ID: ${conv.id}`);
+    
+    // 🔄 Actualizar nombre del contacto si tenemos pushName del mensaje y el nombre actual es solo un número
+    const currentName = conv.contact_name || '';
+    const nameIsNumber = /^\d+$/.test(currentName.trim());
+    const msgPushName = msg.pushName || '';
+    if (nameIsNumber && msgPushName && msgPushName.trim() !== '' && !/^\d+$/.test(msgPushName.trim())) {
+      console.log(`🔄 Actualizando nombre de contacto: "${currentName}" → "${msgPushName}" para ${conversationId}`);
+      await pool.query(`
+        UPDATE conversations_new
+        SET contact_name = $1, updated_at = NOW()
+        WHERE id = $2
+      `, [msgPushName.trim(), conv.id]).catch(e => console.log(`⚠️ Error actualizando nombre: ${e.message}`));
+      conv.contact_name = msgPushName.trim();
+    }
   } else {
     // El chat no existe, crear uno nuevo
     let contactName, contactPhotoUrl;
-    if (conversationId.endsWith('@g.us')) {
-      const meta = await sock.groupMetadata(conversationId);
-      contactName = meta.subject || 'Grupo sin nombre';
-      contactPhotoUrl = meta.iconUrl || await sock.profilePictureUrl(conversationId, 'image').catch(() => null);
-    } else {
-      // Intentar obtener el nombre real del contacto desde WhatsApp
+    
+    // Detectar tipo de chat
+    const isGroup = conversationId.endsWith('@g.us');
+    const isNewsletter = conversationId.endsWith('@newsletter');
+    let chatType = 'individual';
+    
+    if (isGroup) {
+      chatType = 'group';
       try {
-        // Método 1: Intentar obtener desde el store de contactos de Baileys
-        const contactData = await sock.store?.contacts?.get(conversationId);
-        if (contactData) {
-          // Priorizar notify (nombre mostrado en WhatsApp), luego name
-          contactName = contactData.notify || contactData.name || conversationId.split('@')[0];
-          console.log(`✅ Nombre obtenido desde store: ${contactName} para ${conversationId}`);
-        } else {
-          // Método 2: Intentar usar contactAddOrGet si está disponible
-          try {
-            if (typeof sock.contactAddOrGet === 'function') {
-              const contact = await sock.contactAddOrGet(conversationId);
-              if (contact && (contact.pushname || contact.name)) {
-                contactName = contact.pushname || contact.name;
-                console.log(`✅ Nombre obtenido desde contactAddOrGet: ${contactName} para ${conversationId}`);
+        const meta = await sock.groupMetadata(conversationId);
+        contactName = meta.subject || 'Grupo sin nombre';
+        contactPhotoUrl = meta.iconUrl || await sock.profilePictureUrl(conversationId, 'image').catch(() => null);
+      } catch (groupError) {
+        console.log(`⚠️ Error obteniendo metadata del grupo ${conversationId}: ${groupError.message}`);
+        contactName = 'Grupo';
+        contactPhotoUrl = null;
+      }
+    } else if (isNewsletter) {
+      chatType = 'channel';
+      contactName = 'Canal';
+      contactPhotoUrl = null;
+    } else {
+      // Chat individual - usar pushName del mensaje como fuente principal
+      const msgPushName = msg.pushName || '';
+      
+      if (msgPushName && msgPushName.trim() !== '' && !/^\d+$/.test(msgPushName.trim())) {
+        contactName = msgPushName.trim();
+        console.log(`✅ Nombre obtenido desde pushName del mensaje: ${contactName} para ${conversationId}`);
+      } else {
+        // Intentar obtener el nombre real del contacto desde WhatsApp
+        try {
+          const contactData = await sock.store?.contacts?.get(conversationId);
+          if (contactData) {
+            contactName = contactData.notify || contactData.name || conversationId.split('@')[0];
+            console.log(`✅ Nombre obtenido desde store: ${contactName} para ${conversationId}`);
+          } else {
+            try {
+              if (typeof sock.contactAddOrGet === 'function') {
+                const contact = await sock.contactAddOrGet(conversationId);
+                if (contact && (contact.pushname || contact.name)) {
+                  contactName = contact.pushname || contact.name;
+                  console.log(`✅ Nombre obtenido desde contactAddOrGet: ${contactName} para ${conversationId}`);
+                } else {
+                  contactName = conversationId.split('@')[0];
+                }
               } else {
                 contactName = conversationId.split('@')[0];
               }
-            } else {
+            } catch (contactError) {
+              console.log(`⚠️ No se pudo obtener nombre con contactAddOrGet para ${conversationId}:`, contactError.message);
               contactName = conversationId.split('@')[0];
             }
-          } catch (contactError) {
-            console.log(`⚠️ No se pudo obtener nombre con contactAddOrGet para ${conversationId}:`, contactError.message);
-            contactName = conversationId.split('@')[0];
           }
+        } catch (error) {
+          console.log(`⚠️ Error obteniendo nombre del contacto ${conversationId}, usando número:`, error.message);
+          contactName = conversationId.split('@')[0];
         }
-      } catch (error) {
-        console.log(`⚠️ Error obteniendo nombre del contacto ${conversationId}, usando número:`, error.message);
-        contactName = conversationId.split('@')[0];
       }
       
       // Obtener foto de perfil
@@ -549,13 +591,26 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
     try {
       const insertRes = await pool.query(`
         INSERT INTO conversations_new
-        (external_id, contact_name, contact_photo_url, started_at, user_id, wa_user_id, ai_active)
-        VALUES ($1, $2, $3, CURRENT_TIMESTAMP, $4, $5, true)
+        (external_id, contact_name, contact_photo_url, started_at, user_id, wa_user_id, ai_active, chat_type)
+        VALUES ($1, $2, $3, CURRENT_TIMESTAMP, $4, $5, true, $6)
         RETURNING id, ai_active, personality_id, no_ac_ai, contact_name
-      `, [conversationId, contactName, contactPhotoUrl, userId, phoneNumber]);
+      `, [conversationId, contactName, contactPhotoUrl, userId, phoneNumber, chatType]);
 
       conv = insertRes.rows[0];
-      console.log(`✅ Nueva conversación creada con ID: ${conv.id}`);
+      console.log(`✅ Nueva conversación creada con ID: ${conv.id} (tipo: ${chatType})`);
+      
+      // 📡 Emitir el nuevo contacto al frontend en tiempo real
+      emitToUser(userId, 'new-contact', {
+        id: conversationId,
+        name: contactName,
+        phone: conversationId.split('@')[0],
+        photo: contactPhotoUrl,
+        chatType: chatType,
+        lastMessage: '',
+        unreadCount: 0,
+        lastMessageAt: new Date().toISOString(),
+        startedAt: new Date().toISOString()
+      });
     } catch (insertError) {
       // Si falla por duplicado (race condition), obtener el chat existente
       if (insertError.code === '23505' || insertError.message.includes('duplicate') || insertError.message.includes('unique')) {
@@ -573,10 +628,10 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
           conv = existingRows[0];
           console.log(`✅ Conversación existente obtenida después de race condition: ${conv.id}`);
         } else {
-          throw insertError; // Si no se puede obtener, lanzar el error original
+          throw insertError;
         }
       } else {
-        throw insertError; // Si es otro error, lanzarlo
+        throw insertError;
       }
     }
   }
@@ -982,32 +1037,39 @@ export async function saveIncomingMessage(userId, msg, textContent, media = [], 
     .eq('user_id', userId)
     .single();
 
-  let ai_global_active = true; // ✅ ACTIVADO POR DEFECTO
+  let ai_global_active = false; // Solo responde si el usuario ha activado la IA desde el frontend
   let default_personality_id = 1; // ✅ Personalidad por defecto
 
   if (settingsError) {
     if (settingsError.code !== 'PGRST116') {
       console.error('Error al obtener configuración del usuario:', settingsError);
-      // No lanzar error, usar valores por defecto
-      console.log('🔧 Error obteniendo configuración, usando valores por defecto (IA activa)');
+      console.log('🔧 Error obteniendo configuración, IA inactiva por defecto');
     } else {
-    // Si no hay configuración, usar valores por defecto
-      console.log('🔧 No hay configuración de usuario, usando valores por defecto (IA activa)');
+      console.log('🔧 No hay configuración de usuario, IA inactiva por defecto');
     }
   } else {
-    ai_global_active = (settingsData?.ai_global_active !== false); // Si es null/undefined, usar true
+    ai_global_active = settingsData?.ai_global_active === true; // Solo true explícito = activada
     default_personality_id = settingsData?.global_personality_id || 1;
   }
 
-  // ✅ SIEMPRE intentar responder si hay una personalidad disponible
-  // Solo no responder si explícitamente está desactivado en ambos lugares
+  // Solo responder si la IA está activada (global o en esta conversación)
   if (!ai_active && !ai_global_active) {
-    console.log('🚫 IA explícitamente desactivada en conversación y globalmente, no se generará respuesta.');
+    console.log('🚫 IA no activada (global ni en conversación), no se generará respuesta.');
     return { success: true, aiReply: null };
   }
 
+  // 🧠 DETECCIÓN INTELIGENTE PARA GRUPOS: Solo responder si le hablan a la IA
+  const isGroupChat = conversationId.endsWith('@g.us');
+  if (isGroupChat) {
+    const shouldRespondInGroup = await checkIfShouldRespondInGroup(textContent, msg, sock, userId, convId);
+    if (!shouldRespondInGroup) {
+      console.log(`🤫 [Grupo] La IA decidió NO responder en este grupo - el mensaje no va dirigido a ella`);
+      return { success: true, aiReply: null };
+    }
+    console.log(`💬 [Grupo] La IA decidió RESPONDER - detectó que le están hablando`);
+  }
+
   // Modelo agente único: obtener agente del usuario
-  // Orden: personality_id de conversación -> global_personality_id -> único agente del usuario
   let personalityData = null;
   if (ai_active && personality_id) {
     const { data: pFromConv, error: errConv } = await supabaseAdmin
@@ -2038,6 +2100,163 @@ async function processMedia(msg, userId, conversationId, convId, personalityData
   return processedMedia;
 }
 
+/**
+ * 🧠 DETECCIÓN INTELIGENTE PARA GRUPOS
+ * Determina si la IA debería responder a un mensaje en un grupo.
+ * Usa heurísticas rápidas primero, luego IA como fallback para casos ambiguos.
+ * 
+ * Criterios para responder:
+ * 1. El mensaje menciona directamente al bot por su nombre
+ * 2. El mensaje es una respuesta (quote) a un mensaje del bot
+ * 3. El mensaje contiene @mention del número del bot
+ * 4. El contexto conversacional indica que se dirigen al bot (IA detecta esto)
+ */
+async function checkIfShouldRespondInGroup(textContent, msg, sock, userId, convId) {
+  try {
+    // Si no hay texto, no responder (para media sin caption en grupos)
+    if (!textContent || textContent.trim().length === 0) {
+      console.log(`🤫 [Grupo] Sin texto, no responder`);
+      return false;
+    }
+
+    // 1. Verificar si el mensaje es una respuesta a un mensaje del bot
+    const quotedMessage = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    const quotedParticipant = msg.message?.extendedTextMessage?.contextInfo?.participant;
+    
+    if (quotedMessage && sock?.user?.id) {
+      // Si el mensaje citado es del bot (fromMe equivale a que el participante es nuestro número)
+      const botJid = sock.user.id;
+      const botNumber = botJid.split('@')[0].split(':')[0];
+      const quotedNumber = quotedParticipant ? quotedParticipant.split('@')[0].split(':')[0] : '';
+      
+      if (quotedNumber === botNumber || msg.message?.extendedTextMessage?.contextInfo?.fromMe) {
+        console.log(`✅ [Grupo] Respondiendo: el usuario citó un mensaje del bot`);
+        return true;
+      }
+    }
+
+    // 2. Verificar si el mensaje @menciona al bot
+    const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+    if (sock?.user?.id) {
+      const botJid = sock.user.id;
+      const botNumber = botJid.split('@')[0].split(':')[0];
+      
+      for (const mentioned of mentionedJids) {
+        const mentionedNumber = mentioned.split('@')[0].split(':')[0];
+        if (mentionedNumber === botNumber) {
+          console.log(`✅ [Grupo] Respondiendo: el usuario @mencionó al bot`);
+          return true;
+        }
+      }
+    }
+
+    // 3. Obtener el nombre de la personalidad/bot para detectar menciones por nombre
+    let botName = '';
+    try {
+      // Obtener personalidad configurada para esta conversación o la global
+      const { data: convData } = await supabaseAdmin
+        .from('conversations_new')
+        .select('personality_id')
+        .eq('id', convId)
+        .single();
+      
+      let personalityId = convData?.personality_id;
+      
+      if (!personalityId) {
+        const { data: settings } = await supabaseAdmin
+          .from('user_settings')
+          .select('global_personality_id')
+          .eq('user_id', userId)
+          .single();
+        personalityId = settings?.global_personality_id;
+      }
+      
+      if (personalityId) {
+        const { data: personality } = await supabaseAdmin
+          .from('personalities')
+          .select('nombre')
+          .eq('id', personalityId)
+          .single();
+        botName = personality?.nombre || '';
+      }
+    } catch (e) {
+      // No crítico, continuar sin nombre de bot
+    }
+
+    // 4. Verificar mención directa del nombre del bot en el texto
+    const textLower = textContent.toLowerCase().trim();
+    if (botName && botName.length > 2) {
+      const botNameLower = botName.toLowerCase();
+      // Verificar si mencionan al bot por nombre (con tolerancia a variaciones)
+      const botNameParts = botNameLower.split(/\s+/);
+      
+      for (const part of botNameParts) {
+        if (part.length > 2 && textLower.includes(part)) {
+          console.log(`✅ [Grupo] Respondiendo: el texto menciona al bot por nombre ("${part}")`);
+          return true;
+        }
+      }
+    }
+
+    // 5. Frases genéricas que indican que hablan con "el asistente" / "la IA" / "el bot"
+    const botKeywords = [
+      'bot', 'asistente', 'inteligencia artificial', ' ia ', 'ia,', 'ia?', 'ia!',
+      'chatbot', 'robot', 'asistente virtual', 'oye bot', 'hey bot', 'ey bot'
+    ];
+    
+    for (const keyword of botKeywords) {
+      if (textLower.includes(keyword)) {
+        console.log(`✅ [Grupo] Respondiendo: se detectó keyword de bot ("${keyword}")`);
+        return true;
+      }
+    }
+
+    // 6. Si el mensaje es una pregunta directa y ha habido interacción reciente del bot
+    // Obtener los últimos mensajes para ver si el bot participó recientemente
+    try {
+      const { data: recentMessages } = await supabaseAdmin
+        .from('messages_new')
+        .select('sender_type, text_content, created_at')
+        .eq('conversation_id', convId)
+        .order('created_at', { ascending: false })
+        .limit(5);
+
+      if (recentMessages && recentMessages.length > 0) {
+        // Si el bot respondió en los últimos 3 mensajes, es probable que la conversación continúe con él
+        const lastBotMsgIndex = recentMessages.findIndex(m => m.sender_type === 'ia');
+        if (lastBotMsgIndex >= 0 && lastBotMsgIndex <= 2) {
+          // El bot respondió hace poco, verificar si el nuevo mensaje parece dirigido a él
+          const isQuestion = /[?¿]/.test(textContent);
+          const isShortFollowUp = textContent.length < 100;
+          const isContinuation = textLower.startsWith('y ') || textLower.startsWith('pero ') || 
+                                  textLower.startsWith('entonces ') || textLower.startsWith('ok ') ||
+                                  textLower.startsWith('vale ') || textLower.startsWith('si ') ||
+                                  textLower.startsWith('sí ') || textLower.startsWith('no ') ||
+                                  textLower.startsWith('gracias') || textLower.startsWith('oye ') ||
+                                  textLower.startsWith('dime ') || textLower.startsWith('me ') ||
+                                  textLower.startsWith('a ver ');
+          
+          if ((isQuestion || isContinuation) && isShortFollowUp) {
+            console.log(`✅ [Grupo] Respondiendo: el bot participó recientemente y el mensaje parece una continuación`);
+            return true;
+          }
+        }
+      }
+    } catch (e) {
+      console.log(`⚠️ [Grupo] Error verificando mensajes recientes: ${e.message}`);
+    }
+
+    // 7. Por defecto, NO responder en grupos (para no ser spam)
+    console.log(`🤫 [Grupo] No se detectaron señales de que el mensaje va dirigido al bot`);
+    return false;
+
+  } catch (error) {
+    console.error(`❌ Error en checkIfShouldRespondInGroup:`, error);
+    // En caso de error, NO responder (para evitar spam)
+    return false;
+  }
+}
+
 // Actualizar la función generateAIResponse para manejar mejor el contexto
 async function generateAIResponse(personality, message, userId, history) {
   // Verificar si el mensaje es muy corto o vacío
@@ -2161,6 +2380,8 @@ export const getConversations = async (req, res) => {
 
     console.log(`🔍 Debug getConversations: userId=${users_id}, connected=${isConnected}, phoneNumber=${phoneNumber || '(no session)'}`);
 
+    // Siempre cargar conversaciones desde la DB (como WhatsApp Web: lista persistente).
+    // connected/needsQr solo indican si hay que mostrar QR para reconectar.
     // Usar DISTINCT ON para evitar chats duplicados con el mismo external_id
     // Priorizar conversaciones con wa_user_id y luego las más recientes
     // Usar una subconsulta para asegurar que solo se devuelva una conversación por external_id
@@ -2321,22 +2542,33 @@ export const getConversations = async (req, res) => {
       })
     );
 
-    const { data: settingsData, error: settingsError } = await supabaseAdmin
-      .from('user_settings')
-      .select('global_personality_id, ai_global_active')
-      .eq('user_id', users_id)
-      .single();
-
     let settings = {};
-    if (settingsError) {
-      if (settingsError.code !== 'PGRST116') {
-        console.error('Error al obtener configuración de usuario:', settingsError);
-        throw settingsError;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const { data: settingsData, error: settingsError } = await supabaseAdmin
+          .from('user_settings')
+          .select('global_personality_id, ai_global_active')
+          .eq('user_id', users_id)
+          .single();
+        if (!settingsError || settingsError.code === 'PGRST116') {
+          settings = settingsData || {};
+          break;
+        }
+        if (settingsError.code !== 'PGRST116') {
+          console.error('Error al obtener configuración de usuario:', settingsError);
+        }
+        break;
+      } catch (settingsErr) {
+        const isNetwork = (settingsErr?.message || '').includes('fetch failed') || settingsErr?.code === 'ECONNRESET' || settingsErr?.code === 'ETIMEDOUT';
+        if (isNetwork && attempt === 1) {
+          console.log('Reintento user_settings por fallo de red:', settingsErr?.message);
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+        console.error('Error al obtener configuración de usuario:', settingsErr?.message || settingsErr);
+        settings = {};
+        break;
       }
-      // Si no hay configuración, usar valores por defecto
-      settings = {};
-    } else {
-      settings = settingsData;
     }
 
     return res.json({
@@ -2345,7 +2577,7 @@ export const getConversations = async (req, res) => {
       connected: isConnected, // ✅ Estado de conexión explícito
       conversations: enrichedConvs,
       globalSettings: {
-        aiGlobalActive: settings?.ai_global_active ?? true, // ✅ Por defecto ACTIVADA
+        aiGlobalActive: settings?.ai_global_active === true, // Solo true si el usuario la activó
         globalPersonalityId: settings.global_personality_id || null
       }
     })
@@ -3439,28 +3671,45 @@ export const activateGlobalPersonality = async (req, res) => {
   try {
     const users_id = getUserIdFromToken(req)
     const { personalityId } = req.body
-    // Insertar o actualizar la configuración del usuario en la base de datos - MIGRADO: Usar API de Supabase
-    const { error } = await supabaseAdmin
-      .from('user_settings')
-      .upsert({
-        user_id: users_id,
-        global_personality_id: personalityId != null ? String(personalityId) : null,
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'user_id'
-      });
-
-    if (error) {
-      console.error('Error al actualizar personalidad global:', error);
-      throw error;
+    let lastError;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const { error } = await supabaseAdmin
+          .from('user_settings')
+          .upsert({
+            user_id: users_id,
+            global_personality_id: personalityId != null ? String(personalityId) : null,
+            updated_at: new Date().toISOString()
+          }, {
+            onConflict: 'user_id'
+          });
+        if (error) {
+          lastError = error;
+          if (attempt < 3) {
+            await new Promise(r => setTimeout(r, 1500));
+            continue;
+          }
+          console.error('Error al actualizar personalidad global:', error);
+          throw error;
+        }
+        return res.json({
+          success: true,
+          message: "Personality added"
+        });
+      } catch (e) {
+        lastError = e;
+        const isNetwork = e?.message?.includes('fetch failed') || e?.code === 'ECONNRESET' || e?.code === 'ETIMEDOUT';
+        if (isNetwork && attempt < 3) {
+          console.log(`Reintento activateGlobalPersonality (${attempt}/3): ${e?.message}`);
+          await new Promise(r => setTimeout(r, 1500));
+        } else {
+          throw e;
+        }
+      }
     }
-
-    return res.json({
-      success: true,
-      message: "Personality added"
-    })
+    if (lastError) throw lastError;
   } catch (err) {
-    console.error('Error en activateGlobalAIAll:', err)
+    console.error('Error en activateGlobalPersonality:', err?.message || err)
     return res.status(500).json({ success: false, message: 'Error al modificar la configuración de la IA global' })
   }
 }

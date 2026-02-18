@@ -203,8 +203,10 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 
-// CORS – SpeedLeads
+// CORS – SpeedLeads (Authorization y x-user-id para auth robusta desde el front)
 app.use(cors({
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'],
+  credentials: true,
   origin: function (origin, callback) {
     // En desarrollo, permitir todo
     if (ENV_CONFIG.NODE_ENV === 'development') {
@@ -428,7 +430,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'],
   optionsSuccessStatus: 204
 };
 
@@ -576,7 +578,7 @@ io.on('connection', (socket) => {
 });
 
 // Configurar el servicio de WhatsApp con Socket.IO
-import { configureSocket as configureWhatsAppSocket } from './services/whatsappService.js';
+import { configureSocket as configureWhatsAppSocket, restoreSessions } from './services/whatsappService.js';
 configureWhatsAppSocket(io);
 
 // Hacer io disponible globalmente
@@ -653,6 +655,9 @@ server.listen(Number(ENV_CONFIG.PORT) || 5001, '0.0.0.0', async () => {
     ENV_CONFIG.GOOGLE_CLIENT_ID ? '\x1b[32mConfigurado\x1b[0m' : '\x1b[31mNo configurado\x1b[0m'
   );
   console.log('   ▸ WhatsApp Web:', '\x1b[32mListo\x1b[0m');
+
+  // No restaurar sesiones al arranque: se inician cuando el usuario hace socket 'join' (p. ej. al abrir Chats)
+  // restoreSessions().catch(() => {});
 
   // Ejecutar diagnóstico de producción si está en producción o hay problemas
   if (ENV_CONFIG.NODE_ENV === 'production' || !ENV_CONFIG.OPENAI_API_KEY) {

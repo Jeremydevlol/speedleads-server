@@ -105,7 +105,21 @@ export async function createLead(req, res) {
       [userId, name, message, avatar_url, column_id, conversation_id]
     );
 
-    res.status(201).json({ success: true, lead: result.rows[0] });
+    const lead = result.rows[0];
+    try {
+      const { emitToUser } = await import("../services/whatsappService.js");
+      emitToUser(userId, "lead-created", {
+        leadId: lead.id,
+        contactName: name,
+        conversationId: conversation_id || null,
+        columnId: column_id,
+        message: message || null,
+      });
+    } catch (e) {
+      // No fallar la creación del lead si el socket no está disponible
+    }
+
+    res.status(201).json({ success: true, lead });
   } catch (error) {
     console.error("Error al crear el lead:", error);
     res.status(500).json({ success: false, message: error.message });

@@ -11,8 +11,28 @@ import { fileURLToPath } from 'url';
 // Removemos la importación circular de io
 // import { io as ioSocket } from '../app.js';
 import pool, { supabaseAdmin } from '../config/db.js';
-import { getSingleAgentForUser } from '../controllers/personalityController.js';
-import { saveIncomingMessage } from '../controllers/whatsappController.js';
+// ⚠️ Imports dinámicos (lazy) para romper dependencia circular:
+//   whatsappService → whatsappController → whatsappService
+//   whatsappService → personalityController → (usa authController que puede importar indirectamente)
+let _getSingleAgentForUser = null;
+let _saveIncomingMessage = null;
+
+async function getSingleAgentForUser(userId) {
+  if (!_getSingleAgentForUser) {
+    const mod = await import('../controllers/personalityController.js');
+    _getSingleAgentForUser = mod.getSingleAgentForUser;
+  }
+  return _getSingleAgentForUser(userId);
+}
+
+async function saveIncomingMessage(...args) {
+  if (!_saveIncomingMessage) {
+    const mod = await import('../controllers/whatsappController.js');
+    _saveIncomingMessage = mod.saveIncomingMessage;
+  }
+  return _saveIncomingMessage(...args);
+}
+
 import { analyzeImageBufferWithVision, analyzePdfBufferWithVision } from '../services/googleVisionService.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
@@ -38,19 +58,35 @@ async function syncContactWithTimeout(sock, userId, jid, newName, newPhotoUrl, w
   );
 }
 
-/** Resuelve userId desde token JWT; si falla verify y FORCE_LOGIN=true, usa decode (p. ej. token Supabase). */
+/** Resuelve userId desde token JWT; intenta verify local, si falla usa decode (token Supabase ya validado por middleware). */
 function getUserIdFromSocketToken(token) {
   if (!token) return null;
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    return payload.userId || payload.sub || null;
-  } catch (err) {
-    if (process.env.FORCE_LOGIN === 'true') {
-      const decoded = jwt.decode(token);
-      if (decoded && (decoded.userId || decoded.sub)) return decoded.userId || decoded.sub;
+  
+  // Verificar si el JWT_SECRET es un placeholder
+  const hasValidSecret = JWT_SECRET
+    && JWT_SECRET !== 'fallback-secret'
+    && JWT_SECRET !== 'clave-secreta-de-desarrollo'
+    && JWT_SECRET !== 'tu_jwt_secret_muy_seguro_aqui'
+    && JWT_SECRET !== 'PEGA_AQUI_TU_JWT_SECRET_DE_SUPABASE';
+  
+  if (hasValidSecret) {
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      return payload.userId || payload.sub || null;
+    } catch (err) {
+      // Verificación local falló — continuar a decode
     }
-    return null;
   }
+  
+  // Decodificar sin verificar (el token ya fue validado por el middleware antes de llegar al socket)
+  try {
+    const decoded = jwt.decode(token);
+    if (decoded && (decoded.userId || decoded.sub)) return decoded.userId || decoded.sub;
+  } catch (err) {
+    // No se pudo decodificar
+  }
+  
+  return null;
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -86,8 +122,20 @@ export function getCachedQr(userId) {
   }
 }
 
+// Debounce de chats-updated (evita recargas/skeleton en bucle cuando el front refetcha en cada evento)
+const chatsUpdatedDebounceMs = 2000;
+const lastChatsUpdatedEmit = new Map();
+function shouldEmitChatsUpdated(userId) {
+  const now = Date.now();
+  const last = lastChatsUpdatedEmit.get(userId) || 0;
+  if (now - last < chatsUpdatedDebounceMs) return false;
+  lastChatsUpdatedEmit.set(userId, now);
+  return true;
+}
+
 // Función para emitir eventos a través del socket IO
 export function emitToUser(userId, event, data) {
+  if (event === 'chats-updated' && !shouldEmitChatsUpdated(userId)) return;
   if (globalIO) {
     globalIO.to(userId).emit(event, data);
     if (event !== 'contact-progress' || process.env.VERBOSE_WHATSAPP === '1') {
@@ -119,6 +167,29 @@ export function isSessionConnected(userId) {
   
   // Si no hay ws pero hay user, asumir conectado
   return true;
+}
+
+/**
+ * Restaura sesiones de WhatsApp al arranque del servidor (usuarios con auth guardada).
+ * Así, tras un reinicio, los contactos y el estado "conectado" se recuperan.
+ */
+export async function restoreSessions() {
+  try {
+    if (!fs.existsSync(AUTH_DIR)) return;
+    const dirs = fs.readdirSync(AUTH_DIR, { withFileTypes: true });
+    const userIds = dirs.filter(d => d.isDirectory() && d.name).map(d => d.name);
+    if (userIds.length === 0) return;
+    console.log(`🔄 [WhatsApp] Restaurando sesiones para ${userIds.length} usuario(s): ${userIds.join(', ')}`);
+    for (const uid of userIds) {
+      if (sessions.has(uid) || initializing.has(uid)) continue;
+      startSession(uid).catch(err => {
+        console.error(`❌ [WhatsApp] Error restaurando sesión para ${uid}:`, err.message);
+      });
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  } catch (err) {
+    console.error('❌ [WhatsApp] Error en restoreSessions:', err.message);
+  }
 }
 
 // Función para desconectar la sesión de WhatsApp
@@ -293,13 +364,10 @@ export async function startSession(userId) {
         qrCache.set(userId, qr);
         emitToUser(userId, 'qr-code', qr);
         
-        // Limpiar chats cuando se muestra el QR (WhatsApp no está conectado)
-        console.log(`📡 [connection.update] Emitiendo eventos de limpieza por QR para userId=${userId}`);
-        // FIX: No emitir eventos de desconexión aquí, ya que causan que el frontend oculte el QR
-        // emitToUser(userId, 'whatsapp-disconnected', { reason: 'qr_required' });
-        // emitToUser(userId, 'session-closed', { reason: 'qr_required' });
+        // Notificar que hay QR; NO emitir clear-chats para no borrar la lista de contactos (p. ej. al activar IA o cambiar personalidad)
+        console.log(`📡 [connection.update] QR listo para userId=${userId}`);
         emitToUser(userId, 'chats-updated');
-        emitToUser(userId, 'clear-chats');
+        // No emitir clear-chats aquí: la lista puede seguir mostrándose desde la DB mientras se muestra el QR
         
         // NO intentar reconectar aquí - esperar a que el usuario escanee el QR
         return; // Salir temprano para evitar procesar más eventos
@@ -312,6 +380,14 @@ export async function startSession(userId) {
         console.log("✅ Conexión abierta - WhatsApp conectado y listo para recibir mensajes");
         console.log(`📡 [connection.open] Listener messages.upsert está activo para userId=${userId}`);
         emitToUser(userId, "session-ready", true);
+
+        // Keepalive: enviar presencia cada 25s para reducir desconexiones 428 (connectionClosed)
+        if (sock._presenceInterval) clearInterval(sock._presenceInterval);
+        sock._presenceInterval = setInterval(() => {
+          try {
+            if (sock && typeof sock.sendPresenceUpdate === 'function') sock.sendPresenceUpdate('available');
+          } catch (_) {}
+        }, 25000);
         
         // Obtener y guardar la foto de perfil del usuario de WhatsApp (con timeout)
         if (sock.user && sock.user.id) {
@@ -411,34 +487,40 @@ export async function startSession(userId) {
             }
             
             if (chats && chats.length > 0) {
-              const totalContacts = chats.length;
-              const progress = { count: 0 };
-              const contactPromises = chats.map(chat => limit(async () => {
-                const jid = typeof chat.id === 'string' ? chat.id : (chat.id?.user || chat.id);
-                if (!jid || jid.includes('@g.us') || jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
-                const contactName = chat.name || chat.notify || jid.split('@')[0];
-                let contactPhotoUrl = null;
-                try {
-                  contactPhotoUrl = await withTimeout(sock.profilePictureUrl(jid), PROFILE_PICTURE_TIMEOUT_MS, null);
-                } catch {
-                  contactPhotoUrl = null;
-                }
-                await syncContactWithTimeout(sock, userId, jid, contactName, contactPhotoUrl, waUserId);
-                progress.count++;
-                if (progress.count % CONTACT_PROGRESS_EVERY === 0 || progress.count === totalContacts) {
-                  emitToUser(userId, 'contact-progress', { total: totalContacts, processed: progress.count, info: contactName, capitalText: 'Sincronizando contactos', text: `${progress.count}/${totalContacts}` });
-                  if (process.env.VERBOSE_WHATSAPP === '1') console.log(`📊 [Carga manual] ${progress.count}/${totalContacts}`);
-                }
-              }));
-              await Promise.allSettled(contactPromises);
-              console.log(`✅ [Carga manual] ${progress.count} contactos sincronizados para userId=${userId}`);
-              emitToUser(userId, 'chats-updated');
+              emitToUser(userId, 'open-dialog');
+              try {
+                const totalContacts = chats.length;
+                const progress = { count: 0 };
+                const contactPromises = chats.map(chat => limit(async () => {
+                  const jid = typeof chat.id === 'string' ? chat.id : (chat.id?.user || chat.id);
+                  if (!jid || jid.includes('@g.us') || jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
+                  const contactName = chat.name || chat.notify || jid.split('@')[0];
+                  let contactPhotoUrl = null;
+                  try {
+                    contactPhotoUrl = await withTimeout(sock.profilePictureUrl(jid), PROFILE_PICTURE_TIMEOUT_MS, null);
+                  } catch {
+                    contactPhotoUrl = null;
+                  }
+                  await syncContactWithTimeout(sock, userId, jid, contactName, contactPhotoUrl, waUserId);
+                  progress.count++;
+                  if (progress.count % CONTACT_PROGRESS_EVERY === 0 || progress.count === totalContacts) {
+                    emitToUser(userId, 'contact-progress', { total: totalContacts, processed: progress.count, info: contactName, capitalText: 'Sincronizando contactos', text: `${progress.count}/${totalContacts}` });
+                    if (process.env.VERBOSE_WHATSAPP === '1') console.log(`📊 [Carga manual] ${progress.count}/${totalContacts}`);
+                  }
+                }));
+                await Promise.allSettled(contactPromises);
+                console.log(`✅ [Carga manual] ${progress.count} contactos sincronizados para userId=${userId}`);
+                emitToUser(userId, 'chats-updated');
+              } finally {
+                emitToUser(userId, 'close-dialog');
+              }
             } else {
               console.log(`⚠️ [Carga manual] No se encontraron chats para sincronizar para userId=${userId}`);
             }
           } catch (error) {
             console.error(`❌ [Carga manual] Error obteniendo chats manualmente para userId=${userId}:`, error);
             console.error(`   Stack:`, error.stack);
+            emitToUser(userId, 'close-dialog');
             // No lanzar el error, solo loguearlo
           }
         }, 3000); // Esperar 3 segundos después de que la conexión se abre para dar tiempo a que se cargue el store
@@ -477,16 +559,27 @@ export async function startSession(userId) {
       if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
         const loggedOut = code === DisconnectReason.loggedOut;
-        
+        const restartRequired = code === 515; // DisconnectReason.restartRequired
+        const connectionClosed = code === 428; // DisconnectReason.connectionClosed
+        const willReconnect = !loggedOut;
+
+        const reasonLabel = loggedOut ? 'Logged out (401)' : restartRequired ? 'Restart required (515)' : connectionClosed ? 'Connection closed (428)' : `Other (${code})`;
         console.log(`🔌 [connection.update] Conexión cerrada para userId=${userId}`);
-        console.log(`   - Código: ${code}`);
-        console.log(`   - Razón: ${loggedOut ? 'Logged out' : 'Other reason'}`);
-        
-        // SIEMPRE eliminar la sesión cuando se cierra la conexión
+        console.log(`   - Código: ${code} - ${reasonLabel}`);
+        if (loggedOut) console.log(`   💡 Si no cerraste sesión desde el teléfono, puede ser conflicto con otro cliente o WhatsApp revocó el dispositivo.`);
+        if (restartRequired) console.log(`   💡 WhatsApp pide reiniciar el socket; se creará una nueva sesión en 2s.`);
+        if (connectionClosed) console.log(`   💡 Servidor cerró la conexión (timeout/red). Se reintentará en 4s.`);
+
         initializing.delete(userId);
         sessions.delete(userId);
-        
-        // Limpiar archivos de autenticación si es logout
+        if (sock._presenceInterval) {
+          clearInterval(sock._presenceInterval);
+          sock._presenceInterval = null;
+        }
+        try {
+          if (sock.ws) sock.ws.close();
+        } catch (_) {}
+
         if (loggedOut) {
           console.log(`🗑️ [connection.update] User ${userId} logged out, removing auth files`);
           try {
@@ -495,22 +588,20 @@ export async function startSession(userId) {
             console.error(`❌ Error eliminando archivos de auth: ${fsError.message}`);
           }
         }
-        
-        // SIEMPRE emitir eventos para limpiar los chats cuando se cierra la conexión
+
         console.log(`📡 [connection.update] Emitiendo eventos de desconexión para userId=${userId}`);
         emitToUser(userId, 'whatsapp-disconnected', { reason: loggedOut ? 'logged_out' : 'connection_closed' });
         emitToUser(userId, 'chats-updated');
-        emitToUser(userId, 'clear-chats');
+        if (loggedOut) emitToUser(userId, 'clear-chats');
         emitToUser(userId, 'session-closed', { reason: loggedOut ? 'logged_out' : 'connection_closed' });
 
-        // Si se cierra la conexión por cualquier motivo, intentamos reconectar
-        // PERO solo si NO fue un logout (si fue logout, necesita nuevo QR)
-        if (!loggedOut) {
+        if (willReconnect) {
+          const reconnectDelayMs = restartRequired ? 2000 : 4000;
+          console.log(`🔄 [connection.update] Reconectando en ${reconnectDelayMs / 1000}s para userId=${userId}`);
           setTimeout(() => startSession(userId).catch((e) => {
             console.error(`Error intentando reconectar el socket para el usuario ${userId}:`, e);
-          }), 1000);  // Espera 1 segundo antes de intentar reconectar
+          }), reconnectDelayMs);
         } else {
-          // Si fue logout, mostrar QR para reconectar
           console.log(`🔄 Usuario ${userId} desvinculado, se requerirá nuevo QR para reconectar`);
         }
       }
@@ -572,25 +663,53 @@ export async function startSession(userId) {
           if (!convRows || convRows.length === 0) {
             console.log(`📝 [Auto-crear] No se encontró la conversación con ID externo: ${from}, creándola automáticamente...`);
             
-            // Obtener nombre del contacto
+            // Detectar tipo de chat
+            const isGroup = from.endsWith('@g.us');
+            const isNewsletter = from.endsWith('@newsletter');
+            let chatType = 'individual';
             let contactName = from.split('@')[0];
             let contactPhotoUrl = null;
             
-            try {
-              // Intentar obtener el nombre del contacto desde WhatsApp
-              const contact = await sock.onWhatsApp(from);
-              if (contact && contact[0]) {
-                contactName = contact[0].name || contact[0].notify || contactName;
+            if (isGroup) {
+              chatType = 'group';
+              try {
+                const meta = await sock.groupMetadata(from);
+                contactName = meta.subject || 'Grupo sin nombre';
+                contactPhotoUrl = meta.iconUrl || null;
+                try {
+                  contactPhotoUrl = contactPhotoUrl || await sock.profilePictureUrl(from, 'image');
+                } catch {}
+              } catch (groupError) {
+                console.log(`⚠️ Error obteniendo metadata del grupo ${from}: ${groupError.message}`);
+                contactName = 'Grupo';
+              }
+            } else if (isNewsletter) {
+              chatType = 'channel';
+              contactName = 'Canal';
+            } else {
+              // Chat individual - usar pushName del mensaje como fuente más confiable
+              const msgPushName = msg.pushName || '';
+              
+              if (msgPushName && msgPushName.trim() !== '' && !/^\d+$/.test(msgPushName.trim())) {
+                contactName = msgPushName.trim();
+                console.log(`✅ [Auto-crear] Nombre obtenido desde pushName: ${contactName}`);
+              } else {
+                try {
+                  const contact = await sock.onWhatsApp(from);
+                  if (contact && contact[0]) {
+                    contactName = contact[0].name || contact[0].notify || contactName;
+                  }
+                } catch (contactError) {
+                  console.log(`⚠️ No se pudo obtener información del contacto ${from}, usando nombre por defecto`);
+                }
               }
               
               // Intentar obtener la foto de perfil
               try {
-                contactPhotoUrl = await sock.profilePictureUrl(from);
+                contactPhotoUrl = await sock.profilePictureUrl(from, 'image');
               } catch {
                 // Si no se puede obtener, mantener null
               }
-            } catch (contactError) {
-              console.log(`⚠️ No se pudo obtener información del contacto ${from}, usando nombre por defecto`);
             }
             
             // Modelo agente único: obtener agente del usuario para asignar a la nueva conversación
@@ -603,7 +722,8 @@ export async function startSession(userId) {
               wa_user_id: waUserId,
               started_at: new Date().toISOString(),
               ai_active: true,
-              tenant: 'whatsapp'
+              tenant: 'whatsapp',
+              chat_type: chatType
             };
             if (agent?.id) insertData.personality_id = agent.id;
             const { data: newConv, error: createError } = await supabaseAdmin
@@ -618,7 +738,20 @@ export async function startSession(userId) {
             }
             
             convId = newConv.id;
-            console.log(`✅ [Auto-crear] Conversación creada para ${from} (${contactName}) con ID: ${convId}`);
+            console.log(`✅ [Auto-crear] Conversación creada para ${from} (${contactName}) con ID: ${convId} (tipo: ${chatType})`);
+            
+            // 📡 Emitir nuevo contacto al frontend
+            emitToUser(userId, 'new-contact', {
+              id: from,
+              name: contactName,
+              phone: from.split('@')[0],
+              photo: contactPhotoUrl,
+              chatType: chatType,
+              lastMessage: '',
+              unreadCount: 0,
+              lastMessageAt: new Date().toISOString(),
+              startedAt: new Date().toISOString()
+            });
           } else {
             // Si la conversación existe, obtenemos el id
             convId = convRows[0].id;
@@ -713,36 +846,41 @@ export async function startSession(userId) {
         console.error('❌ No se puede obtener wa_user_id: sock.user no está disponible');
         return;
       }
-      const waUserId = sock.user.id.split('@')[0].split(':')[0];
-      const totalContacts = contacts.length;
-      const progress = { count: 0 };
-      const contactPromises = contacts.map(contact => limit(async () => {
-        const jid = contact.id;
-        if (jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
-        const localPart = jid.split('@')[0];
-        const newName = contact.notify || contact.name || contact.verifiedName || contact.pushname || localPart;
-        let newPhotoUrl = null;
-        try {
-          newPhotoUrl = await withTimeout(sock.profilePictureUrl(jid), PROFILE_PICTURE_TIMEOUT_MS, null);
-        } catch {
-          newPhotoUrl = null;
-        }
-        await syncContactWithTimeout(sock, userId, jid, newName, newPhotoUrl, waUserId);
-        progress.count++;
-        if (progress.count % CONTACT_PROGRESS_EVERY === 0 || progress.count === totalContacts) {
-          emitToUser(userId, 'contact-progress', {
-            total: totalContacts,
-            processed: progress.count,
-            avatarUrl: newPhotoUrl,
-            info: newName,
-            capitalText: 'Sincronizando contactos',
-            text: `${progress.count}/${totalContacts}`
-          });
-        }
-      }));
-      await Promise.allSettled(contactPromises);
-      contactsSynced = true;
-      emitToUser(userId, 'chats-updated');
+      emitToUser(userId, 'open-dialog');
+      try {
+        const waUserId = sock.user.id.split('@')[0].split(':')[0];
+        const totalContacts = contacts.length;
+        const progress = { count: 0 };
+        const contactPromises = contacts.map(contact => limit(async () => {
+          const jid = contact.id;
+          if (jid === 'status@broadcast' || jid.split('@')[0] === '0') return;
+          const localPart = jid.split('@')[0];
+          const newName = contact.notify || contact.name || contact.verifiedName || contact.pushname || localPart;
+          let newPhotoUrl = null;
+          try {
+            newPhotoUrl = await withTimeout(sock.profilePictureUrl(jid), PROFILE_PICTURE_TIMEOUT_MS, null);
+          } catch {
+            newPhotoUrl = null;
+          }
+          await syncContactWithTimeout(sock, userId, jid, newName, newPhotoUrl, waUserId);
+          progress.count++;
+          if (progress.count % CONTACT_PROGRESS_EVERY === 0 || progress.count === totalContacts) {
+            emitToUser(userId, 'contact-progress', {
+              total: totalContacts,
+              processed: progress.count,
+              avatarUrl: newPhotoUrl,
+              info: newName,
+              capitalText: 'Sincronizando contactos',
+              text: `${progress.count}/${totalContacts}`
+            });
+          }
+        }));
+        await Promise.allSettled(contactPromises);
+        contactsSynced = true;
+        emitToUser(userId, 'chats-updated');
+      } finally {
+        emitToUser(userId, 'close-dialog');
+      }
     });
     sock.ev.on('messaging-history.set', async ({ contacts, messages }) => {
       emitToUser(userId, 'open-dialog');
@@ -1145,13 +1283,7 @@ export function configureSocket(io) {
         return;
       }
       socket.join(uid);
-      try {
-        console.log(`Starting session for user ${uid}`);
-        await startSession(uid)
-      } catch (err) {
-        console.error('Error starting session:', err);
-        socket.emit('error-message', 'Error iniciando sesión')
-      }
+      // No iniciar sesión WhatsApp aquí: solo al entrar a Chats (get-qr o GET /api/whatsapp/status)
     })
     
     socket.on('send-message', async ({ token, conversationId, textContent, attachments }) => {
@@ -1338,18 +1470,52 @@ export function configureSocket(io) {
       const token = payload?.token || socket.handshake?.auth?.token;
       const userId = getUserIdFromSocketToken(token);
       if (!userId) {
-        socket.emit('contacts-loaded', { success: false, message: 'Token no proporcionado o inválido', contacts: [], total: 0 });
+        socket.emit('contacts-loaded', { success: false, sessionActive: false, message: 'Token no proporcionado o inválido', contacts: [], total: 0 });
         return;
       }
+      const connected = isSessionConnected(userId);
+      // Check if there's persisted auth on disk (session will restore) or is currently initializing
+      const hasPersistedAuth = fs.existsSync(path.join(AUTH_DIR, userId));
+      const isRestoring = initializing.has(userId);
+
+      if (!connected && !hasPersistedAuth && !isRestoring) {
+        // No session, no auth data, truly disconnected
+        socket.emit('contacts-loaded', { success: true, sessionActive: false, contacts: [], total: 0, message: 'No hay sesión de WhatsApp activa' });
+        return;
+      }
+      // Session is connected OR has persisted auth (restoring/will restore) → load contacts from DB
       emitToUser(userId, 'contacts-loading', { started: true });
       try {
         const { getContacts } = await import('../controllers/whatsappController.js');
         const contacts = await getContacts(userId);
-        socket.emit('contacts-loaded', { success: true, contacts, total: contacts.length });
+        socket.emit('contacts-loaded', { success: true, sessionActive: true, contacts, total: contacts.length });
+        // If session is not yet connected but has auth, try to restore it now
+        if (!connected && (hasPersistedAuth || isRestoring) && !sessions.has(userId)) {
+          startSession(userId).catch(err => {
+            console.error(`❌ [get-contacts] Error restaurando sesión para ${userId}:`, err.message);
+          });
+        }
       } catch (error) {
         console.error('Error obteniendo contactos:', error);
-        socket.emit('contacts-loaded', { success: false, message: error.message, contacts: [], total: 0 });
+        socket.emit('contacts-loaded', { success: false, sessionActive: connected || hasPersistedAuth, message: error.message, contacts: [], total: 0 });
+      } finally {
+        emitToUser(userId, 'contacts-loading', { started: false });
       }
+    });
+
+    // Handler for whatsapp:status — frontend asks this to know connection state
+    socket.on('whatsapp:status', async (payload = {}) => {
+      const token = payload?.token || socket.handshake?.auth?.token;
+      const userId = getUserIdFromSocketToken(token);
+      if (!userId) {
+        socket.emit('whatsapp:status', { connected: false });
+        return;
+      }
+      const connected = isSessionConnected(userId);
+      const hasPersistedAuth = fs.existsSync(path.join(AUTH_DIR, userId));
+      const isRestoring = initializing.has(userId);
+      // Consider "connected" if session is active OR if auth is persisted (will restore)
+      socket.emit('whatsapp:status', { connected: connected || hasPersistedAuth || isRestoring });
     });
     
     socket.on('disconnect', () => {

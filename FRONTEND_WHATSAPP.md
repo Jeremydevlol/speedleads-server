@@ -156,7 +156,7 @@ Si el frontend ya usa **`get_conversations`** o **`get_contacts`** por HTTP y re
 | **`message-sent`** | Confirmación de envío (por Socket). |
 | **`error`** / **`error-message`** | Mensaje de error (ej. token inválido, WhatsApp no conectado). |
 | **`analyzing-media`** / **`media-analyzed`** / **`media-analysis-error`** | Progreso/resultado de análisis de media (por conversación). |
-| **`lead-created`** | Lead creado (si aplica). |
+| **`lead-created`** | Lead creado. Payload: `{ leadId?, contactName?, conversationId?, columnId?, message? }` (creación manual/automática) o `{ imported: true, count, total }` (importación de contactos). |
 
 ---
 
@@ -220,6 +220,7 @@ Todas las rutas anteriores requieren JWT (salvo las que el backend documente com
 4. Escuchar **`contact-progress`** → actualizar “X/Y” o barra de progreso.
 5. Escuchar **`close-dialog`** → cerrar el modal (siempre).
 6. Escuchar **`chats-updated`** → llamar a `GET /api/whatsapp/get_conversations` (y/o `get_contacts`) y actualizar la lista.
-7. Para la lista inicial tras login, hacer un `GET /api/whatsapp/get_conversations` y, si se usa, `GET /api/whatsapp/get_contacts`; luego mantener la lista actualizada con **`chats-updated`**.
+7. Para la lista inicial tras login (o **al cargar/refrescar la página**), llamar a `GET /api/whatsapp/status` y, si `connected === true`, llamar a `GET /api/whatsapp/get_contacts` (y/o `get_conversations`). El backend devuelve contactos desde la base de datos incluso sin sesión activa, así la lista persiste tras refresh.
+8. Mantener la lista actualizada con **`chats-updated`**.
 
 Con esto, la conexión, la carga de contactos, los diálogos de progreso y el envío de mensajes quedan alineados con el backend.

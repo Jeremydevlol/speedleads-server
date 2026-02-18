@@ -64,6 +64,29 @@ export const supabaseAdmin = createClient(
   { auth: { autoRefreshToken: true, persistSession: false, detectSessionInUrl: false } }
 );
 
+// Reintentos para fallos de red (fetch failed, ECONNRESET, etc.)
+const SUPABASE_RETRIES = 3;
+const SUPABASE_RETRY_DELAY_MS = 1500;
+
+async function withRetry(fn) {
+  let lastErr;
+  for (let attempt = 1; attempt <= SUPABASE_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const isNetwork = e?.message?.includes('fetch failed') || e?.code === 'ECONNRESET' || e?.code === 'ETIMEDOUT';
+      if (isNetwork && attempt < SUPABASE_RETRIES) {
+        console.log(`   → ⚠️ Reintento Supabase (${attempt}/${SUPABASE_RETRIES}): ${e?.message || e?.code}`);
+        await new Promise(r => setTimeout(r, SUPABASE_RETRY_DELAY_MS));
+      } else {
+        throw e;
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // ----------------------------------------------------------------------------
 //  POOL QUE USA EXCLUSIVAMENTE LA API REAL DE SUPABASE
 // ----------------------------------------------------------------------------
@@ -92,13 +115,13 @@ const pool = {
             return { rows: [], rowCount: 0 };
           }
           
-          // Usar la API real de Supabase para verificar existencia
-          const { data, error } = await supabaseAdmin
+          // Usar la API real de Supabase para verificar existencia (con reintentos)
+          const { data, error } = await withRetry(() => supabaseAdmin
             .from('conversations_new')
             .select('id, external_id, contact_name')
             .eq('external_id', externalId)
             .eq('user_id', userId)
-            .limit(1);
+            .limit(1));
           
           if (error) {
             console.log('   → ❌ Error en verificación via API Supabase:', error.message);
@@ -126,9 +149,8 @@ const pool = {
           console.log(`   → 🔥 OBTENIENDO CONVERSACIONES para userId: ${userId}`);
           console.log(`   → 🔒 FILTRANDO SOLO conversaciones de este usuario`);
           
-          // Usar la API real de Supabase para obtener conversaciones
-          // IMPORTANTE: Filtrar SOLO por el user_id específico
-          const { data, error } = await supabaseAdmin
+          // Usar la API real de Supabase para obtener conversaciones (con reintentos por fallos de red)
+          const { data, error } = await withRetry(() => supabaseAdmin
             .from('conversations_new')
             .select(`
               user_id,
@@ -144,7 +166,7 @@ const pool = {
               last_msg_time
             `)
             .eq('user_id', userId) // 🔒 FILTRO CRÍTICO: Solo este usuario
-            .order('updated_at', { ascending: false });
+            .order('updated_at', { ascending: false }));
           
           if (error) {
             console.log('   → ❌ Error en API Supabase:', error.message);
@@ -204,7 +226,7 @@ const pool = {
             return { rows: [], rowCount: 0 };
           }
           
-          const { data, error } = await supabaseAdmin
+          const { data, error } = await withRetry(() => supabaseAdmin
             .from('conversations_new')
             .upsert({
               user_id: userId,
@@ -215,7 +237,7 @@ const pool = {
               started_at: new Date().toISOString(),
               updated_at: new Date().toISOString()
             }, { onConflict: 'user_id,external_id' })
-            .select();
+            .select());
           
           if (error) {
             console.log('   → ❌ Error en INSERT via API Supabase:', error.message);
@@ -237,7 +259,7 @@ const pool = {
             return { rows: [], rowCount: 0 };
           }
           
-          const { data, error } = await supabaseAdmin
+          const { data, error } = await withRetry(() => supabaseAdmin
             .from('messages_new')
             .insert({
               conversation_id: conversationId,
@@ -247,7 +269,7 @@ const pool = {
               user_id: userId,
               created_at: new Date().toISOString()
             })
-            .select();
+            .select());
           
           if (error) {
             console.log('   → ❌ Error en INSERT de mensaje via API Supabase:', error.message);
@@ -274,10 +296,10 @@ const pool = {
       
       try {
         // Simular verificación básica usando Supabase
-        const { data, error } = await supabaseAdmin
+        const { data, error } = await withRetry(() => supabaseAdmin
           .from('conversations_new')
           .select('id')
-          .limit(1);
+          .limit(1));
         
         if (error) {
           console.log('   → ❌ Error en verificación via API Supabase:', error.message);

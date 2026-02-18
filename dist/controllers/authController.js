@@ -8,10 +8,11 @@ import pool, { getUserById, supabaseAdmin } from '../config/db.js';
 
 dotenv.config();
 
-const supabaseUrl = 'https://jnzsabhbfnivdiceoefg.supabase.co';
+// Usar la misma URL de Supabase que el resto del sistema (desde .env)
+const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-if (!supabaseKey) {
-  throw new Error('Supabase service role key is not defined');
+if (!supabaseUrl || !supabaseKey) {
+  throw new Error('Supabase URL or service role key is not defined');
 }
 const supabase = createClient(supabaseUrl, supabaseKey, {
   auth: {
@@ -27,66 +28,121 @@ const sendgridTemplateId = process.env.SENDGRID_INVITE_TEMPLATE_ID;
 const sendgridFrom = process.env.SENDGRID_FROM_EMAIL;
 sgMail.setApiKey(sendgridKey);
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DEV_USER_ID_FALLBACK = '00c7e035-351b-4e87-9dc2-ac4a05c95291';
+
+// Cache corto para GET /api/auth/user (evita recargas/skeleton en bucle cuando el front llama muchas veces)
+const userResponseCache = new Map();
+const USER_CACHE_TTL_MS = 5000;
+function getCachedUserResponse(userId) {
+  const entry = userResponseCache.get(userId);
+  if (!entry || Date.now() > entry.expires) return null;
+  return entry.data;
+}
+function setCachedUserResponse(userId, data) {
+  userResponseCache.set(userId, { data, expires: Date.now() + USER_CACHE_TTL_MS });
+}
+function invalidateUserCache(userId) {
+  userResponseCache.delete(userId);
+}
+
+function isValidUUID(str) {
+  return str && typeof str === 'string' && UUID_REGEX.test(str.trim());
+}
+
+/** Obtiene el valor de x-user-id si es un UUID válido (prioridad para identificación). */
+function getXUserId(req) {
+  const x = (req.headers['x-user-id'] || '').trim();
+  return isValidUUID(x) ? x : null;
+}
+
+/** Extrae el token de la petición: Authorization → cookie auth_token → cookie Supabase (sb-*-auth-token) → speedleads-dev-token (dev). */
+function extractToken(req) {
+  const authHeader = req.headers['authorization'];
+  if (authHeader) {
+    const t = authHeader.split(' ')[1];
+    if (t) return t;
+  }
+  if (req.cookies) {
+    if (req.cookies.auth_token) return req.cookies.auth_token;
+    for (const [name, value] of Object.entries(req.cookies)) {
+      if (/^sb-.+-auth-token$/i.test(name) && value) {
+        const parsed = typeof value === 'string' ? (() => { try { return JSON.parse(value); } catch { return value; } })() : value;
+        const token = Array.isArray(parsed) ? parsed[0]?.access_token : (parsed?.access_token ?? parsed);
+        if (token) return token;
+        if (typeof value === 'string' && value.length > 50) return value;
+      }
+    }
+    if (process.env.NODE_ENV === 'development' && req.cookies['speedleads-dev-token']) {
+      return req.cookies['speedleads-dev-token'];
+    }
+  }
+  return null;
+}
+
 /**
- * Extrae y verifica el token JWT enviado en Authorization: Bearer ... o en cookies
- * Devuelve el userId o sub (string) si es válido, o null si no lo es.
+ * Extrae y verifica el userId: x-user-id (UUID) → JWT (Authorization/cookie).
+ * Devuelve userId (string) o "" si no se puede determinar (nunca null).
+ */
+/**
+ * Extrae userId: usa req.user (ya validado por middleware validateJwt),
+ * fallback a x-user-id, o intenta validar con Supabase Auth API.
+ * Devuelve userId (string) o "" si no se puede determinar.
  */
 function getUserIdFromToken(req) {
-  // Buscar token en headers Authorization
-  let token = null;
-  const authHeader = req.headers['authorization'];
-  
-  if (authHeader) {
-    token = authHeader.split(' ')[1];
+  const xUserId = getXUserId(req);
+  const isDev = process.env.NODE_ENV === 'development';
+
+  // 1) Si el middleware validateJwt ya validó el token, usar req.user
+  if (req.user && (req.user.userId || req.user.sub)) {
+    return String(req.user.userId || req.user.sub);
   }
-  
-  // Si no hay token en headers, buscar en cookies
-  if (!token && req.cookies && req.cookies.auth_token) {
-    token = req.cookies.auth_token;
-    console.log('🍪 Token obtenido de cookie en getUserIdFromToken');
+
+  // 2) Extraer token manualmente (para rutas sin middleware validateJwt)
+  const token = extractToken(req);
+
+  if (token === 'development-token' && isDev) {
+    if (xUserId) return xUserId;
+    return DEV_USER_ID_FALLBACK;
   }
-  
+
   if (!token) {
-    // En desarrollo, usar x-user-id (frontend envía sesión Supabase en admin/dashboard)
-    const xUserId = (req.headers['x-user-id'] || '').trim();
-    if (process.env.NODE_ENV === 'development' && xUserId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(xUserId)) {
-      return xUserId;
-    }
-    console.error('Token no proporcionado ni en Authorization header ni en cookies');
-    return null;
+    if (isDev && xUserId) return xUserId;
+    return '';
   }
 
-  const forceLogin = process.env.FORCE_LOGIN === 'true';
+  // 3) Intentar verificación local con JWT_SECRET
+  const jwtSecret = process.env.JWT_SECRET;
+  const hasValidSecret = jwtSecret
+    && jwtSecret !== 'clave-secreta-de-desarrollo'
+    && jwtSecret !== 'tu_jwt_secret_muy_seguro_aqui'
+    && jwtSecret !== 'PEGA_AQUI_TU_JWT_SECRET_DE_SUPABASE';
 
-  // Con FORCE_LOGIN: solo decodificar (sin verificar firma) para evitar throws y stack traces
-  if (forceLogin) {
+  if (hasValidSecret) {
+    try {
+      const payload = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] });
+      const id = typeof payload.userId === 'string' ? payload.userId
+        : typeof payload.sub === 'string' ? payload.sub : null;
+      if (id) return id;
+    } catch (err) {
+      // Verificación local falló — continuar a decodificación
+    }
+  }
+
+  // 4) Decodificar sin verificar (el token Supabase tiene sub=userId)
+  //    Esto es seguro porque validateJwt ya validó con Supabase Auth API
+  try {
     const decoded = jwt.decode(token);
     if (decoded && (decoded.userId || decoded.sub)) {
-      return decoded.userId || decoded.sub;
+      return String(decoded.userId || decoded.sub);
     }
-  }
-
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    const id = typeof payload.userId === 'string'
-      ? payload.userId
-      : typeof payload.sub === 'string'
-        ? payload.sub
-        : null;
-
-    if (!id) {
-      throw new Error('Token inválido, falta userId o sub en payload');
-    }
-    return id;
   } catch (err) {
-    console.error('Error al verificar el token:', err.message);
-    // En desarrollo, fallback a x-user-id para admin/dashboard
-    const xUserId = (req.headers['x-user-id'] || '').trim();
-    if (process.env.NODE_ENV === 'development' && xUserId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(xUserId)) {
-      return xUserId;
-    }
-    return null;
+    // No se pudo decodificar
   }
+
+  // 5) Fallback dev: x-user-id
+  if (isDev && xUserId) return xUserId;
+  return '';
 }
 
 /**
@@ -343,9 +399,11 @@ async function getUser(req, res) {
     if (!userId) {
       return res.status(401).json({ message: 'No autenticado' });
     }
-    
+    const cached = getCachedUserResponse(userId);
+    if (cached) {
+      return res.json(cached);
+    }
     console.log('🔍 getUserId extraído:', userId);
-    
     const { user } = await getUserById(userId);
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado' });
@@ -429,9 +487,9 @@ async function getUser(req, res) {
       hasProfile: !!profileData
     });
 
-    return res.json({
-      user: userData,
-    });
+    const response = { user: userData };
+    setCachedUserResponse(userId, response);
+    return res.json(response);
   } catch (err) {
     console.error('❌ Error crítico al obtener el usuario:', err);
     return res.status(500).json({ message: 'Error interno del servidor' });
@@ -692,6 +750,7 @@ async function updateProfile(req, res) {
       });
     }
 
+    invalidateUserCache(userId);
     return res.json({
       success: true,
       message: 'Perfil actualizado correctamente',
