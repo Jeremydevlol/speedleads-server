@@ -1,5 +1,6 @@
 /**
  * Respuesta automática con IA para Meta Instagram.
+ * Versión simple (solo system prompt env). La versión con personalidades como WhatsApp está en dist/services/aiReply.service.js.
  */
 import OpenAI from 'openai';
 import { getRecentMessages } from '../db/metaRepo.js';
