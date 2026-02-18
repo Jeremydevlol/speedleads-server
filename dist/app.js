@@ -47,6 +47,9 @@ import instagramGraphRoutes from './routes/instagramGraphRoutes.js';
 import instagramAuthRoutes from './routes/instagramAuthRoutes.js';
 import instagramPrivateRoutes from './routes/instagramPrivateRoutes.js';
 import metaWebhookRoutes from './routes/metaWebhookRoutes.js';
+import metaDiagnosticRoutes from './routes/metaDiagnosticRoutes.js';
+import metaAuthRoutes from './routes/metaAuthRoutes.js';
+import metaConnectionRoutes from './routes/metaConnectionRoutes.js';
 
 // =============================================
 // CONFIGURACIÓN DE VARIABLES DE ENTORNO
@@ -449,6 +452,8 @@ app.use('/api/calendar', calendarRoutes);
 app.use('/api', googleCalendarRoutes); // <-- NUEVO: Rutas de Google Calendar
 // Auth: montar en /api/auth para coincidir con frontend (api/auth/user, api/auth/login, etc.)
 app.use('/api/auth', authRoutes);
+// Meta/Instagram onboarding: GET /auth/meta/start (JWT), GET /auth/meta/callback (OAuth)
+app.use('/auth/meta', metaAuthRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/configuracion-chat', configuracionChatRoutes);
 app.use('/api/sessions', sessionsRoutes);
@@ -460,6 +465,9 @@ app.use('/api', customDomainsRoutes); // <-- NUEVO: Rutas de dominios personaliz
 app.use('/api/instagram/graph', instagramGraphRoutes);
 app.use('/api/instagram/private', instagramPrivateRoutes);
 app.use('/api/instagram', instagramAuthRoutes);
+// Meta: conexión (JWT) y diagnóstico (DIAG_KEY)
+app.use('/api/meta', metaConnectionRoutes);
+app.use('/api/meta', metaDiagnosticRoutes);
 
 // NUEVO: Ruta catch-all SOLO para dominios personalizados
 // Debe ir DESPUÉS de todas las rutas /api/ pero ANTES de otras rutas

@@ -6,6 +6,15 @@ let lastInvalidTokenLog = 0;
 const INVALID_TOKEN_LOG_INTERVAL_MS = 30000; // log at most once per 30s in dev
 
 export const validateJwt = (req, res, next) => {
+    // Bypass: rutas que no deben exigir JWT (OAuth callbacks, diagnóstico)
+    const path = (req.originalUrl || req.path || '').split('?')[0];
+    if (path.startsWith('/api/meta/diagnostic') || path.startsWith('/meta/diagnostic')) {
+        return next();
+    }
+    if (path === '/auth/meta/callback') {
+        return next();
+    }
+
     // Intentar obtener token del header Authorization o de las cookies
     let token = req.headers['authorization']?.split(' ')[1];
     

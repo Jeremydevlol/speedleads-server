@@ -48,6 +48,7 @@ export const authMiddleware = async (req, res, next) => {
     '/api/health', '/health', '/status', '/ping',
     '/api/instagram/auth/callback',   // OAuth callback Facebook/Meta
     '/api/instagram/graph/callback', // OAuth callback Graph API
+    '/auth/meta/callback',            // OAuth callback Meta (Facebook/Instagram) — sin JWT
   ]);
 
   // Rutas públicas con patrones (regex)
