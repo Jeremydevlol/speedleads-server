@@ -8,7 +8,6 @@ let lastInvalidTokenLog = 0;
 const INVALID_TOKEN_LOG_INTERVAL_MS = 30000;
 
 // ─── Cache de tokens validados por Supabase Auth ────────────────────────────
-// Evita llamar a Supabase en cada request para el mismo token
 const tokenCache = new Map();
 const TOKEN_CACHE_TTL_MS = 60_000; // 1 minuto
 
@@ -23,7 +22,6 @@ function getCachedToken(token) {
 }
 
 function setCachedToken(token, user) {
-    // Limpiar cache antiguo si es muy grande
     if (tokenCache.size > 500) {
         const now = Date.now();
         for (const [k, v] of tokenCache) {
@@ -33,13 +31,10 @@ function setCachedToken(token, user) {
     tokenCache.set(token, { user, expires: Date.now() + TOKEN_CACHE_TTL_MS });
 }
 
-// ─── Validación con Supabase Auth API ───────────────────────────────────────
 async function validateWithSupabase(token) {
     try {
         const { data, error } = await supabaseAdmin.auth.getUser(token);
-        if (error || !data?.user) {
-            return null;
-        }
+        if (error || !data?.user) return null;
         const user = data.user;
         return {
             userId: user.id,
@@ -48,7 +43,6 @@ async function validateWithSupabase(token) {
             role: user.role || 'authenticated',
             user_metadata: user.user_metadata || {},
             aud: user.aud || 'authenticated',
-            // Compatibilidad con el formato que espera el resto del backend
             iss: 'supabase',
         };
     } catch (err) {
@@ -57,8 +51,16 @@ async function validateWithSupabase(token) {
     }
 }
 
-// ─── Middleware principal de validación JWT ──────────────────────────────────
 export const validateJwt = async (req, res, next) => {
+    // Bypass: rutas Meta (OAuth callbacks, diagnóstico) no exigen JWT
+    const path = (req.originalUrl || req.path || '').split('?')[0];
+    if (path.startsWith('/api/meta/diagnostic') || path.startsWith('/meta/diagnostic')) {
+        return next();
+    }
+    if (path === '/auth/meta/callback') {
+        return next();
+    }
+
     // Intentar obtener token del header Authorization o de las cookies
     let token = req.headers['authorization']?.split(' ')[1];
 
