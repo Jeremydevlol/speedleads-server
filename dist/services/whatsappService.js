@@ -1642,10 +1642,10 @@ export async function saveMessagesInBatch(userId, messages) {
     try {
       const { data: convRows, error } = await supabaseAdmin
         .from('conversations_new')
-        .select('id')
+        .select('id, wa_user_id')
         .eq('external_id', conversationId)
         .eq('user_id', userId)
-        .eq('wa_user_id', phoneNumber)
+        .order('wa_user_id', { ascending: false }) // Preferir el que tiene wa_user_id (no null)
         .limit(1);
 
       if (error) {
