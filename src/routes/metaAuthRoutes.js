@@ -45,17 +45,29 @@ router.post('/start-link', validateJwt, (req, res) => {
   }
 });
 
+// Códigos de error de Meta conocidos → clave amigable para el frontend
+const META_ERROR_MAP = {
+  1349220: 'meta_login_unavailable', // "Función no disponible" / Facebook actualizando la app
+  190: 'token_expired',
+  102: 'session_invalid',
+};
+
 /** GET /auth/meta/callback — Meta OAuth callback. Validates state, exchanges code, saves connection, redirects to frontend. */
 router.get('/callback', async (req, res) => {
   const { code, state, error: fbError, error_code: errorCode, error_message: errorMessage } = req.query;
-  const redirectFail = (msg) => {
-    console.error('[metaAuth] callback fail:', msg);
-    return res.redirect(chatsRedirect({ channel: 'instagram', error: msg }));
+  const redirectFail = (errorKey, logMsg) => {
+    console.error('[metaAuth] callback fail:', logMsg || errorKey);
+    const params = { channel: 'instagram', error: errorKey };
+    return res.redirect(chatsRedirect(params));
   };
-  if (fbError) return redirectFail(fbError === 'access_denied' ? 'access_denied' : fbError);
+  if (fbError) return redirectFail(fbError === 'access_denied' ? 'access_denied' : fbError, fbError);
   if (errorCode || errorMessage) {
-    const msg = (errorMessage && decodeURIComponent(String(errorMessage))) || (errorCode ? `fb_error_${errorCode}` : 'fb_error');
-    return redirectFail(msg.length > 100 ? `fb_error_${errorCode || 'unknown'}` : msg);
+    const friendlyKey = (errorCode && META_ERROR_MAP[Number(errorCode)]) || (errorCode ? `fb_error_${errorCode}` : 'fb_error');
+    const rawMsg = (errorMessage && decodeURIComponent(String(errorMessage))) || '';
+    const logMsg = (friendlyKey !== 'fb_error' && errorCode)
+      ? `${friendlyKey} (Meta ${errorCode})`
+      : (rawMsg.length > 100 ? `fb_error_${errorCode || 'unknown'}` : rawMsg || friendlyKey);
+    return redirectFail(friendlyKey, logMsg);
   }
   if (!code || !state) return redirectFail('missing_code_or_state');
 

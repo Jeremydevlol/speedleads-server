@@ -1,5 +1,24 @@
 # Meta OAuth — Checklist y ejemplos
 
+## Error 1349220 — "Función no disponible" / "Facebook login no está disponible"
+
+Si en el callback ves `error_code=1349220` y el mensaje *"En este momento, el inicio de sesión con Facebook no está disponible..."*, **el fallo es de Meta**, no de tu servidor. Suele pasar cuando:
+
+- Meta está **actualizando la app** (mensaje explícito de Facebook).
+- La app está en **modo Development** y hay restricciones temporales.
+- Cambios recientes en la app (permisos, productos) y Meta aún no ha propagado el estado.
+
+**Qué hacer:**
+
+1. **Esperar** y volver a intentar en unos minutos u horas.
+2. En [developers.facebook.com](https://developers.facebook.com) → tu app → **Dashboard**: revisar si hay avisos o "App en mantenimiento".
+3. Comprobar que **Facebook Login** (y **Instagram** si aplica) estén habilitados y sin errores en **Use cases**.
+4. Si la app está en **Development**, asegurarte de que el usuario que prueba esté en **Roles** (Admin/Developer/Tester).
+
+El backend redirige al frontend con `error=meta_login_unavailable` para que puedas mostrar un mensaje amigable tipo: *"El inicio de sesión con Facebook no está disponible. Vuelve a intentarlo más tarde."*
+
+---
+
 ## Por qué sale "La aplicación no está activa"
 
 Meta muestra ese mensaje cuando la app está en **modo Development** y el usuario que inicia el login **no** es Admin/Developer/Tester, o cuando la **Redirect URI** no coincide exactamente con la configurada en la app, o la app está deshabilitada/revocada.
@@ -117,6 +136,21 @@ Si no hay conexión (200):
 ```json
 { "connected": false }
 ```
+
+---
+
+## Error "column meta_connections.access_token does not exist"
+
+Si en los logs del backend aparece **`[metaConnectionsRepo] getConnectionByTenantId error: column meta_connections.access_token does not exist`**, la tabla **`meta_connections`** en Supabase no tiene el esquema que usa el código (falta la columna `access_token` o la tabla no existe).
+
+**Qué hacer:**
+
+1. Ejecutar la migración que crea/actualiza la tabla:
+   - En Supabase: **SQL Editor** → New query.
+   - Copiar y ejecutar el contenido de **`db/migrations/2025-02-18_meta_connections.sql`** (crea la tabla con `access_token` y, si la tabla ya existía, añade las columnas que falten).
+2. Reiniciar el backend y volver a probar el flujo de conexión Meta.
+
+Sin esta tabla/columna, el callback de OAuth puede guardar el token pero las rutas que leen la conexión (p. ej. `/api/meta/connection`) fallan y la app no puede "loguear" / usar la conexión Meta.
 
 ---
 
