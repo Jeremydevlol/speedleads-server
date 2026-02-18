@@ -97,6 +97,21 @@ export async function insertMessage(p) {
   return { inserted: true, id: data?.id };
 }
 
+/** List conversations for a tenant (for frontend Instagram channel). */
+export async function getConversationsByTenantId(tenantId) {
+  if (!tenantId) return [];
+  const { data, error } = await supabaseAdmin
+    .from('meta_conversations')
+    .select('ig_business_id, sender_id, last_message, last_message_at, updated_at')
+    .eq('tenant_id', tenantId)
+    .order('last_message_at', { ascending: false });
+  if (error) {
+    console.error('[metaRepo] getConversationsByTenantId error:', error.message);
+    return [];
+  }
+  return data ?? [];
+}
+
 /**
  * Últimos N mensajes de la conversación para contexto IA (orden desc, limit).
  * @param {object} p - { tenant_id, ig_business_id, sender_id, limit?: number }

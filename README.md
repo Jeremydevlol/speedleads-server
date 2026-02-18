@@ -48,7 +48,8 @@ El webhook guarda mensajes en Supabase y opcionalmente responde con IA.
   - `META_VERIFY_TOKEN`, `META_APP_SECRET`, `META_GRAPH_VERSION` (ej. `v24.0`).
   - Para auto-respuesta con IA: `OPENAI_API_KEY` o `DEEPSEEK_API_KEY`; opcional: `META_AI_MODEL`, `META_AI_SYSTEM_PROMPT`, `VERIFY_META_SIGNATURE`.
 
-- **Tablas Supabase esperadas:**
+- **Tablas Supabase esperadas:**  
+  Crear con `db/migrations/2025-02-18_meta_connections.sql` y `db/migrations/2025-02-18_meta_conversations_messages.sql`.
   - **meta_connections**: `tenant_id`, `ig_business_id` (Page/recipient ID), `access_token`, `auto_reply_enabled` (boolean), `status` o `estado` (ej. `'active'`).
   - **meta_conversations**: `tenant_id`, `ig_business_id`, `sender_id` (único por conversación), `last_message`, `last_message_at`; constraint único en `(tenant_id, ig_business_id, sender_id)`.
   - **meta_messages**: `tenant_id`, `ig_business_id`, `sender_id`, `direction` (`'in'`|`'out'`), `mid`, `text`, `raw` (jsonb), `created_at`. Recomendado: índice único en `(tenant_id, ig_business_id, sender_id, mid)` para evitar duplicados.
@@ -56,7 +57,7 @@ El webhook guarda mensajes en Supabase y opcionalmente responde con IA.
 - **Flujo:** POST recibe evento → 200 OK inmediato → en background: busca conexión por `recipient.id` (ig_business_id), upsert conversación, inserta mensaje (dedupe por `mid`), si `auto_reply_enabled` genera respuesta con IA y envía por Graph API.
 
 - **Estructura del código:**
-  - `dist/db/metaRepo.js` – getConnectionByIgId, upsertConversation, insertMessage, getRecentMessages.
+  - `dist/db/metaRepo.js` – getConnectionByIgId, upsertConversation, insertMessage, getConversationsByTenantId, getRecentMessages.
   - `dist/services/metaWebhook.service.js` – parseAndExtractMessageEvents, isValidInstagramPayload (solo `object === 'instagram'`).
   - `dist/services/metaSend.service.js` – sendInstagramMessage (Graph API).
   - `dist/services/aiReply.service.js` – generateReply (contexto desde meta_messages + OpenAI/DeepSeek).
@@ -92,6 +93,10 @@ Endpoints para comprobar en ~30 s que Supabase, tablas, conexión y IA están li
 - **GET /auth/meta/callback**: Facebook redirige con `code` y `state`. Se verifica `state`, se intercambia `code` por token, se obtiene long-lived y el primer Instagram Business Account de las páginas del usuario. Se hace upsert en `meta_connections` (tenant_id, ig_business_id, access_token, status=active, auto_reply_enabled=false) y se redirige a `FRONTEND_URL/integrations/instagram?connected=1`.
 
 - **GET /api/meta/connection** (con JWT): Devuelve `{ connected, ig_business_id?, auto_reply_enabled?, status? }` para el tenant del token.
+
+- **GET /api/meta/conversations** (con JWT): Lista conversaciones Instagram del tenant para mostrar en la app (`{ conversations: [{ ig_business_id, sender_id, last_message, last_message_at, updated_at }] }`). Si "no salen los mensajes", el frontend debe llamar a este endpoint cuando el canal sea Instagram.
+
+- **GET /api/meta/conversations/:senderId/messages** (con JWT, query `?limit=50`): Mensajes de una conversación (`{ messages: [{ direction, text, mid, raw, created_at }] }`). `senderId` es el ID de usuario de Instagram del contacto.
 
 - **POST /api/meta/connection/auto-reply** (con JWT): Body `{ "enabled": true|false }`. Actualiza `auto_reply_enabled` para ese tenant.
 
