@@ -605,12 +605,7 @@ def _safe_user_id_from_username(cl: Client, username: str):
         return user.pk
     except Exception as e1:
         logger.warning(f"V1 user_info failed for @{username}: {e1}")
-    # Fallback: standard method (tries GQL then V1 internally)
-    try:
-        return cl.user_id_from_username(username)
-    except Exception as e2:
-        logger.warning(f"user_id_from_username failed for @{username}: {e2}")
-    # Last resort: search
+    # Fallback: search V1 (avoids public/GQL endpoints blocked on datacenter IPs)
     try:
         results = cl.search_users_v1(username, 1)
         for u in results:
@@ -635,7 +630,7 @@ async def search_users(q: str = Query(...), limit: int = Query(10), user_id: str
         logger.warning(f"Challenge on search_users for '{q}': {e}")
         # Fallback: try GQL search for a single user by exact username
         try:
-            user = cl.user_info_by_username_gql(q)
+            user = cl.user_info_by_username_v1(q)
             if user:
                 users = [_format_user(user)]
                 logger.info(f"1 user found via GQL fallback for '{q}'")
@@ -728,10 +723,10 @@ async def get_user_info(username: str, user_id: str = Query(...)):
         return JSONResponse(content=err)
     try:
         try:
-            user = cl.user_info_by_username(username)
+            user = cl.user_info_by_username_v1(username)
         except Exception:
             uid = _safe_user_id_from_username(cl, username)
-            user = cl.user_info(uid)
+            user = cl.user_info_v1(uid)
         return {
             "success": True,
             "user": {
@@ -900,7 +895,7 @@ async def get_user_media(username: str, limit: int = Query(20), user_id: str = Q
         return JSONResponse(content={**err, "media": [], "total": 0})
     try:
         uid = _safe_user_id_from_username(cl, username)
-        medias = cl.user_medias(uid, amount=limit)
+        medias = cl.user_medias_v1(uid, amount=limit)
         media = [_format_media(m) for m in medias[:limit]]
         logger.info(f"{len(media)} posts fetched for @{username}")
         return {"success": True, "media": media, "total": len(media), "username": username}
@@ -1018,7 +1013,7 @@ async def send_dm(req: DMRequest):
     if err:
         return JSONResponse(content=err)
     try:
-        uid = cl.user_id_from_username(req.recipient_username)
+        uid = _safe_user_id_from_username(cl, req.recipient_username)
         result = cl.direct_send(req.text, [int(uid)])
         logger.info(f"DM sent to @{req.recipient_username}")
         return {"success": True, "data": {"thread_id": str(getattr(result, "thread_id", ""))}}
@@ -1045,7 +1040,7 @@ async def send_mass_dm(req: MassDMRequest):
         if req.use_username_template:
             text = re.sub(r"\{\{\s*username\s*\}\}", username, text, flags=re.IGNORECASE)
         try:
-            uid = cl.user_id_from_username(username)
+            uid = _safe_user_id_from_username(cl, username)
             cl.direct_send(text, [int(uid)])
             sent.append({"username": username, "success": True})
         except Exception as e:
