@@ -1,0 +1,4 @@
+instagrapi==2.2.1
+fastapi
+uvicorn[standard]
+python-dotenv
