@@ -770,59 +770,53 @@ def _fetch_one_gql_following_chunk(cl, uid, max_amount, timeout=25):
 
 
 def _fetch_followers_sync(cl: Client, uid: int, limit: int):
-    """Fetch followers in GQL chunks with per-chunk timeouts. Returns partial results if pagination is blocked."""
-    import concurrent.futures
-    all_users = []
-    cursor = None
-    pages = 0
-    while len(all_users) < limit:
-        remaining = limit - len(all_users)
-        fetch = min(20, remaining)
-        pages += 1
-        logger.info(f"🔍 GQL followers page {pages} for {uid} (fetch={fetch})...")
-        try:
-            chunk, cursor = _fetch_one_gql_chunk(cl, uid, fetch, cursor, timeout=30)
-        except concurrent.futures.TimeoutError:
-            logger.warning(f"⏰ Chunk {pages} timed out for {uid}")
-            if all_users:
-                logger.info(f"↩️ Returning {len(all_users)} followers from previous pages")
-            break
-        except Exception as gql_err:
-            logger.warning(f"❌ GQL chunk {pages} failed: {type(gql_err).__name__}: {gql_err}")
-            if all_users:
-                logger.info(f"↩️ Returning {len(all_users)} followers from previous pages")
-                break
-            logger.info(f"🔍 Trying V1 fallback for {uid}...")
+    """Fetch followers using V1 (private/authenticated) API - works better from datacenter IPs."""
+    logger.info(f"🔍 V1 followers for {uid} (limit={limit})...")
+    try:
+        raw = cl.user_followers_v1(uid, amount=limit)
+        logger.info(f"✅ V1 returned {len(raw) if raw else 0} followers")
+        return raw
+    except Exception as v1_err:
+        logger.warning(f"❌ V1 followers failed: {type(v1_err).__name__}: {v1_err}")
+        logger.info(f"🔍 Trying GQL fallback for {uid}...")
+        import concurrent.futures
+        all_users = []
+        cursor = None
+        pages = 0
+        while len(all_users) < limit:
+            remaining = limit - len(all_users)
+            fetch = min(20, remaining)
+            pages += 1
             try:
-                raw = cl.user_followers_v1(uid, amount=limit)
-                return raw
-            except Exception:
-                raise gql_err
-        all_users.extend(chunk)
-        logger.info(f"✅ Page {pages}: got {len(chunk)} (total: {len(all_users)})")
-        if not cursor or not chunk:
-            break
-        if len(all_users) < limit:
-            time.sleep(3)
-    return all_users[:limit]
+                chunk, cursor = _fetch_one_gql_chunk(cl, uid, fetch, cursor, timeout=30)
+            except (concurrent.futures.TimeoutError, Exception):
+                break
+            all_users.extend(chunk)
+            if not cursor or not chunk:
+                break
+            if len(all_users) < limit:
+                time.sleep(3)
+        if all_users:
+            return all_users[:limit]
+        raise v1_err
 
 
 def _fetch_following_sync(cl: Client, uid: int, limit: int):
-    """Fetch following via GQL with timeout, V1 fallback."""
-    import concurrent.futures
-    logger.info(f"🔍 GQL following for {uid} (limit={limit})...")
+    """Fetch following using V1 (private/authenticated) API first."""
+    logger.info(f"🔍 V1 following for {uid} (limit={limit})...")
     try:
-        result = _fetch_one_gql_following_chunk(cl, uid, limit, timeout=30)
-        logger.info(f"✅ GQL returned {len(result) if result else 0} following")
-        return result
-    except concurrent.futures.TimeoutError:
-        logger.warning(f"⏰ GQL following timed out for {uid}")
-    except Exception as gql_err:
-        logger.warning(f"❌ GQL following failed: {type(gql_err).__name__}: {gql_err}")
-    logger.info(f"🔍 Trying V1 following for {uid}...")
-    raw = cl.user_following_v1(uid, amount=limit)
-    logger.info(f"✅ V1 returned {len(raw) if raw else 0} following")
-    return raw
+        raw = cl.user_following_v1(uid, amount=limit)
+        logger.info(f"✅ V1 returned {len(raw) if raw else 0} following")
+        return raw
+    except Exception as v1_err:
+        logger.warning(f"❌ V1 following failed: {type(v1_err).__name__}: {v1_err}")
+        import concurrent.futures
+        logger.info(f"🔍 Trying GQL following fallback for {uid}...")
+        try:
+            result = _fetch_one_gql_following_chunk(cl, uid, limit, timeout=30)
+            return result
+        except Exception:
+            raise v1_err
 
 
 @app.get("/user/{username}/followers")
@@ -832,9 +826,9 @@ async def get_followers(username: str, limit: int = Query(30), user_id: str = Qu
         return JSONResponse(content={**err, "followers": [], "total": 0})
     try:
         logger.info(f"⏳ Fetching followers for @{username} (limit={limit})...")
-        uid = await _run_with_timeout(_safe_user_id_from_username, cl, username, timeout_seconds=30)
+        uid = await _run_with_timeout(_safe_user_id_from_username, cl, username, timeout_seconds=60)
         logger.info(f"✅ User ID resolved for @{username}: {uid}")
-        followers_raw = await _run_with_timeout(_fetch_followers_sync, cl, uid, limit, timeout_seconds=100)
+        followers_raw = await _run_with_timeout(_fetch_followers_sync, cl, uid, limit, timeout_seconds=120)
         if isinstance(followers_raw, dict):
             followers = [_format_user(u) for u in followers_raw.values()][:limit]
         elif isinstance(followers_raw, list):
