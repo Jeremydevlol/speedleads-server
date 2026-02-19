@@ -143,9 +143,11 @@ def _get_or_create_client(user_id: str) -> Client:
     return clients[user_id]
 
 
-def _save_session(user_id: str, cl: Client, username: str):
+def _save_session(user_id: str, cl: Client, username: str, password: str = ""):
+    pw = password or getattr(cl, "password", "") or ""
     data = {
         "username": username,
+        "password": pw,
         "session": cl.get_settings(),
         "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -359,7 +361,7 @@ async def login(req: LoginRequest):
     cl = _get_or_create_client(req.user_id)
     try:
         cl.login(req.username, req.password)
-        _save_session(req.user_id, cl, req.username)
+        _save_session(req.user_id, cl, req.username, req.password)
         try:
             user_info = cl.account_info()
             logger.info(f"Login OK for @{req.username}")
@@ -373,7 +375,7 @@ async def login(req: LoginRequest):
     except ChallengeCodeNeeded as ccn:
         logger.info(f"Challenge code sent via {ccn.choice} for @{req.username} during login")
         pending_challenges[req.user_id] = {"username": req.username, "password": req.password}
-        _save_session(req.user_id, cl, req.username)
+        _save_session(req.user_id, cl, req.username, req.password)
         method = "email" if "email" in ccn.choice.lower() else "sms"
         return _checkpoint_response(
             f"Instagram ha enviado un código de verificación por {method}. Introdúcelo para continuar.",
@@ -404,7 +406,7 @@ async def login(req: LoginRequest):
     except json.JSONDecodeError as e:
         logger.warning(f"JSON decode error during login for @{req.username}: {e}")
         if cl.user_id:
-            _save_session(req.user_id, cl, req.username)
+            _save_session(req.user_id, cl, req.username, req.password)
             return _checkpoint_response(
                 "Instagram requiere verificación. Abre Instagram en tu teléfono, completa la verificación y pulsa 'Ya lo aprobé'."
             )
@@ -541,31 +543,51 @@ async def restore_session(req: RestoreRequest):
         cl = _get_or_create_client(req.user_id)
         cl.set_settings(data["session"])
         username = data.get("username", "unknown")
+        password = data.get("password", "")
+
+        session_ok = False
+        try:
+            cl.get_timeline_feed()
+            session_ok = True
+        except Exception as check_err:
+            logger.warning(f"Session check failed for @{username} ({type(check_err).__name__}): {check_err}")
+
+        if session_ok:
+            logger.info(f"Session fully restored for @{username} (userId={req.user_id})")
+            return {"success": True, "restored": True, "username": username}
+
+        if password and username and username != "unknown":
+            logger.info(f"Session invalid, attempting fresh re-login for @{username} from current IP...")
+            try:
+                cl_fresh = Client(proxy=IG_PROXY if IG_PROXY else None)
+                cl_fresh.delay_range = [0, 1]
+                cl_fresh.request_timeout = 20
+                cl_fresh.challenge_code_handler = _challenge_code_handler
+                cl_fresh.login(username, password)
+                clients[req.user_id] = cl_fresh
+                _save_session(req.user_id, cl_fresh, username, password)
+                logger.info(f"Fresh re-login successful for @{username} (userId={req.user_id})")
+                return {"success": True, "restored": True, "username": username}
+            except ChallengeCodeNeeded as ccn:
+                pending_challenges[req.user_id] = {"username": username, "password": password}
+                _save_session(req.user_id, cl, username, password)
+                logger.warning(f"Re-login needs challenge code for @{username}")
+                return {"success": True, "restored": True, "username": username, "needs_checkpoint": True}
+            except TwoFactorRequired:
+                logger.warning(f"Re-login needs 2FA for @{username}")
+                return {"success": False, "restored": False, "error": "Se requiere 2FA, por favor inicia sesión manualmente"}
+            except Exception as login_err:
+                logger.error(f"Fresh re-login failed for @{username}: {login_err}")
 
         has_auth = bool(
             cl.settings.get("authorization_data", {}).get("sessionid")
         )
-
-        try:
-            cl.get_timeline_feed()
-        except LoginRequired as lr_err:
-            if has_auth:
-                logger.info(f"Session loaded for @{username} - timeline blocked but auth cookies exist (userId={req.user_id})")
-                return {"success": True, "restored": True, "username": username, "needs_checkpoint": True}
-            logger.warning(f"Session expired for @{username} (userId={req.user_id})")
-            return {"success": False, "restored": False, "error": "Sesión expirada"}
-        except Exception as check_err:
-            if has_auth:
-                logger.info(f"Session loaded for @{username} - check failed ({type(check_err).__name__}) but auth cookies exist (userId={req.user_id})")
-                return {"success": True, "restored": True, "username": username, "needs_checkpoint": True}
-            err_str = str(check_err).lower()
-            if "login_required" in err_str:
-                logger.warning(f"Session expired for @{username} (userId={req.user_id})")
-                return {"success": False, "restored": False, "error": "Sesión expirada"}
-            logger.info(f"Session loaded for @{username} but check failed ({type(check_err).__name__}): {check_err} (userId={req.user_id})")
+        if has_auth:
+            logger.info(f"Session for @{username} - re-login failed but auth cookies exist, using as-is (userId={req.user_id})")
             return {"success": True, "restored": True, "username": username, "needs_checkpoint": True}
-        logger.info(f"Session fully restored for @{username} (userId={req.user_id})")
-        return {"success": True, "restored": True, "username": username}
+
+        logger.warning(f"Session expired for @{username} (userId={req.user_id})")
+        return {"success": False, "restored": False, "error": "Sesión expirada, inicia sesión de nuevo"}
     except Exception as e:
         logger.warning(f"Session restore failed for userId={req.user_id}: {e}")
         return {"success": False, "restored": False, "error": str(e)}
