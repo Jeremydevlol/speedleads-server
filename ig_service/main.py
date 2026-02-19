@@ -598,17 +598,27 @@ def _require_client(user_id: str) -> tuple[Optional[Client], Optional[dict]]:
 
 
 def _safe_user_id_from_username(cl: Client, username: str):
-    """Get user PK from username, handling challenge errors on the v1 fallback."""
+    """Get user PK from username, preferring the private (authenticated) API."""
+    # Try V1 (private/authenticated) first - works better from datacenter IPs
+    try:
+        user = cl.user_info_by_username_v1(username)
+        return user.pk
+    except Exception as e1:
+        logger.warning(f"V1 user_info failed for @{username}: {e1}")
+    # Fallback: standard method (tries GQL then V1 internally)
     try:
         return cl.user_id_from_username(username)
-    except (ChallengeRequired, json.JSONDecodeError):
-        try:
-            user = cl.user_info_by_username_gql(username)
-            return user.pk
-        except Exception:
-            raise
+    except Exception as e2:
+        logger.warning(f"user_id_from_username failed for @{username}: {e2}")
+    # Last resort: search
+    try:
+        results = cl.search_users_v1(username, 1)
+        for u in results:
+            if u.username.lower() == username.lower():
+                return u.pk
     except Exception:
-        raise
+        pass
+    raise Exception(f"No se pudo resolver el usuario @{username}")
 
 
 @app.get("/search/users")
