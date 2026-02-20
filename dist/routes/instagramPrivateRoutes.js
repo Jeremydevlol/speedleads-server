@@ -22,6 +22,7 @@ import {
 } from '../services/instagramService.js';
 import { validateJwt } from '../config/jwt.js';
 import { saveScrapedFollowers, getScrapedFollowers, getScrapedTargets } from '../db/igScrapedRepo.js';
+import { fetchFollowersViaRapidApi, fetchUserInfoViaRapidApi, isRapidApiConfigured } from '../services/igRapidApiService.js';
 
 const router = express.Router();
 
@@ -107,7 +108,16 @@ router.get('/followers/:username', validateJwt, async (req, res) => {
         const { username } = req.params;
         const limit = parseInt(req.query.limit) || 30;
         if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-        const result = await igGetFollowers(username, limit, userId);
+
+        let result;
+
+        if (isRapidApiConfigured()) {
+            console.log(`[IG] Using RapidAPI for followers of @${username}`);
+            result = await fetchFollowersViaRapidApi(username, limit);
+        } else {
+            console.log(`[IG] RapidAPI not configured, using Python service for @${username}`);
+            result = await igGetFollowers(username, limit, userId);
+        }
 
         if (result.success && result.followers && result.followers.length > 0) {
             try {
@@ -180,7 +190,13 @@ router.get('/user/:username', validateJwt, async (req, res) => {
         const userId = getUserId(req);
         const { username } = req.params;
         if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-        const result = await igGetUserInfo(username, userId);
+
+        let result;
+        if (isRapidApiConfigured()) {
+            result = await fetchUserInfoViaRapidApi(username);
+        } else {
+            result = await igGetUserInfo(username, userId);
+        }
         res.json(result);
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
