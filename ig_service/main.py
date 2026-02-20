@@ -295,6 +295,10 @@ class RestoreRequest(BaseModel):
 class LogoutRequest(BaseModel):
     user_id: str
 
+class SessionIdLoginRequest(BaseModel):
+    session_id: str
+    user_id: str
+
 class PostLikersRequest(BaseModel):
     post_url: str
     user_id: str
@@ -365,6 +369,22 @@ def _create_fresh_client(user_id: str) -> Client:
     if IG_PROXY:
         logger.info("Usando proxy para Instagram")
     return cl
+
+
+@app.post("/login-by-sessionid")
+async def login_by_sessionid(req: SessionIdLoginRequest):
+    """Login using a browser sessionid cookie — no password, no IP block risk."""
+    cl = _create_fresh_client(req.user_id)
+    try:
+        cl.login_by_sessionid(req.session_id)
+        username = cl.account_info().username
+        _save_session(req.user_id, cl, username)
+        logger.info(f"SessionID login OK for @{username}")
+        return {"success": True, "pk": str(cl.user_id), "username": username}
+    except Exception as e:
+        msg = str(e)
+        logger.error(f"SessionID login failed: {msg}")
+        return {"success": False, "error": f"SessionID inválido o expirado: {msg}"}
 
 
 @app.post("/login")
