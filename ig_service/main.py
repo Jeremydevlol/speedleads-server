@@ -356,9 +356,20 @@ def _try_resolve_challenge(cl: Client, user_id: str, username: str):
         )
 
 
+def _create_fresh_client(user_id: str) -> Client:
+    cl = Client(proxy=IG_PROXY if IG_PROXY else None)
+    cl.delay_range = [0, 1]
+    cl.request_timeout = 20
+    cl.challenge_code_handler = _challenge_code_handler
+    clients[user_id] = cl
+    if IG_PROXY:
+        logger.info("Usando proxy para Instagram")
+    return cl
+
+
 @app.post("/login")
 async def login(req: LoginRequest):
-    cl = _get_or_create_client(req.user_id)
+    cl = _create_fresh_client(req.user_id)
     try:
         cl.login(req.username, req.password)
         _save_session(req.user_id, cl, req.username, req.password)
