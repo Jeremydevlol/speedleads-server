@@ -17,8 +17,10 @@ import Bottleneck from 'bottleneck';
 import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
-import { IgApiClient, IgLoginTwoFactorRequiredError } from 'instagram-private-api';
 import { supabaseAdmin } from '../config/db.js';
+
+// Python instagrapi microservice URL
+const PYTHON_IG_URL = process.env.PYTHON_IG_URL || 'http://localhost:5002';
 
 // ═══════════════════════════════════════════════════════════
 // CONFIGURACIÓN
@@ -35,6 +37,9 @@ export const igSessions = new Map();
 
 // Store de login pendiente 2FA
 export const pending2FA = new Map();
+
+// Store de checkpoint pendiente (verificación de seguridad Instagram)
+export const pendingCheckpoint = new Map();
 
 // Directorio para guardar sesiones de Private API
 const STATE_DIR = path.join(process.cwd(), 'storage', 'ig_state');
@@ -62,393 +67,183 @@ function emitToUserIG(userId, event, data) {
   }
 }
 
+// Helper: call the Python instagrapi microservice
+async function _pyCall(method, urlPath, data = null, params = null) {
+  try {
+    const isHeavy = /\/(followers|following)/.test(urlPath);
+    const config = { method, url: `${PYTHON_IG_URL}${urlPath}`, timeout: isHeavy ? 150000 : 120000 };
+    if (data) config.data = data;
+    if (params) config.params = params;
+    const resp = await axios(config);
+    return resp.data;
+  } catch (err) {
+    if (err.response?.data) return err.response.data;
+    P.error(`❌ [PY-IG] Error calling ${urlPath}: ${err.message}`);
+    return { success: false, error: `Servicio Instagram no disponible: ${err.message}` };
+  }
+}
+
 // ═══════════════════════════════════════════════════════════
-// PRIVATE API CLIENT (solo para extracción de datos)
+// PRIVATE API CLIENT — thin proxy to Python instagrapi service
 // ═══════════════════════════════════════════════════════════
 
 class PrivateAPIClient {
   constructor(userId) {
     this.userId = userId;
-    this.ig = new IgApiClient();
     this.logged = false;
     this.username = null;
 
-    // Rate limiter más agresivo para Private API (evitar bans)
     this.limiter = new Bottleneck({
       maxConcurrent: 1,
-      minTime: 3000,   // 3 segundos mínimo entre requests
-      reservoir: 60,   // 60 requests por hora
-      reservoirRefreshAmount: 60,
+      minTime: 1500,
+      reservoir: 120,
+      reservoirRefreshAmount: 120,
       reservoirRefreshInterval: 60 * 60 * 1000
     });
   }
 
-  stateFile() {
-    return path.join(STATE_DIR, `${this.userId}.json`);
-  }
-
-  /**
-   * Login con username/password
-   */
   async login(username, password) {
-    try {
-      P.info(`🔐 [PRIVATE] Intentando login para @${username}...`);
-      this.ig.state.generateDevice(username);
-
-      try {
-        await this.ig.simulate.preLoginFlow();
-      } catch (e) {
-        P.warn(`⚠️ [PRIVATE] preLoginFlow error (no crítico): ${e.message}`);
-      }
-
-      const loggedUser = await this.ig.account.login(username, password);
+    P.info(`🔐 [PRIVATE] Intentando login para @${username}...`);
+    const result = await _pyCall('POST', '/login', { username, password, user_id: this.userId });
+    if (result.success) {
       this.logged = true;
       this.username = username;
-
-      try {
-        await this.ig.simulate.postLoginFlow();
-      } catch (e) {
-        // No critical
-      }
-
-      // Guardar sesión
-      await this._saveState();
-
-      P.info(`✅ [PRIVATE] Login exitoso para @${username} (pk: ${loggedUser.pk})`);
-      return { success: true, pk: loggedUser.pk, username };
-    } catch (error) {
-      if (error instanceof IgLoginTwoFactorRequiredError) {
-        const twoFactorInfo = error.response.body.two_factor_info;
-        pending2FA.set(this.userId, {
-          username,
-          password,
-          twoFactorIdentifier: twoFactorInfo.two_factor_identifier,
-          methods: twoFactorInfo.enabled_methods || [],
-          ig: this.ig
-        });
-        P.info(`📲 [PRIVATE] 2FA requerido para @${username}`);
-        return {
-          success: false,
-          needs_2fa: true,
-          two_factor_identifier: twoFactorInfo.two_factor_identifier,
-          methods: twoFactorInfo.enabled_methods || []
-        };
-      }
-      P.error(`❌ [PRIVATE] Login fallido: ${error.message}`);
-      return { success: false, error: error.message };
+      P.info(`✅ [PRIVATE] Login exitoso para @${username}`);
+    } else if (result.needs_2fa) {
+      P.info(`📲 [PRIVATE] 2FA requerido para @${username}`);
+    } else if (result.needs_checkpoint) {
+      this.username = username;
+      pendingCheckpoint.set(this.userId, { client: this });
+      P.warn(`⚠️ [PRIVATE] Checkpoint durante login para @${username}: ${result.checkpoint_type}`);
+    } else {
+      P.error(`❌ [PRIVATE] Login fallido: ${result.error}`);
     }
+    return result;
   }
 
-  /**
-   * Completar login con código 2FA
-   */
   async complete2FA(code) {
-    const pending = pending2FA.get(this.userId);
-    if (!pending) {
-      throw new Error('No hay 2FA pendiente para este usuario');
-    }
-
-    try {
-      const result = await pending.ig.account.twoFactorLogin({
-        username: pending.username,
-        verificationCode: code,
-        twoFactorIdentifier: pending.twoFactorIdentifier,
-        verificationMethod: '1',
-        trustThisDevice: '1'
-      });
-
-      this.ig = pending.ig;
+    const result = await _pyCall('POST', '/2fa', { code, user_id: this.userId });
+    if (result.success) {
       this.logged = true;
-      this.username = pending.username;
+      this.username = result.username;
       pending2FA.delete(this.userId);
-
-      await this._saveState();
-
       P.info(`✅ [PRIVATE] 2FA completado para @${this.username}`);
-      return { success: true, pk: result.pk, username: this.username };
-    } catch (error) {
-      P.error(`❌ [PRIVATE] Error 2FA: ${error.message}`);
-      return { success: false, error: error.message };
     }
+    return result;
   }
 
-  /**
-   * Restaurar sesión desde archivo
-   */
-  async restoreSession() {
-    const file = this.stateFile();
-    if (!fs.existsSync(file)) return false;
-
-    try {
-      const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (!saved.username || !saved.cookies) return false;
-
-      this.ig.state.generateDevice(saved.username);
-      await this.ig.state.deserializeCookieJar(saved.cookies);
-      this.username = saved.username;
+  async submitChallengeCode(code) {
+    const result = await _pyCall('POST', '/challenge/code', { code, user_id: this.userId });
+    if (result.success) {
       this.logged = true;
-
-      // Verificar que la sesión siga activa
-      try {
-        await this.ig.account.currentUser();
-        P.info(`✅ [PRIVATE] Sesión restaurada para @${this.username}`);
-        return true;
-      } catch (e) {
-        P.warn(`⚠️ [PRIVATE] Sesión expirada para @${this.username}`);
-        this.logged = false;
-        return false;
-      }
-    } catch (error) {
-      P.warn(`⚠️ [PRIVATE] Error restaurando sesión: ${error.message}`);
-      return false;
+      this.username = result.username || this.username;
+      pendingCheckpoint.delete(this.userId);
+      P.info(`✅ [PRIVATE] Checkpoint resuelto para @${this.username}`);
     }
+    return result;
   }
 
-  /**
-   * Guardar estado de la sesión
-   */
-  async _saveState() {
-    try {
-      const cookies = await this.ig.state.serializeCookieJar();
-      const data = {
-        username: this.username,
-        cookies,
-        savedAt: new Date().toISOString()
-      };
-      fs.writeFileSync(this.stateFile(), JSON.stringify(data, null, 2));
-      P.info(`💾 [PRIVATE] Sesión guardada para @${this.username}`);
-    } catch (error) {
-      P.warn(`⚠️ [PRIVATE] Error guardando sesión: ${error.message}`);
+  async retryAfterCheckpoint() {
+    const result = await _pyCall('POST', '/challenge/retry', { user_id: this.userId });
+    if (result.success) {
+      this.logged = true;
+      pendingCheckpoint.delete(this.userId);
+      P.info(`✅ [PRIVATE] Sesión restaurada tras checkpoint para @${this.username}`);
     }
+    return result;
   }
 
-  /**
-   * Obtener likers de un post
-   */
+  async restoreSession() {
+    const result = await _pyCall('POST', '/restore-session', { user_id: this.userId });
+    if (result.success && result.restored) {
+      this.logged = true;
+      this.username = result.username || this.username;
+      P.info(`✅ [PRIVATE] Sesión restaurada para @${this.username}`);
+      return true;
+    }
+    P.info(`ℹ️ [PRIVATE] No se pudo restaurar sesión para userId=${this.userId}`);
+    return false;
+  }
+
   async getLikesFromPost(postUrl, limit = 100) {
     if (!this.logged) throw new Error('Private API no conectada. Inicia sesión con usuario/contraseña primero.');
-
-    return this.limiter.schedule(async () => {
-      try {
-        // Extraer shortcode de la URL
-        const shortcode = this._extractShortcode(postUrl);
-        if (!shortcode) throw new Error('URL de post inválida');
-
-        // Obtener media ID desde shortcode
-        const mediaInfo = await this.ig.media.info(await this._shortcodeToMediaId(shortcode));
-        const mediaItem = mediaInfo.items[0];
-
-        // Obtener likers
-        const likersFeed = this.ig.media.likers(mediaItem.pk);
-        const likersResponse = await likersFeed;
-
-        const likers = (likersResponse.users || []).slice(0, limit).map(u => ({
-          pk: u.pk,
-          username: u.username,
-          full_name: u.full_name || '',
-          is_private: u.is_private,
-          is_verified: u.is_verified,
-          profile_pic_url: u.profile_pic_url
-        }));
-
-        P.info(`✅ [PRIVATE] ${likers.length} likers obtenidos del post ${shortcode}`);
-
-        return {
-          success: true,
-          likes: likers,
-          total: likers.length,
-          post_info: {
-            pk: mediaItem.pk,
-            shortcode,
-            like_count: mediaItem.like_count || 0,
-            comment_count: mediaItem.comment_count || 0,
-            owner: {
-              username: mediaItem.user?.username || 'unknown',
-              pk: mediaItem.user?.pk
-            }
-          }
-        };
-      } catch (error) {
-        P.error(`❌ [PRIVATE] Error obteniendo likers: ${error.message}`);
-        return { success: false, error: error.message, likes: [], total: 0 };
-      }
-    });
+    return this.limiter.schedule(() => _pyCall('POST', '/post/likers', { post_url: postUrl, user_id: this.userId, limit }));
   }
 
-  /**
-   * Obtener seguidores de un usuario
-   */
-  async getFollowers(username, limit = 100) {
+  async getFollowers(username, limit = 30) {
     if (!this.logged) throw new Error('Private API no conectada.');
-
-    return this.limiter.schedule(async () => {
-      try {
-        const userId = await this.ig.user.getIdByUsername(username);
-        const followersFeed = this.ig.feed.accountFollowers(userId);
-
-        let followers = [];
-        let page = 0;
-
-        while (followers.length < limit) {
-          const items = await followersFeed.items();
-          if (!items || items.length === 0) break;
-
-          followers.push(...items.map(u => ({
-            pk: u.pk,
-            username: u.username,
-            full_name: u.full_name || '',
-            is_private: u.is_private,
-            is_verified: u.is_verified,
-            profile_pic_url: u.profile_pic_url
-          })));
-
-          page++;
-          if (!followersFeed.isMoreAvailable() || page > 10) break;
-
-          // Delay entre páginas
-          await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
-        }
-
-        followers = followers.slice(0, limit);
-        P.info(`✅ [PRIVATE] ${followers.length} seguidores obtenidos de @${username}`);
-
-        return { success: true, followers, total: followers.length };
-      } catch (error) {
-        P.error(`❌ [PRIVATE] Error obteniendo seguidores de @${username}: ${error.message}`);
-        return { success: false, error: error.message, followers: [], total: 0 };
-      }
-    });
+    return this.limiter.schedule(() => _pyCall('GET', `/user/${encodeURIComponent(username)}/followers`, null, { limit, user_id: this.userId }));
   }
 
-  /**
-   * Buscar usuarios por query
-   */
   async searchUsers(query, limit = 10) {
     if (!this.logged) throw new Error('Private API no conectada.');
-
-    return this.limiter.schedule(async () => {
-      try {
-        const result = await this.ig.user.search(query);
-        const users = (result.users || []).slice(0, limit).map(u => ({
-          pk: u.pk,
-          username: u.username,
-          full_name: u.full_name || '',
-          is_private: u.is_private,
-          is_verified: u.is_verified,
-          profile_pic_url: u.profile_pic_url,
-          follower_count: u.follower_count,
-          is_business: u.is_business || false
-        }));
-
-        P.info(`✅ [PRIVATE] ${users.length} usuarios encontrados para '${query}'`);
-        return { success: true, users, total: users.length };
-      } catch (error) {
-        P.error(`❌ [PRIVATE] Error buscando usuarios: ${error.message}`);
-        return { success: false, error: error.message, users: [], total: 0 };
-      }
-    });
+    return this.limiter.schedule(() => _pyCall('GET', '/search/users', null, { q: query, limit, user_id: this.userId }));
   }
 
-  /**
-   * Enviar DM vía Private API (para contacto inicial fuera de ventana 24h)
-   */
   async sendDirectMessage(recipientUsername, text) {
     if (!this.logged) throw new Error('Private API no conectada.');
+    return this.limiter.schedule(() => _pyCall('POST', '/dm/send', { recipient_username: recipientUsername, text, user_id: this.userId }));
+  }
 
-    return this.limiter.schedule(async () => {
-      try {
-        const userId = await this.ig.user.getIdByUsername(recipientUsername);
-        const thread = this.ig.entity.directThread([userId.toString()]);
-        const result = await thread.broadcastText(text);
-
-        P.info(`✅ [PRIVATE] DM enviado a @${recipientUsername}`);
-        return { success: true, data: result };
-      } catch (error) {
-        P.error(`❌ [PRIVATE] Error enviando DM a @${recipientUsername}: ${error.message}`);
-        return { success: false, error: error.message };
-      }
+  async sendMassDM(recipientUsernames, message, options = {}) {
+    if (!this.logged) throw new Error('Private API no conectada.');
+    return _pyCall('POST', '/dm/mass', {
+      recipient_usernames: recipientUsernames,
+      message,
+      user_id: this.userId,
+      delay_between_ms: options.delayBetweenMs || 8000,
+      use_username_template: !!options.useUsernameTemplate
     });
   }
 
-  /**
-   * Obtener info de un usuario por username
-   */
   async getUserInfo(username) {
     if (!this.logged) throw new Error('Private API no conectada.');
-
-    return this.limiter.schedule(async () => {
-      try {
-        const userId = await this.ig.user.getIdByUsername(username);
-        const userInfo = await this.ig.user.info(userId);
-
-        return {
-          success: true,
-          user: {
-            pk: userInfo.pk,
-            username: userInfo.username,
-            full_name: userInfo.full_name,
-            biography: userInfo.biography,
-            follower_count: userInfo.follower_count,
-            following_count: userInfo.following_count,
-            media_count: userInfo.media_count,
-            is_private: userInfo.is_private,
-            is_verified: userInfo.is_verified,
-            is_business: userInfo.is_business,
-            profile_pic_url: userInfo.profile_pic_url
-          }
-        };
-      } catch (error) {
-        P.error(`❌ [PRIVATE] Error obteniendo info de @${username}: ${error.message}`);
-        return { success: false, error: error.message };
-      }
-    });
+    return this.limiter.schedule(() => _pyCall('GET', `/user/${encodeURIComponent(username)}/info`, null, { user_id: this.userId }));
   }
 
-  /**
-   * Logout de Private API
-   */
+  async searchHashtags(query, limit = 20) {
+    if (!this.logged) throw new Error('Private API no conectada.');
+    return this.limiter.schedule(() => _pyCall('GET', '/search/hashtags', null, { q: query, limit, user_id: this.userId }));
+  }
+
+  async getHashtagMedia(hashtag, limit = 30) {
+    if (!this.logged) throw new Error('Private API no conectada.');
+    return this.limiter.schedule(() => _pyCall('GET', `/hashtag/${encodeURIComponent(hashtag)}/media`, null, { limit, user_id: this.userId }));
+  }
+
+  async searchLocations(query, limit = 20) {
+    if (!this.logged) throw new Error('Private API no conectada.');
+    return this.limiter.schedule(() => _pyCall('GET', '/search/locations', null, { q: query, limit, user_id: this.userId }));
+  }
+
+  async getLocationMedia(locationId, limit = 30) {
+    if (!this.logged) throw new Error('Private API no conectada.');
+    return this.limiter.schedule(() => _pyCall('GET', `/location/${encodeURIComponent(locationId)}/media`, null, { limit, user_id: this.userId }));
+  }
+
+  async getUserMedia(username, limit = 20) {
+    if (!this.logged) throw new Error('Private API no conectada.');
+    return this.limiter.schedule(() => _pyCall('GET', `/user/${encodeURIComponent(username)}/media`, null, { limit, user_id: this.userId }));
+  }
+
+  async getFollowing(username, limit = 30) {
+    if (!this.logged) throw new Error('Private API no conectada.');
+    return this.limiter.schedule(() => _pyCall('GET', `/user/${encodeURIComponent(username)}/following`, null, { limit, user_id: this.userId }));
+  }
+
+  async getTimelineFeed(limit = 20) {
+    if (!this.logged) throw new Error('Private API no conectada.');
+    return this.limiter.schedule(() => _pyCall('GET', '/timeline', null, { limit, user_id: this.userId }));
+  }
+
   async logout() {
-    try {
-      if (this.logged) {
-        await this.ig.account.logout();
-      }
-      this.logged = false;
-      this.username = null;
-
-      // Eliminar archivo de sesión
-      const file = this.stateFile();
-      if (fs.existsSync(file)) fs.unlinkSync(file);
-
-      P.info(`🔒 [PRIVATE] Sesión cerrada`);
-      return { success: true };
-    } catch (error) {
-      P.warn(`⚠️ [PRIVATE] Error en logout: ${error.message}`);
-      return { success: false, error: error.message };
-    }
-  }
-
-  // Helpers
-  _extractShortcode(url) {
-    const patterns = [
-      /instagram\.com\/p\/([A-Za-z0-9_-]+)/,
-      /instagram\.com\/reel\/([A-Za-z0-9_-]+)/,
-      /instagram\.com\/tv\/([A-Za-z0-9_-]+)/
-    ];
-    for (const p of patterns) {
-      const m = url.match(p);
-      if (m) return m[1];
-    }
-    return null;
-  }
-
-  async _shortcodeToMediaId(shortcode) {
-    // Algoritmo para convertir shortcode a media ID de Instagram
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-    let id = BigInt(0);
-    for (const char of shortcode) {
-      id = id * BigInt(64) + BigInt(alphabet.indexOf(char));
-    }
-    return id.toString();
+    const result = await _pyCall('POST', '/logout', { user_id: this.userId });
+    this.logged = false;
+    this.username = null;
+    pendingCheckpoint.delete(this.userId);
+    pending2FA.delete(this.userId);
+    P.info(`🔒 [PRIVATE] Sesión cerrada`);
+    return result;
   }
 }
 
@@ -1452,29 +1247,19 @@ export async function getOrCreateIGSession(userId) {
 
   if (igSessions.has(userId)) {
     const existing = igSessions.get(userId);
-    if (existing.connected) {
-      P.info(`   ✅ Retornando sesión existente conectada`);
-      return existing;
-    }
-
-    // Intentar recargar credenciales
-    const loaded = await existing.loadCredentials();
-    if (loaded) {
-      P.info(`   ✅ Credenciales recargadas exitosamente`);
-      return existing;
-    }
+    P.info(`   ✅ Retornando sesión existente (Graph: ${existing.connected}, Private: ${existing.privateClient.logged})`);
+    return existing;
   }
 
-  // Crear nueva sesión
+  // Crear nueva sesión solo si no existe ninguna
   const service = new InstagramGraphService(userId);
+  igSessions.set(userId, service);
 
   // Cargar ambas sesiones (Graph API + Private API)
   const [graphLoaded, privateLoaded] = await Promise.all([
     service.loadCredentials(),
     service.privateClient.restoreSession()
   ]);
-
-  igSessions.set(userId, service);
 
   if (graphLoaded && privateLoaded) {
     P.info(`✅ Sesión HÍBRIDA completa para usuario ${userId}`);
@@ -1783,9 +1568,42 @@ export async function igPrivateComplete2FA(code, userId) {
 }
 
 /**
+ * Enviar código de verificación de checkpoint (SMS/email de Instagram)
+ */
+export async function igSubmitChallengeCode(code, userId) {
+  try {
+    const session = await getOrCreateIGSession(userId);
+    return await session.privateClient.submitChallengeCode(code);
+  } catch (error) {
+    P.error(`❌ Error en igSubmitChallengeCode: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Reintentar login tras aprobar el checkpoint en el teléfono.
+ * Si el usuario aprobó "¿Fuiste tú?" en Instagram, reintentar el login.
+ */
+export async function igRetryAfterCheckpoint(userId) {
+  try {
+    const session = await getOrCreateIGSession(userId);
+    const client = session.privateClient;
+    const result = await client.retryAfterCheckpoint();
+    if (result.success) {
+      client.logged = true;
+      pendingCheckpoint.delete(userId);
+    }
+    return result;
+  } catch (error) {
+    P.error(`❌ Error en igRetryAfterCheckpoint: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
  * Obtener seguidores de un usuario (Private API)
  */
-export async function igGetFollowers(username, limit = 100, userId = null) {
+export async function igGetFollowers(username, limit = 30, userId = null) {
   try {
     const session = await _getConnectedSession(userId);
     if (!session) return { success: false, error: 'No hay sesión activa', followers: [] };
@@ -1896,6 +1714,59 @@ export async function igSendInitialDM(recipientUsername, message, userId = null)
 }
 
 /**
+ * Envío masivo de DMs vía Private API (Instagram).
+ * Requiere sesión de Private API (login con usuario/contraseña).
+ * @param {string[]} recipientUsernames - Lista de usernames (con o sin @)
+ * @param {string} message - Texto del mensaje. Opcional: usar {{username}} si useUsernameTemplate=true
+ * @param {string} userId - ID del usuario en tu app (para la sesión IG)
+ * @param {Object} options - { delayBetweenMs?: number, useUsernameTemplate?: boolean }
+ */
+export async function igSendMassDM(recipientUsernames, message, userId, options = {}) {
+  try {
+    const session = await _getConnectedSession(userId);
+    if (!session) return { success: false, error: 'No hay sesión activa', sent: [], failed: [] };
+
+    if (!session.privateClient.logged) {
+      return {
+        success: false,
+        error: 'Private API no conectada. Inicia sesión con usuario/contraseña en Instagram (Private).',
+        sent: [],
+        failed: []
+      };
+    }
+
+    if (!Array.isArray(recipientUsernames) || recipientUsernames.length === 0) {
+      return { success: false, error: 'recipientUsernames debe ser un array no vacío', sent: [], failed: [] };
+    }
+
+    if (!message || typeof message !== 'string') {
+      return { success: false, error: 'message es requerido', sent: [], failed: [] };
+    }
+
+    const maxRecipients = 100;
+    const list = recipientUsernames.slice(0, maxRecipients);
+    if (recipientUsernames.length > maxRecipients) {
+      P.warn(`⚠️ [PRIVATE] Mass DM limitado a ${maxRecipients} destinatarios`);
+    }
+
+    const result = await session.privateClient.sendMassDM(list, message, {
+      delayBetweenMs: options.delayBetweenMs || 8000,
+      useUsernameTemplate: !!options.useUsernameTemplate
+    });
+
+    return {
+      success: result.failed.length === 0,
+      sent: result.sent,
+      failed: result.failed,
+      total: result.total
+    };
+  } catch (error) {
+    P.error(`❌ Error en igSendMassDM: ${error.message}`);
+    return { success: false, error: error.message, sent: [], failed: [] };
+  }
+}
+
+/**
  * Logout de Private API
  */
 export async function igPrivateLogout(userId) {
@@ -1936,6 +1807,111 @@ export async function igGetHybridStatus(userId) {
       graph_api: { connected: false, error: error.message },
       private_api: { connected: false }
     };
+  }
+}
+
+/**
+ * Buscar hashtags (Private API)
+ */
+export async function igSearchHashtags(query, limit = 20, userId = null) {
+  try {
+    const session = await _getConnectedSession(userId);
+    if (!session) return { success: false, error: 'No hay sesión activa', hashtags: [] };
+    if (!session.privateClient.logged) return { success: false, error: 'Private API no conectada.', hashtags: [] };
+    return await session.privateClient.searchHashtags(query, limit);
+  } catch (error) {
+    P.error(`❌ Error en igSearchHashtags: ${error.message}`);
+    return { success: false, error: error.message, hashtags: [] };
+  }
+}
+
+/**
+ * Obtener media de un hashtag (Private API)
+ */
+export async function igGetHashtagMedia(hashtag, limit = 30, userId = null) {
+  try {
+    const session = await _getConnectedSession(userId);
+    if (!session) return { success: false, error: 'No hay sesión activa', media: [] };
+    if (!session.privateClient.logged) return { success: false, error: 'Private API no conectada.', media: [] };
+    return await session.privateClient.getHashtagMedia(hashtag, limit);
+  } catch (error) {
+    P.error(`❌ Error en igGetHashtagMedia: ${error.message}`);
+    return { success: false, error: error.message, media: [] };
+  }
+}
+
+/**
+ * Buscar ubicaciones (Private API)
+ */
+export async function igSearchLocations(query, limit = 20, userId = null) {
+  try {
+    const session = await _getConnectedSession(userId);
+    if (!session) return { success: false, error: 'No hay sesión activa', locations: [] };
+    if (!session.privateClient.logged) return { success: false, error: 'Private API no conectada.', locations: [] };
+    return await session.privateClient.searchLocations(query, limit);
+  } catch (error) {
+    P.error(`❌ Error en igSearchLocations: ${error.message}`);
+    return { success: false, error: error.message, locations: [] };
+  }
+}
+
+/**
+ * Obtener media de una ubicación (Private API)
+ */
+export async function igGetLocationMedia(locationId, limit = 30, userId = null) {
+  try {
+    const session = await _getConnectedSession(userId);
+    if (!session) return { success: false, error: 'No hay sesión activa', media: [] };
+    if (!session.privateClient.logged) return { success: false, error: 'Private API no conectada.', media: [] };
+    return await session.privateClient.getLocationMedia(locationId, limit);
+  } catch (error) {
+    P.error(`❌ Error en igGetLocationMedia: ${error.message}`);
+    return { success: false, error: error.message, media: [] };
+  }
+}
+
+/**
+ * Obtener media/posts de un usuario (Private API)
+ */
+export async function igGetUserMedia(username, limit = 20, userId = null) {
+  try {
+    const session = await _getConnectedSession(userId);
+    if (!session) return { success: false, error: 'No hay sesión activa', media: [] };
+    if (!session.privateClient.logged) return { success: false, error: 'Private API no conectada.', media: [] };
+    return await session.privateClient.getUserMedia(username, limit);
+  } catch (error) {
+    P.error(`❌ Error en igGetUserMedia: ${error.message}`);
+    return { success: false, error: error.message, media: [] };
+  }
+}
+
+/**
+ * Obtener following de un usuario (Private API)
+ */
+export async function igGetFollowing(username, limit = 30, userId = null) {
+  try {
+    const session = await _getConnectedSession(userId);
+    if (!session) return { success: false, error: 'No hay sesión activa', following: [] };
+    if (!session.privateClient.logged) return { success: false, error: 'Private API no conectada.', following: [] };
+    return await session.privateClient.getFollowing(username, limit);
+  } catch (error) {
+    P.error(`❌ Error en igGetFollowing: ${error.message}`);
+    return { success: false, error: error.message, following: [] };
+  }
+}
+
+/**
+ * Obtener timeline feed del usuario logueado (Private API)
+ */
+export async function igGetTimeline(limit = 20, userId = null) {
+  try {
+    const session = await _getConnectedSession(userId);
+    if (!session) return { success: false, error: 'No hay sesión activa', media: [] };
+    if (!session.privateClient.logged) return { success: false, error: 'Private API no conectada.', media: [] };
+    return await session.privateClient.getTimelineFeed(limit);
+  } catch (error) {
+    P.error(`❌ Error en igGetTimeline: ${error.message}`);
+    return { success: false, error: error.message, media: [] };
   }
 }
 
