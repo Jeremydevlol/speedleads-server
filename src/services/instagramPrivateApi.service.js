@@ -209,16 +209,23 @@ class IGPrivateClient {
       } catch (proxyErr) {
         const msg = proxyErr?.message || '';
         if (proxyUrl && (msg.includes('402') || msg.includes('502') || msg.includes('Residential Failed'))) {
-          console.warn('   ⚠️ Proxy bloquea login (402/502). Sesión sin proxy (evitar 403 en acciones).');
+          console.warn('   ⚠️ Proxy bloquea login (402/502). Login sin proxy...');
           this.ig.state.proxyUrl = '';
           loggedUser = await this.ig.account.login(username, password);
-          // No restaurar proxy: sesión ligada a IP, cambiar IP = 403 login_required
         } else {
           throw proxyErr;
         }
       }
       this.logged = true;
       this.username = username;
+
+      // IMPORTANTE: Restaurar proxy después del login para que TODAS las peticiones
+      // posteriores (inbox, DMs, comments) vayan por IP residencial.
+      // Sin esto, Instagram bloquea con 467 desde la IP de datacenter.
+      if (proxyUrl) {
+        this.ig.state.proxyUrl = proxyUrl;
+        console.log('   🌐 [IG] Proxy restaurado para peticiones post-login.');
+      }
 
       if (!getConfig().proxyUrl) {
         try { await this.ig.simulate.postLoginFlow(); } catch (e) {}
@@ -300,6 +307,14 @@ class IGPrivateClient {
       await this.ig.state.deserializeCookieJar(saved.cookies);
       this.username = saved.username;
       this.logged = true;
+
+      // Asegurar proxy durante restore (crucial para producción)
+      const proxyUrl = getConfig().proxyUrl;
+      if (proxyUrl) {
+        this.ig.state.proxyUrl = proxyUrl;
+        console.log('   🌐 [IG] Proxy establecido al restaurar sesión.');
+      }
+
       try {
         await this.ig.account.currentUser();
         console.log(`✅ [IG] Sesión restaurada para @${this.username}`);
@@ -332,6 +347,11 @@ class IGPrivateClient {
       if (!restored) {
         throw new Error('Private API no conectada.');
       }
+    }
+    // Siempre asegurar que el proxy esté activo antes de cualquier petición
+    const proxyUrl = getConfig().proxyUrl;
+    if (proxyUrl && this.ig.state.proxyUrl !== proxyUrl) {
+      this.ig.state.proxyUrl = proxyUrl;
     }
   }
 
