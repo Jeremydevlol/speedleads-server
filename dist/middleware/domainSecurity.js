@@ -59,6 +59,8 @@ export const authMiddleware = async (req, res, next) => {
     /^\/api\/websites\/custom-domain/,      // /api/websites/custom-domain
     /^\/api\/websites\/video\//,            // /api/websites/video/* (streaming público)
     /^\/api\/websites\/connection\//,       // /api/websites/connection/detect
+    /^\/api\/instagram\/brightdata\//,      // Bright Data scrapers (sin login)
+    /^\/api\/brightdata\//,                 // Bright Data alternativo
   ];
 
   // Rutas ruidosas a silenciar (IPFS/extensiones)
@@ -77,6 +79,11 @@ export const authMiddleware = async (req, res, next) => {
   // 2.5) Permitir GET público en rutas con patrones
   if (method === 'GET' && PUBLIC_PATH_PATTERNS.some(pattern => pattern.test(path))) {
     console.log(`✅ Ruta pública permitida: ${path}`);
+    return next();
+  }
+
+  // 2.6) Bright Data scrapers: sin auth (GET y POST)
+  if (path.startsWith('/api/instagram/brightdata/') || path.startsWith('/api/brightdata/')) {
     return next();
   }
 

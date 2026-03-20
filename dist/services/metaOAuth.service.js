@@ -42,9 +42,6 @@ export function verifyState(state) {
   }
 }
 
-/**
- * Intercambia code por access_token (short-lived).
- */
 export async function exchangeCodeForToken(code) {
   const url = `${BASE}/oauth/access_token?client_id=${encodeURIComponent(META_APP_ID)}&redirect_uri=${encodeURIComponent(META_REDIRECT_URI)}&client_secret=${encodeURIComponent(META_APP_SECRET)}&code=${encodeURIComponent(code)}`;
   const res = await fetch(url);
@@ -57,9 +54,6 @@ export async function exchangeCodeForToken(code) {
   return data.access_token;
 }
 
-/**
- * Intercambia short-lived por long-lived user token.
- */
 export async function getLongLivedUserToken(shortLivedToken) {
   const url = `${BASE}/oauth/access_token?grant_type=fb_exchange_token&client_id=${encodeURIComponent(META_APP_ID)}&client_secret=${encodeURIComponent(META_APP_SECRET)}&fb_exchange_token=${encodeURIComponent(shortLivedToken)}`;
   const res = await fetch(url);

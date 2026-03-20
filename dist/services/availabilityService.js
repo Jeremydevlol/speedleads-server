@@ -312,40 +312,8 @@ export async function bookAppointment(userId, slotEventId, clientName, clientPho
     const endDateTime = new Date(`${availability.selected_date}T${availability.end_time}`);
 
     // 2. Crear evento de cita en Google Calendar con información profesional
-    // Generar título/Summary más profesional y contextual
-    let appointmentSummary = `Cita con ${clientName}`;
-    if (description) {
-      // Si hay descripción, crear un título más descriptivo
-      const descLower = description.toLowerCase();
-      if (descLower.includes('comer') || descLower.includes('pizza') || descLower.includes('restaurante')) {
-        appointmentSummary = `Reunión con ${clientName} - ${description}`;
-      } else if (descLower.includes('proyecto') || descLower.includes('hablar') || descLower.includes('reunión')) {
-        appointmentSummary = `Reunión: ${description} - ${clientName}`;
-      } else if (descLower.includes('consulta') || descLower.includes('asesoría')) {
-        appointmentSummary = `Consulta con ${clientName} - ${description}`;
-      } else {
-        appointmentSummary = `${description} - ${clientName}`;
-      }
-    }
-    
-    // Generar descripción más completa y profesional
-    let appointmentDescription = '';
-    if (description) {
-      appointmentDescription = `${description}`;
-      if (notes && notes !== description) {
-        appointmentDescription += `\n\nNotas adicionales: ${notes}`;
-      }
-    } else if (notes) {
-      appointmentDescription = notes;
-    }
-    
-    // Agregar información del cliente
-    appointmentDescription += `\n\nCliente: ${clientName}`;
-    if (clientPhone) {
-      appointmentDescription += `\nTeléfono: ${clientPhone}`;
-    }
-    // clientEmail no está disponible en este contexto
-    
+    const appointmentSummary = `Cita con ${clientName}`;
+    const appointmentDescription = description || notes || `Cita agendada con ${clientName}${clientPhone ? `\nTeléfono: ${clientPhone}` : ''}${notes ? `\n\nNotas: ${notes}` : ''}`;
     const appointmentLocation = location || availability.location || '';
     
     const appointmentData = {
@@ -459,29 +427,8 @@ export async function bookAppointment(userId, slotEventId, clientName, clientPho
 
       if (citaError) {
         console.warn('⚠️ Error guardando cita agendada:', citaError);
-        
-        // Si el error es por google_event_id null, intentar sin él (aunque debería ser nullable ahora)
-        if (citaError.message && citaError.message.includes('google_event_id')) {
-          // Si google_event_id es null y causa error, intentar con un placeholder temporal
-          // O simplemente retry sin incluir el campo si ya es null
-          console.warn('⚠️ Error relacionado con google_event_id, intentando con valor temporal...');
-          insertData.google_event_id = `temp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-          
-          const { data: citaData3, error: citaError3 } = await supabaseAdmin
-            .from('citas_agendadas')
-            .insert(insertData)
-            .select()
-            .single();
-          
-          if (!citaError3) {
-            citaAgendada = citaData3;
-            console.log('✅ Cita guardada en citas_agendadas (con google_event_id temporal)');
-          } else {
-            console.warn('⚠️ Error persistente guardando cita:', citaError3);
-          }
-        }
         // Si el error es por disponibilidad_id o foreign key, intentar sin él
-        else if (citaError.message && (citaError.message.includes('disponibility_id') || 
+        if (citaError.message && (citaError.message.includes('disponibility_id') || 
             citaError.message.includes('disponibilidad_id') || 
             citaError.message.includes('foreign key') ||
             citaError.message.includes('fk_disponibilidad'))) {

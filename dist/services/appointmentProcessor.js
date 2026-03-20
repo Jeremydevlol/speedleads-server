@@ -5,6 +5,7 @@ import { getAvailableSlots, extractAppointmentInfo, bookAppointment } from './av
 import { supabaseAdmin } from '../db/supabase.js';
 import OpenAI from 'openai';
 
+// Cliente OpenAI para generar descripciones profesionales
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   timeout: 10000,

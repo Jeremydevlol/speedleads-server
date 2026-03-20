@@ -10,10 +10,13 @@ import { getConversationsByTenantId, getRecentMessages } from '../db/metaRepo.js
 const router = express.Router();
 
 router.get('/connection', validateJwt, async (req, res) => {
+  console.log("TEST: En /connection route. req.user:", req.user?.userId);
   const tenantId = req.user?.userId || req.user?.sub;
   if (!tenantId) return res.status(401).json({ error: 'User not found in token' });
   try {
+    console.log("TEST: Before getConnectionByTenantId");
     const conn = await getConnectionByTenantId(tenantId);
+    console.log("TEST: After getConnectionByTenantId", conn);
     if (!conn) return res.json({ connected: false });
     return res.json({
       connected: true,

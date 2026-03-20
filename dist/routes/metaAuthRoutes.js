@@ -69,28 +69,28 @@ router.get('/callback', async (req, res) => {
       : (rawMsg.length > 100 ? `fb_error_${errorCode || 'unknown'}` : rawMsg || friendlyKey);
     return redirectFail(friendlyKey, logMsg);
   }
-  if (!code || !state) return redirectFail('missing_code_or_state', 'missing_code_or_state');
+  if (!code || !state) return redirectFail('missing_code_or_state');
 
   const parsed = verifyState(state);
-  if (!parsed?.tenant_id) return redirectFail('invalid_state', 'invalid_state');
+  if (!parsed?.tenant_id) return redirectFail('invalid_state');
   const tenantId = parsed.tenant_id;
 
   let accessToken;
   try {
     accessToken = await exchangeCodeForToken(code);
-    if (!accessToken) return redirectFail('token_exchange_failed', 'token_exchange_failed');
+    if (!accessToken) return redirectFail('token_exchange_failed');
   } catch (e) {
     console.error('[metaAuth] token exchange:', e.message);
-    return redirectFail('token_exchange_failed', 'token_exchange_failed');
+    return redirectFail('token_exchange_failed');
   }
 
   try {
     const longLived = await getLongLivedUserToken(accessToken);
     const igData = await getIgBusinessIdAndPageToken(longLived);
     if (igData.error) {
-      return redirectFail(igData.error === 'no_pages' ? 'no_pages' : 'no_instagram_business', igData.error);
+      return redirectFail(igData.error === 'no_pages' ? 'no_pages' : 'no_instagram_business');
     }
-    if (!igData.ig_business_id || !igData.page_access_token) return redirectFail('no_instagram_business', 'no_instagram_business');
+    if (!igData.ig_business_id || !igData.page_access_token) return redirectFail('no_instagram_business');
     await upsertConnection({
       tenant_id: tenantId,
       ig_business_id: igData.ig_business_id,
@@ -101,7 +101,7 @@ router.get('/callback', async (req, res) => {
     return res.redirect(chatsRedirect({ channel: 'instagram', connected: '1' }));
   } catch (e) {
     console.error('[metaAuth] callback save:', e.message);
-    return redirectFail('save_failed', 'save_failed');
+    return redirectFail('save_failed');
   }
 });
 

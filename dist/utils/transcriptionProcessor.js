@@ -20,45 +20,38 @@ export async function processTranscriptionToInstructions(transcription, metadata
     console.log('🤖 Procesando transcripción con IA...');
     console.log(`📝 Texto original: ${transcription.length} caracteres`);
 
-    const systemPrompt = `Eres un experto en análisis de contenido de videos que crea resúmenes naturales y conversacionales.
+    const systemPrompt = `Eres un asistente experto en convertir transcripciones de videos en instrucciones claras y estructuradas.
 
-Tu tarea es analizar la transcripción de un video y crear un resumen natural que explique de qué trata realmente el video, como si fueras una persona describiendo el contenido a un amigo.
-
-ESTILO DE ANÁLISIS:
-- Escribe de forma natural y conversacional
-- Explica de qué trata realmente el video
-- Usa un lenguaje cercano y directo
-- Enfócate en el contenido principal y el mensaje
-- Menciona detalles importantes o curiosos
-- Evita listas formales o estructuras rígidas
-
-EJEMPLOS DE BUEN ESTILO:
-❌ MAL: "El video contiene instrucciones sobre gaming con los siguientes puntos..."
-✅ BIEN: "Este video trata sobre Lolito que va a hacer un directo de 24 horas jugando Minecraft sin parar, donde va a comer, dormir y hacer todo en stream."
-
-❌ MAL: "### Instrucciones para el contenido: 1. El usuario menciona..."
-✅ BIEN: "En este video, el youtuber está anunciando que va a borrar el video en 24 horas y quiere que la gente vaya a ver un video sorpresa que tiene en el segundo link de la descripción."
+Tu tarea es tomar la transcripción de un video y convertirla en instrucciones útiles, información organizada, o indicaciones claras que una IA pueda usar para aprender.
 
 REGLAS:
-1. Mantén toda la información importante de la transcripción
-2. Escribe como si fueras una persona explicando el video
-3. No uses formatos de listas o instrucciones formales
-4. Enfócate en QUÉ pasa en el video y POR QUÉ es interesante
-5. Menciona detalles específicos que hacen único el contenido
-6. Usa un tono natural y directo`;
+1. Mantén TODA la información de la transcripción original
+2. Organiza el contenido en secciones claras
+3. Convierte declaraciones en instrucciones o información estructurada
+4. Usa formato claro con viñetas, numeración o secciones
+5. No inventes información que no esté en la transcripción
+6. Si hay consejos, conviértelos en instrucciones directas
+7. Si hay información, organízala por temas
+8. Si hay narraciones, extrae los puntos clave como datos
 
-    const userPrompt = `Analiza este video de ${platform} y explícame de qué trata de forma natural y conversacional:
+FORMATO DE SALIDA:
+- Usa encabezados claros (##, ###)
+- Organiza en secciones lógicas
+- Convierte en instrucciones accionables cuando sea posible
+- Mantén el contexto y significado original`;
 
-INFORMACIÓN DEL VIDEO:
+    const userPrompt = `Convierte esta transcripción de video de ${platform} en instrucciones estructuradas:
+
+METADATOS DEL VIDEO:
 - Título: ${metadata.title || 'Sin título'}
 - Canal/Usuario: ${metadata.uploader || metadata.channel || 'Desconocido'}
 - Plataforma: ${platform}
 - Duración: ${metadata.duration ? `${Math.floor(metadata.duration / 60)}:${String(metadata.duration % 60).padStart(2, '0')}` : 'N/A'}
 
-LO QUE DICE EN EL VIDEO:
+TRANSCRIPCIÓN ORIGINAL:
 "${transcription}"
 
-Explícame de qué trata este video de forma natural, como si me estuvieras contando qué pasa en él:`;
+Convierte esto en instrucciones claras y estructuradas manteniendo toda la información:`;
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',

@@ -46,6 +46,7 @@ import websitesRoutes from './routes/websitesRoutes.js';
 import instagramGraphRoutes from './routes/instagramGraphRoutes.js';
 import instagramAuthRoutes from './routes/instagramAuthRoutes.js';
 import instagramPrivateRoutes from './routes/instagramPrivateRoutes.js';
+import instagramBrightDataRoutes from './routes/instagramBrightDataRoutes.js';
 import metaWebhookRoutes from './routes/metaWebhookRoutes.js';
 import metaDiagnosticRoutes from './routes/metaDiagnosticRoutes.js';
 import metaAuthRoutes from './routes/metaAuthRoutes.js';
@@ -382,6 +383,30 @@ app.get('/status', (req, res) => {
     timestamp: Date.now()
   });
 });
+
+// Bright Data (sin auth) — handler directo para evitar cualquier validateJwt
+app.get('/api/brightdata/profile/:username', async (req, res) => {
+  try {
+    const { scrapeProfileByUsername } = await import('./services/brightDataScraper.service.js');
+    const username = (req.params.username || '').replace(/^@/, '');
+    const data = await scrapeProfileByUsername(username);
+    return res.json({ success: true, data });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+app.get('/api/instagram/brightdata/profile/:username', async (req, res) => {
+  try {
+    const { scrapeProfileByUsername } = await import('./services/brightDataScraper.service.js');
+    const username = (req.params.username || '').replace(/^@/, '');
+    const data = await scrapeProfileByUsername(username);
+    return res.json({ success: true, data });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+app.use('/api/brightdata', instagramBrightDataRoutes);
+app.use('/api/instagram/brightdata', instagramBrightDataRoutes);
 
 app.use('/api', health);
 

@@ -16,64 +16,44 @@ const decrypt = (encryptedText) => {
 /**
  * Genera URL de autorización OAuth de Google
  */
-/**
- * Genera URL de autorización OAuth de Google
- */
-export function generateAuthUrl(userId, redirectUri) {
-  const currentRedirect = redirectUri || process.env.GOOGLE_REDIRECT_URI;
-  console.log(`🔗 GENERANDO NUEVA AUTH URL en backend: userId=${userId}, redirect=${currentRedirect}`);
-
+export function generateAuthUrl(userId) {
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
-    currentRedirect
+    process.env.GOOGLE_REDIRECT_URI
   );
   
-  // Incluir redirectUri en el state para recuperarlo en el callback
-  const statePayload = { userId };
-  if (redirectUri) {
-      statePayload.redirectUri = redirectUri;
-  }
+  const state = Buffer.from(JSON.stringify({ userId })).toString('base64');
   
-  const state = Buffer.from(JSON.stringify(statePayload)).toString('base64');
-  
-  const url = oauth2Client.generateAuthUrl({
+  return oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: [
       'https://www.googleapis.com/auth/calendar',
-      'https://www.googleapis.com/auth/calendar.events', // Agregado scope explícito de eventos
       'https://www.googleapis.com/auth/calendar.settings.readonly',
       'openid',
       'email',
       'profile'
     ],
-    prompt: 'consent', // <--- ESTO ES LA CLAVE PARA EL REFRESH TOKEN
-    include_granted_scopes: true,
+    prompt: 'consent',
     state
   });
-  
-  console.log('🔗 URL Generada (truncada):', url.substring(0, 100) + '...');
-  return url;
 }
 
 /**
  * Maneja el callback OAuth de Google
  */
-export async function handleOAuthCallback(code, userId, redirectUri) {
-  const currentRedirectUri = redirectUri || process.env.GOOGLE_REDIRECT_URI;
-  console.log(`🔗 Usando redirect_uri para token exchange: ${currentRedirectUri}`);
-
+export async function handleOAuthCallback(code, userId) {
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
-    currentRedirectUri
+    process.env.GOOGLE_REDIRECT_URI
   );
 
   try {
-    // Configurar el redirect_uri explícitamente y dinámicamente
+    // Configurar el redirect_uri explícitamente
     const { tokens } = await oauth2Client.getToken({
       code: code,
-      redirect_uri: currentRedirectUri
+      redirect_uri: process.env.GOOGLE_REDIRECT_URI
     });
     
     if (!tokens.access_token || !tokens.refresh_token) {
@@ -134,21 +114,11 @@ export async function saveUserTokens(userId, tokens, email = null) {
     }
 
     // Guardar en base de datos usando Supabase
-    const { error: upsertError } = await supabaseAdmin
+    await supabaseAdmin
       .from('google_accounts')
       .upsert(updateData, { onConflict: 'user_id' });
       
-    if (upsertError) {
-      console.error('❌ Supabase upsert error in saveUserTokens:', upsertError);
-      // Check for unique constraint violation on email
-      if (upsertError.code === '23505' && upsertError.message.includes('email')) {
-         console.error('⚠️ PREVENCIÓN: Este email de Google ya está conectado a otro usuario.');
-         throw new Error('Este email de Google ya está conectado a otra cuenta de usuario. Desconéctalo primero.');
-      }
-      throw upsertError;
-    }
-      
-    console.log(`✅ Tokens saved manually for user ${userId} (Email: ${email || 'unknown'})`);
+    console.log(`✅ Tokens saved manually for user ${userId}`);
   } catch (error) {
     console.error('❌ Error saving user tokens:', error);
     throw error;
@@ -192,8 +162,8 @@ export async function getOAuth2Client(userId) {
     expiry_date: new Date(expiry_date).getTime()
   });
 
-  // Refresh automático si está por expirar Y hay refresh_token
-  if (decryptedRefreshToken && new Date(expiry_date).getTime() - Date.now() < 60000) {
+  // Refresh automático si está por expirar
+  if (new Date(expiry_date).getTime() - Date.now() < 60000) {
     try {
       const { credentials } = await oauth2Client.refreshAccessToken();
       
@@ -207,13 +177,9 @@ export async function getOAuth2Client(userId) {
         .eq('user_id', userId);
       
       console.log(`🔄 Token refreshed for user ${userId}`);
-      
-      // Actualizar las credenciales del cliente
-      oauth2Client.setCredentials(credentials);
     } catch (error) {
       console.error('❌ Failed to refresh token:', error);
-      // No lanzar error aquí, intentar usar el token actual aunque esté expirado
-      console.warn('⚠️ Continuando con token actual (puede estar expirado)');
+      throw error;
     }
   }
 

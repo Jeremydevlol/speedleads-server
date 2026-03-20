@@ -1,14 +1,8 @@
 /**
  * Repositorio para meta_connections (onboarding / conexión por tenant).
- * Supabase con service role.
  */
 import { supabaseAdmin } from './supabase.js';
 
-/**
- * Obtiene la conexión Meta activa para un tenant (por tenant_id).
- * @param {string} tenantId
- * @returns {Promise<{ tenant_id, ig_business_id, access_token, auto_reply_enabled, status } | null>}
- */
 export async function getConnectionByTenantId(tenantId) {
   if (!tenantId) return null;
   const { data, error } = await supabaseAdmin
@@ -27,10 +21,6 @@ export async function getConnectionByTenantId(tenantId) {
   return data ?? null;
 }
 
-/**
- * Obtiene la conexión por tenant_id sin filtrar por status (para actualizar).
- * @param {string} tenantId
- */
 export async function getConnectionByTenantIdAnyStatus(tenantId) {
   if (!tenantId) return null;
   const { data, error } = await supabaseAdmin
@@ -47,10 +37,6 @@ export async function getConnectionByTenantIdAnyStatus(tenantId) {
   return data ?? null;
 }
 
-/**
- * Upsert de meta_connections por (tenant_id, ig_business_id).
- * @param {object} p - { tenant_id, ig_business_id, access_token, status?, auto_reply_enabled? }
- */
 export async function upsertConnection(p) {
   const {
     tenant_id,
@@ -81,11 +67,6 @@ export async function upsertConnection(p) {
   return row;
 }
 
-/**
- * Actualiza auto_reply_enabled para el tenant (y su ig_business_id activo).
- * @param {string} tenantId
- * @param {boolean} enabled
- */
 export async function updateAutoReply(tenantId, enabled) {
   if (!tenantId) throw new Error('tenant_id required');
   const conn = await getConnectionByTenantIdAnyStatus(tenantId);

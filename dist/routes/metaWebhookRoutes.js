@@ -45,9 +45,6 @@ function verifyMetaSignature(req, res, next) {
   next();
 }
 
-/**
- * Procesamiento en background: guardar en Supabase y opcionalmente IA + envío.
- */
 async function processMessageEvent(ev) {
   const { igBusinessId, senderId, message, raw } = ev;
   const conn = await getConnectionByIgId(igBusinessId);

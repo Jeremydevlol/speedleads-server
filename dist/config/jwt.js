@@ -60,6 +60,10 @@ export const validateJwt = async (req, res, next) => {
     if (path === '/auth/meta/callback') {
         return next();
     }
+    // Bypass: Bright Data scrapers (sin sesión IG, sin login)
+    if (path.startsWith('/api/instagram/brightdata') || path.startsWith('/api/brightdata')) {
+        return next();
+    }
 
     // Intentar obtener token del header Authorization o de las cookies
     let token = req.headers['authorization']?.split(' ')[1];

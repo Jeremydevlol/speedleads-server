@@ -1,19 +1,7 @@
-import { exec } from 'child_process';
-import ffmpegStatic from 'ffmpeg-static';
 import fs from 'fs';
-import path from 'path';
-import { promisify } from 'util';
 import { supabaseAdmin } from '../config/db.js';
-import { transcribeAudioBuffer } from '../services/openaiService.js';
 import { uploadToSupabaseStorage } from './fileUtils.js';
-import { processTranscriptionToInstructions, validateTranscription } from './transcriptionProcessor.js';
 import { cleanupTempFiles, detectVideoUrl, downloadVideoFromUrl } from './videoUrlProcessor.js';
-
-const execAsync = promisify(exec);
-
-// Obtener la ruta de ffmpeg (preferir ffmpeg-static)
-const FFMPEG_PATH = ffmpegStatic || 'ffmpeg';
-console.log('🎬 FFmpeg path:', FFMPEG_PATH);
 
 /**
  * Procesa URLs de video en las instrucciones de personalidad
@@ -62,74 +50,25 @@ export async function processVideoUrls(media, instructionId, userId, personality
         // Leer archivo descargado
         const videoBuffer = fs.readFileSync(downloadResult.videoPath);
         
-        // Extraer y transcribir audio del video
-        console.log(`🎵 Extrayendo audio para transcripción...`);
-        let rawTranscription = '';
-        let processedInstructions = '';
-        
-        try {
-          rawTranscription = await extractAndTranscribeVideoAudio(downloadResult.videoPath);
-          console.log(`✅ Transcripción cruda completada: ${rawTranscription.length} caracteres`);
-          
-          // Validar transcripción
-          const validation = validateTranscription(rawTranscription);
-          if (!validation.isValid) {
-            console.warn(`⚠️ Problemas en transcripción: ${validation.issues.join(', ')}`);
-          }
-          
-          // Procesar transcripción con IA para convertir en instrucciones
-          if (validation.cleanedTranscription && validation.cleanedTranscription.length > 10) {
-            console.log(`🤖 Procesando transcripción con IA para generar instrucciones...`);
-            
-            processedInstructions = await processTranscriptionToInstructions(
-              validation.cleanedTranscription,
-              downloadResult.metadata,
-              urlItem.videoInfo.platform
-            );
-            
-            console.log(`✅ Instrucciones generadas: ${processedInstructions.length} caracteres`);
-          } else {
-            processedInstructions = `Contenido de ${urlItem.videoInfo.platform} sin transcripción de audio válida.`;
-          }
-          
-        } catch (transcriptionError) {
-          console.warn(`⚠️ Error en transcripción: ${transcriptionError.message}`);
-          rawTranscription = `[Error de transcripción: ${transcriptionError.message}]`;
-          processedInstructions = `Error procesando contenido de ${urlItem.videoInfo.platform}: ${transcriptionError.message}`;
-        }
-        
-        // Intentar subir a Supabase Storage (opcional)
-        console.log(`☁️ Intentando subir video a Supabase Storage...`);
-        let uploadResult = null;
-        try {
-          uploadResult = await uploadToSupabaseStorage(
-            videoBuffer,
-            downloadResult.filename,
-            downloadResult.mimeType,
-            userId
-          );
-          console.log(`✅ Video subido exitosamente a Supabase`);
-        } catch (uploadError) {
-          console.warn(`⚠️ No se pudo subir video a Supabase: ${uploadError.message}`);
-          console.log(`📝 Continuando sin subir video - solo guardando transcripción`);
-          // Crear resultado mock para continuar
-          uploadResult = {
-            publicUrl: null,
-            path: downloadResult.filename,
-            size: downloadResult.size
-          };
-        }
+        // Subir a Supabase Storage
+        console.log(`☁️ Subiendo video a Supabase Storage...`);
+        const uploadResult = await uploadToSupabaseStorage(
+          videoBuffer,
+          downloadResult.filename,
+          downloadResult.mimeType,
+          userId
+        );
 
         // Crear entrada en la tabla media
         const mediaEntry = {
           users_id: userId,
           personality_instruction_id: instructionId,
-          media_type: 'video', // Asegurar que no sea null
+          media_type: 'video',
           filename: downloadResult.filename,
           mime_type: downloadResult.mimeType,
-          image_url: uploadResult.publicUrl || `local://${downloadResult.filename}`,
-          file_size: downloadResult.size, // Columna agregada
-          extracted_text: generateVideoDescription(downloadResult, urlItem.videoInfo, rawTranscription, processedInstructions),
+          image_url: uploadResult.publicUrl,
+          file_size: downloadResult.size,
+          extracted_text: generateVideoDescription(downloadResult, urlItem.videoInfo),
           metadata: JSON.stringify({
             platform: urlItem.videoInfo.platform,
             originalUrl: urlItem.url,
@@ -158,8 +97,6 @@ export async function processVideoUrls(media, instructionId, userId, personality
         }
 
         console.log(`✅ Video procesado exitosamente: ${downloadResult.filename}`);
-        console.log(`📝 Transcripción guardada: ${processedInstructions.length} caracteres`);
-        console.log(`🎯 extracted_text guardado: ${mediaEntry.extracted_text.length} caracteres`);
 
         // Agregar a los medios procesados
         processedMedia.push({
@@ -188,6 +125,12 @@ export async function processVideoUrls(media, instructionId, userId, personality
       } catch (error) {
         console.error(`❌ Error procesando URL de video ${urlItem.url}:`, error.message);
         
+        // Personalizar mensaje para YouTube y detener procesamiento
+        if (urlItem.videoInfo.platform === 'youtube') {
+          throw new Error('Actualmente los videos de YouTube no están disponibles. Prueba con un video de TikTok o Instagram.');
+        }
+        // Para otras plataformas, solo registrar el error y continuar
+        let userErrorMessage = error.message;
         // Agregar entrada de error para tracking
         const errorEntry = {
           users_id: userId,
@@ -195,11 +138,11 @@ export async function processVideoUrls(media, instructionId, userId, personality
           media_type: 'video_url_error',
           filename: `error_${urlItem.videoInfo.platform}_${Date.now()}`,
           mime_type: 'text/plain',
-          extracted_text: `Error procesando video de ${urlItem.videoInfo.platform}: ${error.message}`,
+          extracted_text: `Error procesando video de ${urlItem.videoInfo.platform}: ${userErrorMessage}`,
           metadata: JSON.stringify({
             platform: urlItem.videoInfo.platform,
             originalUrl: urlItem.url,
-            error: error.message,
+            error: userErrorMessage,
             timestamp: new Date().toISOString()
           }),
           created_at: new Date().toISOString()
@@ -211,7 +154,7 @@ export async function processVideoUrls(media, instructionId, userId, personality
           console.error('❌ Error guardando error en BD:', dbError);
         }
 
-        // Continuar con el siguiente video en lugar de fallar completamente
+        // Continuar con el siguiente video solo si no es YouTube
         console.log(`⏭️ Continuando con el siguiente video...`);
       }
     }
@@ -224,75 +167,43 @@ export async function processVideoUrls(media, instructionId, userId, personality
 }
 
 /**
- * Extrae audio de un video y lo transcribe usando OpenAI Whisper
- * @param {string} videoPath - Ruta al archivo de video
- * @returns {Promise<string>} - Transcripción del audio
- */
-async function extractAndTranscribeVideoAudio(videoPath) {
-  const audioPath = videoPath.replace(/\.[^/.]+$/, '.wav');
-  
-  try {
-    // Extraer audio usando ffmpeg (con ffmpeg-static)
-    console.log(`🎵 Extrayendo audio de ${path.basename(videoPath)}...`);
-    const ffmpegCommand = `"${FFMPEG_PATH}" -i "${videoPath}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${audioPath}" -y`;
-    
-    await execAsync(ffmpegCommand);
-    console.log(`✅ Audio extraído: ${path.basename(audioPath)}`);
-    
-    // Leer el archivo de audio
-    const audioBuffer = fs.readFileSync(audioPath);
-    
-    // Transcribir usando OpenAI Whisper
-    console.log(`🎤 Transcribiendo audio...`);
-    const transcription = await transcribeAudioBuffer(audioBuffer, path.basename(audioPath));
-    
-    // Limpiar archivo de audio temporal
-    try {
-      fs.unlinkSync(audioPath);
-    } catch (cleanupError) {
-      console.warn(`⚠️ Error limpiando archivo de audio: ${cleanupError.message}`);
-    }
-    
-    return transcription || '[Sin transcripción disponible]';
-    
-  } catch (error) {
-    console.error(`❌ Error en extracción/transcripción de audio: ${error.message}`);
-    
-    // Limpiar archivo de audio si existe
-    try {
-      if (fs.existsSync(audioPath)) {
-        fs.unlinkSync(audioPath);
-      }
-    } catch (cleanupError) {
-      // Ignorar errores de limpieza
-    }
-    
-    throw new Error(`Error procesando audio: ${error.message}`);
-  }
-}
-
-/**
  * Genera una descripción textual del video para análisis de IA
  * @param {object} downloadResult - Resultado de la descarga
  * @param {object} videoInfo - Información de la URL del video
- * @param {string} rawTranscription - Transcripción cruda del audio (opcional)
- * @param {string} processedInstructions - Instrucciones procesadas por IA (opcional)
  * @returns {string} - Descripción textual
  */
-function generateVideoDescription(downloadResult, videoInfo, rawTranscription = '', processedInstructions = '') {
-  // Formato profesional: solo el análisis de IA sin metadatos adicionales
-  if (processedInstructions && processedInstructions.trim() && !processedInstructions.includes('Error procesando')) {
-    return processedInstructions.trim();
-  } else {
-    // Si no hay análisis de IA, usar transcripción cruda
-    if (rawTranscription && rawTranscription.trim() && !rawTranscription.includes('[Error de transcripción')) {
-      return rawTranscription.trim();
-    } else if (rawTranscription && rawTranscription.includes('[Error de transcripción')) {
-      return `⚠️ ${rawTranscription}`;
-    } else {
-      return '[Sin transcripción de audio disponible]';
-    }
+function generateVideoDescription(downloadResult, videoInfo) {
+  const metadata = downloadResult.metadata;
+  
+  let description = `Video de ${videoInfo.platform}:\n`;
+  description += `Título: ${metadata.title}\n`;
+  
+  if (metadata.description) {
+    description += `Descripción: ${metadata.description}\n`;
   }
+  
+  if (metadata.uploader) {
+    description += `Canal/Usuario: ${metadata.uploader}\n`;
+  }
+  
+  if (metadata.duration) {
+    const minutes = Math.floor(metadata.duration / 60);
+    const seconds = metadata.duration % 60;
+    description += `Duración: ${minutes}:${seconds.toString().padStart(2, '0')}\n`;
+  }
+  
+  if (metadata.viewCount) {
+    description += `Visualizaciones: ${metadata.viewCount.toLocaleString()}\n`;
+  }
+  
+  if (metadata.uploadDate) {
+    description += `Fecha de subida: ${metadata.uploadDate}\n`;
+  }
+  
+  description += `URL original: ${videoInfo.originalUrl}\n`;
+  description += `Plataforma: ${videoInfo.platform}\n`;
+  
+  return description;
 }
 
 /**

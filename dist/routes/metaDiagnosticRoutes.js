@@ -198,8 +198,8 @@ router.post('/diagnostic/test-event', async (req, res) => {
           }
         }
       } else {
-          console.log('[DIAG] IA did not return text (generateReply returned null)');
-        }
+        console.log('[DIAG] IA did not return text (generateReply returned null)');
+      }
     } catch (e) {
       console.log('[DIAG] IA generateReply failed:', e.message);
     }

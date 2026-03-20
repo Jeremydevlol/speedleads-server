@@ -4,12 +4,6 @@
  */
 import { supabaseAdmin } from './supabase.js';
 
-/**
- * Busca la conexión Meta por ig_business_id (Page ID / recipient.id).
- * Fallback: intentar por entry.id si se pasa como segundo argumento.
- * @param {string} igBusinessId - recipient.id o entry.id del webhook
- * @returns {Promise<{ tenant_id: string, ig_business_id: string, access_token: string, auto_reply_enabled: boolean } | null>}
- */
 export async function getConnectionByIgId(igBusinessId) {
   if (!igBusinessId) return null;
   const { data, error } = await supabaseAdmin
@@ -26,10 +20,6 @@ export async function getConnectionByIgId(igBusinessId) {
   return data ?? null;
 }
 
-/**
- * Upsert de conversación por (tenant_id, ig_business_id, sender_id).
- * @param {object} p - { tenant_id, ig_business_id, sender_id, last_message?, last_message_at? }
- */
 export async function upsertConversation(p) {
   const { tenant_id, ig_business_id, sender_id, last_message, last_message_at } = p;
   const now = new Date().toISOString();
@@ -44,10 +34,7 @@ export async function upsertConversation(p) {
         last_message_at: last_message_at ?? now,
         updated_at: now
       },
-      {
-        onConflict: 'tenant_id,ig_business_id,sender_id',
-        ignoreDuplicates: false
-      }
+      { onConflict: 'tenant_id,ig_business_id,sender_id', ignoreDuplicates: false }
     );
   if (error) {
     console.error('[metaRepo] upsertConversation error:', error.message);
@@ -55,11 +42,6 @@ export async function upsertConversation(p) {
   }
 }
 
-/**
- * Inserta un mensaje. Anti-duplicados: si ya existe (tenant_id, ig_business_id, sender_id, mid) no inserta.
- * @param {object} p - { tenant_id, ig_business_id, sender_id, direction: 'in'|'out', mid?, text?, raw? }
- * @returns {Promise<{ inserted: boolean, id?: string }>}
- */
 export async function insertMessage(p) {
   const { tenant_id, ig_business_id, sender_id, direction, mid, text, raw } = p;
   if (direction === 'in' && mid) {
@@ -72,9 +54,7 @@ export async function insertMessage(p) {
       .eq('mid', mid)
       .limit(1)
       .maybeSingle();
-    if (existing) {
-      return { inserted: false };
-    }
+    if (existing) return { inserted: false };
   }
   const { data, error } = await supabaseAdmin
     .from('meta_messages')
@@ -112,11 +92,6 @@ export async function getConversationsByTenantId(tenantId) {
   return data ?? [];
 }
 
-/**
- * Últimos N mensajes de la conversación para contexto IA (orden desc, limit).
- * @param {object} p - { tenant_id, ig_business_id, sender_id, limit?: number }
- * @returns {Promise<Array<{ direction, text, mid, raw, created_at }>>}
- */
 export async function getRecentMessages(p) {
   const { tenant_id, ig_business_id, sender_id, limit = 20 } = p;
   const { data, error } = await supabaseAdmin

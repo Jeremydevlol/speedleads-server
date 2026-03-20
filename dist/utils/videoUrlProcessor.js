@@ -6,44 +6,6 @@ import { __dirname } from '../app.js';
 
 const execAsync = promisify(exec);
 
-// Rutas comunes donde puede estar yt-dlp
-const YT_DLP_PATHS = [
-  'yt-dlp', // En PATH
-  '/usr/local/bin/yt-dlp',
-  '/opt/homebrew/bin/yt-dlp',
-  '/Users/' + (process.env.USER || 'user') + '/Library/Python/3.9/bin/yt-dlp',
-  '/Users/' + (process.env.USER || 'user') + '/Library/Python/3.10/bin/yt-dlp',
-  '/Users/' + (process.env.USER || 'user') + '/Library/Python/3.11/bin/yt-dlp',
-  '/Users/' + (process.env.USER || 'user') + '/Library/Python/3.12/bin/yt-dlp',
-  '/home/' + (process.env.USER || 'user') + '/.local/bin/yt-dlp',
-  process.env.HOME + '/Library/Python/3.9/bin/yt-dlp',
-  process.env.HOME + '/Library/Python/3.10/bin/yt-dlp',
-  process.env.HOME + '/Library/Python/3.11/bin/yt-dlp',
-  process.env.HOME + '/.local/bin/yt-dlp'
-];
-
-// Caché de la ruta encontrada
-let cachedYtDlpPath = null;
-
-// Buscar yt-dlp en las rutas comunes
-async function findYtDlp() {
-  if (cachedYtDlpPath) return cachedYtDlpPath;
-  
-  for (const ytPath of YT_DLP_PATHS) {
-    try {
-      // Intentar ejecutar --version para verificar
-      await execAsync(`"${ytPath}" --version`);
-      cachedYtDlpPath = ytPath;
-      console.log(`✅ yt-dlp encontrado en: ${ytPath}`);
-      return ytPath;
-    } catch {
-      // Continuar buscando
-    }
-  }
-  
-  return null;
-}
-
 /**
  * Detecta si una URL es de una plataforma de video soportada
  * @param {string} url - URL a verificar
@@ -57,41 +19,20 @@ export function detectVideoUrl(url) {
   // Limpiar URL de parámetros innecesarios
   const cleanUrl = url.trim();
   
-  // Patrones para diferentes plataformas (AMPLIADO)
+  // Patrones para diferentes plataformas
   const patterns = {
     youtube: [
       /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/|m\.youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
-      /(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]+)/
+      /(?:https?:\/\/)?(?:www\.)?youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/
     ],
     instagram: [
-      /(?:https?:\/\/)?(?:www\.)?instagram\.com\/(?:p|reel|reels|tv)\/([a-zA-Z0-9_-]+)/,
-      /(?:https?:\/\/)?(?:www\.)?instagram\.com\/stories\/[^\/]+\/([0-9]+)/,
-      /(?:https?:\/\/)?(?:www\.)?instagr\.am\/(?:p|reel)\/([a-zA-Z0-9_-]+)/
+      /(?:https?:\/\/)?(?:www\.)?instagram\.com\/(?:p|reel)\/([a-zA-Z0-9_-]+)/,
+      /(?:https?:\/\/)?(?:www\.)?instagram\.com\/stories\/[^\/]+\/([0-9]+)/
     ],
     tiktok: [
       /(?:https?:\/\/)?(?:www\.)?tiktok\.com\/@[^\/]+\/video\/([0-9]+)/,
       /(?:https?:\/\/)?(?:vm\.tiktok\.com|vt\.tiktok\.com)\/([a-zA-Z0-9]+)/,
       /(?:https?:\/\/)?(?:www\.)?tiktok\.com\/t\/([a-zA-Z0-9]+)/
-    ],
-    twitter: [
-      /(?:https?:\/\/)?(?:www\.)?(?:twitter\.com|x\.com)\/\w+\/status\/([0-9]+)/,
-      /(?:https?:\/\/)?(?:mobile\.)?(?:twitter\.com|x\.com)\/\w+\/status\/([0-9]+)/
-    ],
-    facebook: [
-      /(?:https?:\/\/)?(?:www\.)?facebook\.com\/(?:watch\/?\?v=|video\.php\?v=|[^\/]+\/videos\/)([0-9]+)/,
-      /(?:https?:\/\/)?(?:www\.)?fb\.watch\/([a-zA-Z0-9_-]+)/,
-      /(?:https?:\/\/)?(?:www\.)?facebook\.com\/reel\/([0-9]+)/
-    ],
-    vimeo: [
-      /(?:https?:\/\/)?(?:www\.)?vimeo\.com\/([0-9]+)/,
-      /(?:https?:\/\/)?player\.vimeo\.com\/video\/([0-9]+)/
-    ],
-    dailymotion: [
-      /(?:https?:\/\/)?(?:www\.)?dailymotion\.com\/video\/([a-zA-Z0-9]+)/
-    ],
-    twitch: [
-      /(?:https?:\/\/)?clips\.twitch\.tv\/([a-zA-Z0-9_-]+)/,
-      /(?:https?:\/\/)?(?:www\.)?twitch\.tv\/[^\/]+\/clip\/([a-zA-Z0-9_-]+)/
     ]
   };
 
@@ -100,7 +41,6 @@ export function detectVideoUrl(url) {
     for (const pattern of platformPatterns) {
       const match = cleanUrl.match(pattern);
       if (match) {
-        console.log(`🎬 Video de ${platform} detectado: ${cleanUrl}`);
         return {
           isValid: true,
           platform,
@@ -134,28 +74,22 @@ export async function downloadVideoFromUrl(url, outputDir = null) {
     fs.mkdirSync(tempDir, { recursive: true });
   }
 
-  // Generar nombre de archivo de salida
   const timestamp = Date.now();
-  const outputPath = path.join(tempDir, `video_${timestamp}_%(title)s.%(ext)s`);
+  const outputTemplate = path.join(tempDir, `video_${timestamp}_%(title)s.%(ext)s`);
   
   try {
     console.log(`📥 Descargando video desde ${videoInfo.platform}: ${url}`);
     
-    // Buscar yt-dlp
-    const ytDlpPath = await findYtDlp();
-    if (!ytDlpPath) {
-      throw new Error('yt-dlp no está instalado. Instala con: pip install yt-dlp');
-    }
-    
-    // Construir comando yt-dlp con formato simple
+    // Comando yt-dlp con opciones optimizadas
     const ytDlpCommand = [
-      `"${ytDlpPath}"`,
+      'yt-dlp',
       '--no-playlist',
+      '--extract-flat', 'false',
       '--write-info-json',
       '--write-description',
       '--write-thumbnail',
-      '--format', 'best',
-      '--output', `"${outputPath}"`,
+      '--format', 'best[height<=720]/best', // Limitar calidad para ahorrar espacio
+      '--output', `"${outputTemplate}"`,
       `"${url}"`
     ].join(' ');
 
@@ -312,17 +246,12 @@ export function cleanupTempFiles(tempDir = null, maxAgeHours = 2) {
  */
 export async function checkYtDlpAvailability() {
   try {
-    const ytDlpPath = await findYtDlp();
-    if (ytDlpPath) {
-      const { stdout } = await execAsync(`"${ytDlpPath}" --version`);
-      console.log(`✅ yt-dlp disponible (${ytDlpPath}): ${stdout.trim()}`);
-      return true;
-    }
-    throw new Error('No encontrado');
+    const { stdout } = await execAsync('yt-dlp --version');
+    console.log(`✅ yt-dlp disponible: ${stdout.trim()}`);
+    return true;
   } catch (error) {
-    console.error('❌ yt-dlp no está instalado o no se encontró en rutas comunes');
+    console.error('❌ yt-dlp no está instalado o no está en el PATH');
     console.error('💡 Instala con: pip install yt-dlp');
-    console.error('📍 Rutas buscadas:', YT_DLP_PATHS.slice(0, 5).join(', '));
     return false;
   }
 }

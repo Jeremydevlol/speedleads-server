@@ -4,13 +4,6 @@
 const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || 'v24.0';
 const BASE_URL = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
 
-/**
- * Envía un mensaje de texto al usuario de Instagram.
- * @param {string} accessToken - Page/Instagram access token
- * @param {string} recipientId - sender.id (PSID del usuario)
- * @param {string} text - Texto a enviar
- * @returns {Promise<{ success: boolean, error?: string, errorPayload?: object }>}
- */
 export async function sendInstagramMessage(accessToken, recipientId, text) {
   if (!accessToken || !recipientId || text == null) {
     return { success: false, error: 'Missing accessToken, recipientId or text' };
